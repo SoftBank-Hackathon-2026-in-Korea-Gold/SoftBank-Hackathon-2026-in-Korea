@@ -88,3 +88,4 @@ def test_gives_up_immediately_when_no_patch_available():
 
     assert not report.success
     assert report.records == []
+    assert report.attempts == 0

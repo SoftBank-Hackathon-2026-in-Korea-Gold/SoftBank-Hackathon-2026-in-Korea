@@ -16,6 +16,10 @@ def deploy(src_dir: str, dockerfile: str, target: DeployTarget) -> DeployResult:
     Must NOT raise on build/run failure: return DeployResult(success=False, stderr=...)
     so that healer can read the stderr.
 
+    `stderr` MUST include container runtime logs (`docker logs <id>` / Cloud Run revision logs),
+    not just CLI output. Otherwise a crash like `ModuleNotFoundError` only surfaces as
+    "failed to start and listen on the port" and healer misclassifies it as a port error.
+
     TODO(전동훈):
     - local:    subprocess `docker build` + `docker run -p` -> public URL (e.g. tunnel)
     - cloudrun: subprocess `gcloud run deploy --source ... --region $GCP_REGION` -> *.run.app URL

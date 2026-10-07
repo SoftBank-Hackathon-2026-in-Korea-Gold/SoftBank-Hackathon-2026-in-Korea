@@ -236,7 +236,7 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
             result = (after, "LLM-proposed fix") if after and after != before else None
             source = "llm"
         if result is None:
-            return {"status": "gave_up", "retry_count": attempt}
+            return {"status": "gave_up"}  # no patch applied -> attempt not counted
 
         after, rationale = result
         diff = _unified_diff(before, after)
