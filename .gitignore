@@ -1,0 +1,54 @@
+# Reference & Documentation
+ref/
+
+# AI Assistant configs & notes
+CLAUDE.md
+AGENTS.md
+.claude/
+.gemini/
+.cursor/
+
+# Environment Variables & Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Operating System
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+
+# Build & Outputs
+dist/
+build/
+out/
+tmp/
+temp/
+*.log
