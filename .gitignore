@@ -52,3 +52,11 @@ out/
 tmp/
 temp/
 *.log
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Local agent tooling state
+.omc/
+.serena/
+.remember/

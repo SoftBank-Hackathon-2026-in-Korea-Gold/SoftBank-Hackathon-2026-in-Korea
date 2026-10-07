@@ -1,0 +1,24 @@
+[project]
+name = "cloudmorph-backend"
+version = "0.1.0"
+description = "One Action, Infinite Clouds — analyze, deploy, self-heal, redeploy"
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "sse-starlette>=2.1",
+    "langgraph>=0.2",
+    "langchain-openai>=0.2",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 110
