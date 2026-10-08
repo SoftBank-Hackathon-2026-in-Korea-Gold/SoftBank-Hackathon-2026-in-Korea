@@ -1,4 +1,4 @@
-from app.healer import classify_error, heal
+from app.healer import _llm_context, classify_error, heal
 from app.schemas import MAX_RETRIES, DeployResult, ErrorCategory
 
 BROKEN_DOCKERFILE = """FROM python:3.11-slim
@@ -89,3 +89,59 @@ def test_gives_up_immediately_when_no_patch_available():
     assert not report.success
     assert report.records == []
     assert report.attempts == 0
+
+
+PREFLIGHT_ERROR = (
+    "[deployer] stage=preflight kind=user_action_required target=cloudrun\n"
+    "--- error ---\n"
+    "- no active gcloud account (gcloud auth login)"
+)
+
+
+def test_gives_up_without_redeploy_when_deployer_needs_human_action():
+    def never_called(*_):
+        raise AssertionError("must not redeploy or call the LLM for a human-only failure")
+
+    report = heal(
+        "/tmp/app", "cloudrun", _failed(PREFLIGHT_ERROR), BROKEN_DOCKERFILE, never_called, never_called
+    )
+
+    assert not report.success
+    assert report.attempts == 0 and report.records == []
+    assert "kind=user_action_required" in report.summary and "stage=preflight" in report.summary
+
+
+def test_stops_mid_loop_when_redeploy_hits_unhealable_failure():
+    calls: list[str] = []
+
+    def push_fails(src_dir, dockerfile, target):
+        calls.append(dockerfile)
+        return _failed("[deployer] stage=push kind=push_error target=cloudrun\n--- error ---\ndenied")
+
+    def never_called(*_):
+        raise AssertionError("LLM must not run after an unhealable failure")
+
+    report = heal("/tmp/app", "cloudrun", _failed(MISSING_FLASK), BROKEN_DOCKERFILE, push_fails, never_called)
+
+    assert not report.success
+    assert len(calls) == 1
+    assert [r.category for r in report.records] == [ErrorCategory.MISSING_DEPENDENCY]
+    assert "kind=push_error" in report.summary
+
+
+def test_llm_context_keeps_deployer_header_and_tail():
+    header = "[deployer] stage=verify kind=runtime_error target=local"
+    diagnosis = "app is listening on PORT=8080 but answered an error (HTTP 500); see runtime logs"
+    body = [f"  frame {i}" for i in range(100)]
+    log = "\n".join([header, diagnosis, "--- error ---", "status=running", "--- runtime logs ---", *body])
+
+    ctx = _llm_context(log, tail=40)
+
+    assert ctx.startswith(f"{header}\n{diagnosis}\n...")
+    assert "  frame 99" in ctx and "  frame 60" in ctx
+    assert "  frame 59" not in ctx
+
+
+def test_llm_context_returns_short_log_unchanged():
+    log = "[deployer] stage=build kind=build_error target=local\n--- error ---\nERROR [3/4] RUN pip install"
+    assert _llm_context(log) == log
