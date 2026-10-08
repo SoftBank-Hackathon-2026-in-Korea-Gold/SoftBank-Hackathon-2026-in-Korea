@@ -1,10 +1,21 @@
 # sample-apps (owner: 전동훈)
 
-시연용 배포 대상 앱. 앱 퀄리티는 무관 — 배포 플랫폼 시연이 목적.
+시연용 배포 대상 앱. 앱 퀄리티는 무관 — 배포 플랫폼 시연이 목적. 모두 Flask + gunicorn, `/`와 `/health` 두 경로.
 
-| Dir | 목적 | 의도된 결함 |
-|---|---|---|
-| `healthy/` | 정상 배포 경로 시연 | 없음 |
-| `broken/` | 자가치유 시연 | 패키지 누락(requirements 미기재) + 포트/호스트 하드코딩(`127.0.0.1:5000`) |
+| Dir | 목적 | 의도된 결함 | deployer가 돌려주는 실패 |
+|---|---|---|---|
+| `healthy/` | 정상 배포 경로 시연 | 없음 | — (local ≈ 35초, cloudrun ≈ 30초) |
+| `broken/` | 자가치유 2단계 시연 | flask가 requirements에 없음 + `127.0.0.1:5000` 하드코딩 | 1차 `ModuleNotFoundError` → 패치 후 2차 포트 바인딩 → 패치 후 성공 |
+| `broken-requirements/` | 빌드 실패 | `flask==99.99.99` | stage=build, pip 오류 원문 |
+| `broken-import/` | 기동 크래시 | `from flask import` 삭제 | stage=verify, 컨테이너 exited(3), `NameError` |
+| `broken-port/` | 포트 불일치 | PORT 무시하고 5000 고정 | stage=verify, 컨테이너 running, "failed to start and listen on the port" 진단 |
+| `broken-health/` | 요청 시 오류 | `/health`가 예외 | stage=verify, HTTP 500, 요청 Traceback |
 
-`broken/` 실행 시 실제 stderr를 `backend/tests/fixtures/`에 저장해 두면 healer 패턴 보강에 사용합니다.
+실측 stderr 원문은 [`backend/tests/fixtures/`](../backend/tests/fixtures/)에 있다 (healer `ERROR_PATTERNS` 보강용).
+
+```bash
+cd backend
+uv run python -m app.deployer ../sample-apps/healthy local            # 터널 포함
+uv run python -m app.deployer ../sample-apps/broken local --no-tunnel
+uv run python -m app.deployer cleanup ../sample-apps/healthy          # 컨테이너·터널 정리
+```

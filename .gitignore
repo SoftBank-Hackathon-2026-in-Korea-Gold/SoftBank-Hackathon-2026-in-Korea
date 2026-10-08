@@ -60,3 +60,6 @@ temp/
 .omc/
 .serena/
 .remember/
+
+# deployer runtime state (written into src_dir)
+.deployer/
