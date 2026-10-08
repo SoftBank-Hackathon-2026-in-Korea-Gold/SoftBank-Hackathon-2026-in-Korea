@@ -1,0 +1,7 @@
+{
+  "name": "visit-counter",
+  "version": "1.0.0",
+  "main": "app.js",
+  "scripts": { "start": "node app.js" },
+  "dependencies": { "express": "^4.21.2", "pg": "^8.13.1" }
+}
