@@ -640,18 +640,26 @@ def rollback_cloudrun(service: str, revision: str, cfg: Config, r: Runner | None
     return subprocess.run(cmd, capture_output=True, text=True, check=False).returncode == 0
 
 
-def tagged_url(service: str, tag: str, cfg: Config) -> str | None:
-    cp = subprocess.run(
-        _gcr(cfg, "services", "describe", service, "--format=json"),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if cp.returncode != 0:
-        return None
-    for entry in json.loads(cp.stdout).get("status", {}).get("traffic", []):
-        if entry.get("tag") == tag and entry.get("url"):
-            return entry["url"]
+def tagged_url(service: str, tag: str, revision: str | None, cfg: Config, wait: int = 30) -> str | None:
+    """URL of `tag` once Cloud Run reports it attached to `revision` (tag URLs are stable strings, but the
+    revision behind them switches a few seconds after deploy; checking too early would test the old one)."""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        cp = subprocess.run(
+            _gcr(cfg, "services", "describe", service, "--format=json"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if cp.returncode == 0:
+            for entry in json.loads(cp.stdout).get("status", {}).get("traffic", []):
+                if (
+                    entry.get("tag") == tag
+                    and entry.get("url")
+                    and (not revision or entry.get("revisionName") == revision)
+                ):
+                    return entry["url"]
+        time.sleep(2)
     return None
 
 
@@ -709,7 +717,11 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         stage="expose",
     )
     url = cp.stdout.strip()
-    candidate = tagged_url(service, CANDIDATE_TAG, cfg) or url
+    candidate = tagged_url(service, CANDIDATE_TAG, revision, cfg)
+    if candidate is None:
+        raise StepError(
+            "expose", "deploy_error", f"tag '{CANDIDATE_TAG}' did not attach to revision {revision} in time"
+        )
     out.handles["candidate_url"] = candidate
 
     out.stage = "verify"
