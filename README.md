@@ -49,6 +49,6 @@ uv run uvicorn app.main:app --reload
 - [ ] analyzer 구현 및 healer 연결 (10/8) · deployer 구현 완료 (#PR: local Docker + Cloud Run 블루그린)
 - [ ] 고장 샘플 앱 stderr 실측 → `healer.ERROR_PATTERNS` 보강
 - [ ] 프론트 SSE 연동 + 수정 전/후 diff 카드
-- [x] 로컬 Public URL (Cloudflare Quick Tunnel) · [ ] CI (pytest + ruff)
+- [x] 로컬 Public URL (Cloudflare Quick Tunnel) · [x] CI (pytest + ruff, `.github/workflows/ci.yml`)
 - [ ] Notion ADR: Cloud Run 선택, Docker, LangGraph 순환 루프, 규칙 우선·LLM 폴백
 - [ ] (stretch) Agent Memory, Langfuse 트레이싱, AWS 2nd target · 롤백은 Cloud Run 블루그린(candidate 태그 검증 후 승격)으로 대체
