@@ -447,8 +447,8 @@ def container_logs(name: str, tail: int = 200) -> str:
     return (cp.stdout + cp.stderr)[-TAIL:]
 
 
-def start_tunnel(local_url: str, log_path: Path, r: Runner) -> tuple[str, int, bool]:
-    """Return (public_url, pid, registered)."""
+def start_tunnel(local_url: str, log_path: Path, r: Runner) -> tuple[str, int]:
+    """Start a Cloudflare quick tunnel and return (public_url, pid) as soon as the URL is printed."""
     t0 = time.time()
     cmd = ["cloudflared", "tunnel", "--no-autoupdate", "--url", local_url]
     with open(log_path, "w") as log:
@@ -470,7 +470,17 @@ def start_tunnel(local_url: str, log_path: Path, r: Runner) -> tuple[str, int, b
         raise StepError(
             "expose", "deploy_error", "cloudflared did not print a trycloudflare URL\n" + text[-TAIL:]
         )
-    return url, proc.pid, "Registered tunnel connection" in text
+    return url, proc.pid
+
+
+def tunnel_registered(log_path: Path, wait: int = 30) -> bool:
+    """The edge connection is registered a few seconds after the URL is printed; wait for it."""
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if "Registered tunnel connection" in log_path.read_text(errors="replace"):
+            return True
+        time.sleep(1)
+    return False
 
 
 def cleanup_local(handles: dict) -> list[str]:
@@ -496,62 +506,58 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     name = slug(src_dir.name)
     tag = cfg.tag or time.strftime("local-%Y%m%d-%H%M%S")
     image, cname = f"{name}:{tag}", f"{name}-{tag}"
-    out.handles.update(image=image, container_name=cname)
-
-    out.stage = "build"
-    build_image(src_dir, image, None, cfg, r)
-
-    out.stage = "deploy"
     host_port = free_port()
-    cp = r.run(
-        "docker run",
-        [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            cname,
-            "-e",
-            f"PORT={cfg.container_port}",
-            "-p",
-            f"{host_port}:{cfg.container_port}",
-            image,
-        ],
-        stage="deploy",
-    )
-    out.handles.update(container_id=cp.stdout.strip(), host_port=host_port)
     local_url = f"http://127.0.0.1:{host_port}"
-    out.handles["local_url"] = local_url
+    out.handles.update(image=image, container_name=cname, host_port=host_port, local_url=local_url)
 
-    out.stage = "verify"
-    ok, why = wait_up(
-        local_url, cfg.health_path, cfg.verify_timeout, is_dead=lambda: container_state(cname)[0] != "running"
-    )
-    if not ok:
-        status, code = container_state(cname)
-        logs = container_logs(cname)
-        raise StepError(
-            "verify",
-            "runtime_error",
-            f"container status={status} exit_code={code}; {why}",
-            app_logs=logs,
-            diagnosis=diagnose_not_reachable(cfg.container_port, why, logs, exited=status != "running"),
+    public_url, tunnel_log = None, src_dir / STATE_DIR / f"tunnel-{tag}.log"
+    if cfg.tunnel:
+        # Tunnel first: *.trycloudflare.com DNS needs ~1 min to propagate, which now overlaps the build.
+        out.stage = "expose"
+        public_url, pid = start_tunnel(local_url, tunnel_log, r)
+        out.handles.update(tunnel_pid=pid, public_url=public_url)
+
+    try:
+        out.stage = "build"
+        build_image(src_dir, image, None, cfg, r)
+
+        out.stage = "deploy"
+        run_cmd = ["docker", "run", "-d", "--name", cname, "-e", f"PORT={cfg.container_port}"]
+        run_cmd += ["-p", f"{host_port}:{cfg.container_port}", image]
+        cp = r.run("docker run", run_cmd, stage="deploy")
+        out.handles["container_id"] = cp.stdout.strip()
+
+        out.stage = "verify"
+        ok, why = wait_up(
+            local_url,
+            cfg.health_path,
+            cfg.verify_timeout,
+            is_dead=lambda: container_state(cname)[0] != "running",
         )
+        if not ok:
+            status, code = container_state(cname)
+            logs = container_logs(cname)
+            raise StepError(
+                "verify",
+                "runtime_error",
+                f"container status={status} exit_code={code}; {why}",
+                app_logs=logs,
+                diagnosis=diagnose_not_reachable(cfg.container_port, why, logs, exited=status != "running"),
+            )
+    except StepError:
+        if public_url:  # don't leave an orphan tunnel behind a failed attempt
+            cleanup_local({"tunnel_pid": out.handles.pop("tunnel_pid", None)})
+        raise
     out.url = local_url
 
-    if cfg.tunnel:
-        out.stage = "expose"
-        public_url, pid, registered = start_tunnel(local_url, src_dir / STATE_DIR / f"tunnel-{tag}.log", r)
-        out.handles.update(tunnel_pid=pid, public_url=public_url)
+    if public_url:
         out.stage = "verify"
         ok, why = wait_up(public_url, cfg.health_path, 60, interval=3)
-        if not ok and not registered:
+        if not ok and not tunnel_registered(tunnel_log):
             raise StepError(
-                "verify", "runtime_error", f"public URL not reachable: {why}", app_logs=container_logs(cname)
+                "verify", "runtime_error", f"tunnel not registered, public URL unreachable: {why}"
             )
-        if (
-            not ok
-        ):  # tunnel registered + local healthy: DNS propagation of *.trycloudflare.com can take >1 min
+        if not ok:  # registered + local healthy: this machine's resolver has not seen the new name yet
             out.warnings.append(
                 f"public URL not verified from this machine ({why}); local URL {local_url} is healthy"
             )
