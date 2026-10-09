@@ -13,20 +13,20 @@ This module orchestrates the team's analyzer, deployer, and healer unchanged.
 from __future__ import annotations
 
 import asyncio
-from collections import deque
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 import ipaddress
 import os
-from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import time
-from typing import Callable, Iterator
-from urllib.parse import urlparse
 import uuid
 import zipfile
+from collections import deque
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -87,9 +87,12 @@ def _extract_zip_safe(zip_path: Path, destination: Path) -> Path:
         for item in members:
             name = item.filename.replace("\\", "/")
             parts = Path(name).parts
-            if (name.startswith("/") or ".." in parts or
-                    any(part.endswith(":") for part in parts) or
-                    (item.external_attr >> 16) & 0o170000 == 0o120000):
+            if (
+                name.startswith("/")
+                or ".." in parts
+                or any(part.endswith(":") for part in parts)
+                or (item.external_attr >> 16) & 0o170000 == 0o120000
+            ):
                 raise ValueError("Unsafe ZIP entry detected")
             total += item.file_size
             if total > MAX_SOURCE_BYTES:
@@ -121,7 +124,10 @@ def prepare_source(source: str) -> Iterator[str]:
             try:
                 subprocess.run(
                     ["git", "-c", "protocol.file.allow=never", "clone", "--depth", "1", "--", url, str(dest)],
-                    check=True, capture_output=True, text=True, timeout=120,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
                     env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
@@ -140,14 +146,19 @@ def _prepare_zip(path: Path, root: Path) -> str:
 def _copy_for_target(source: str, destination: Path) -> str:
     """Deployer writes Dockerfile and .deployer state; isolate each target."""
     shutil.copytree(
-        source, destination,
+        source,
+        destination,
         ignore=shutil.ignore_patterns(".git", ".venv", "node_modules", ".deployer", "__pycache__"),
     )
     return str(destination)
 
 
-def run_pipeline(source: str, target: DeployTarget, emit: Callable[[PipelineEvent], None],
-                 analysis: AnalysisResult | None = None) -> bool:
+def run_pipeline(
+    source: str,
+    target: DeployTarget,
+    emit: Callable[[PipelineEvent], None],
+    analysis: AnalysisResult | None = None,
+) -> bool:
     """Run one target synchronously; healer owns all retry attempts."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
@@ -159,9 +170,16 @@ def run_pipeline(source: str, target: DeployTarget, emit: Callable[[PipelineEven
         emit(PipelineEvent(type="done", payload={"target": target, "url": result.url}))
         return True
 
-    emit(PipelineEvent(type="stage", stage="heal", payload={
-        "target": target, "stderr": result.stderr[-2000:],
-    }))
+    emit(
+        PipelineEvent(
+            type="stage",
+            stage="heal",
+            payload={
+                "target": target,
+                "stderr": result.stderr[-2000:],
+            },
+        )
+    )
     report = healer.heal(source, target, result, analysis.dockerfile, deployer.deploy, emit=emit)
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
@@ -187,8 +205,16 @@ def _publish(job: Job, event: PipelineEvent | None) -> None:
 
 def create_app() -> FastAPI:
     app = FastAPI(title="CloudMorph", version="0.2.0")
-    origins = [x.strip() for x in os.getenv("CLOUDMORPH_CORS_ORIGINS", "http://localhost:5173,http://localhost:5174").split(",") if x.strip()]
-    app.add_middleware(CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"])
+    origins = [
+        x.strip()
+        for x in os.getenv("CLOUDMORPH_CORS_ORIGINS", "http://localhost:5173,http://localhost:5174").split(
+            ","
+        )
+        if x.strip()
+    ]
+    app.add_middleware(
+        CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"]
+    )
 
     @app.get("/health")
     async def health() -> dict[str, str]:
@@ -226,10 +252,16 @@ def create_app() -> FastAPI:
                     try:
                         target_dir = _copy_for_target(source_dir, work_root / target)
                         run_pipeline(target_dir, target, emit, analysis=analysis)
-                    except Exception as exc:  # Continue with other targets.
-                        emit(PipelineEvent(type="error", payload={
-                            "target": target, "message": f"{type(exc).__name__}: {exc}",
-                        }))
+                    except Exception as exc:  # noqa: BLE001 — isolate target failures
+                        emit(
+                            PipelineEvent(
+                                type="error",
+                                payload={
+                                    "target": target,
+                                    "message": f"{type(exc).__name__}: {exc}",
+                                },
+                            )
+                        )
 
         async def worker() -> None:
             job.state = "running"
@@ -243,7 +275,7 @@ def create_app() -> FastAPI:
                     job.state = "partial_failure"
                 else:
                     job.state = "failed"
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — record unexpected pipeline failures
                 job.state = "failed"
                 job.error = f"{type(exc).__name__}: {exc}"
                 _publish(job, PipelineEvent(type="error", payload={"message": job.error}))
