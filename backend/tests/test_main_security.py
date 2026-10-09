@@ -10,7 +10,9 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -179,6 +181,133 @@ def test_mock_git_rejected_before_yield(m, tmp_path, monkeypatch, kind):
     with pytest.raises(ValueError), m.prepare_source("https://github.com/example/project"):
         pytest.fail("unsafe clone yielded")
     assert clone_paths and not clone_paths[0].exists()
+
+
+def test_git_clone_concurrency_is_bounded(m, monkeypatch):
+    assert m.MAX_CONCURRENT_GIT_CLONES == 2
+    monkeypatch.setattr(m, "_git_clone_semaphore", threading.BoundedSemaphore(2))
+    started = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+
+    def fake_clone(args, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+            if active == 2:
+                started.set()
+        try:
+            if not release.wait(timeout=5):
+                raise TimeoutError("test clone was not released")
+            Path(args[-1]).mkdir()
+            return subprocess.CompletedProcess(args, 0)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(m.subprocess, "run", fake_clone)
+
+    def clone():
+        with m.prepare_source("https://github.com/example/project"):
+            pass
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = [executor.submit(clone) for _ in range(3)]
+        try:
+            assert started.wait(timeout=3)
+        finally:
+            release.set()
+        for future in futures:
+            future.result(timeout=5)
+
+    assert max_active == 2
+
+
+def test_git_clone_concurrency_limit_is_environment_configurable(m, monkeypatch):
+    monkeypatch.setitem(os.environ, "CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES", "3")
+    module_name = "_cloudmorph_main_security_config"
+    source_path = Path(__file__).resolve().parents[1] / "app" / "main.py"
+    spec = importlib.util.spec_from_file_location(module_name, source_path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, module_name, module)
+    spec.loader.exec_module(module)
+
+    assert module.MAX_CONCURRENT_GIT_CLONES == 3
+    acquired = [module._git_clone_semaphore.acquire(blocking=False) for _ in range(4)]
+    try:
+        assert acquired == [True, True, True, False]
+    finally:
+        for acquired_slot in acquired:
+            if acquired_slot:
+                module._git_clone_semaphore.release()
+
+
+def test_git_clone_capacity_returns_clear_error_when_saturated(m, monkeypatch):
+    monkeypatch.setattr(m, "_git_clone_semaphore", threading.BoundedSemaphore(1))
+    monkeypatch.setattr(m, "GIT_CLONE_WAIT_SECONDS", 0.01)
+    started = threading.Event()
+    release = threading.Event()
+
+    def fake_clone(args, **kwargs):
+        started.set()
+        if not release.wait(timeout=5):
+            raise TimeoutError("test clone was not released")
+        Path(args[-1]).mkdir()
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_clone)
+
+    def first_clone():
+        with m.prepare_source("https://github.com/example/project"):
+            pass
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(first_clone)
+        try:
+            assert started.wait(timeout=3)
+            with (
+                pytest.raises(ValueError, match="Git clone capacity reached"),
+                m.prepare_source("https://github.com/example/project"),
+            ):
+                pytest.fail("saturated clone unexpectedly started")
+        finally:
+            release.set()
+        future.result(timeout=5)
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected_error"),
+    [
+        (subprocess.CalledProcessError(1, ["git", "clone"]), ValueError),
+        (subprocess.TimeoutExpired(["git", "clone"], 120), ValueError),
+        (RuntimeError("unexpected clone error"), RuntimeError),
+    ],
+    ids=["git-failure", "timeout", "unexpected-exception"],
+)
+def test_git_clone_semaphore_released_after_failure(m, monkeypatch, failure, expected_error):
+    monkeypatch.setattr(m, "_git_clone_semaphore", threading.BoundedSemaphore(1))
+    calls = 0
+
+    def fake_clone(args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise failure
+        Path(args[-1]).mkdir()
+        return subprocess.CompletedProcess(args, 0)
+
+    monkeypatch.setattr(m.subprocess, "run", fake_clone)
+
+    with pytest.raises(expected_error), m.prepare_source("https://github.com/example/project"):
+        pytest.fail("failed clone unexpectedly yielded")
+    with m.prepare_source("https://github.com/example/project"):
+        pass
+
+    assert calls == 2
 
 
 @pytest.mark.parametrize("limit", ["bytes", "count"])

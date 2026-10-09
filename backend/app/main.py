@@ -18,6 +18,7 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -43,6 +44,14 @@ MAX_JOBS = 30
 MAX_EVENTS = 1000
 MAX_SOURCE_BYTES = 200 * 1024 * 1024
 MAX_SOURCE_FILES = 10_000  # Includes directories to bound traversal as well.
+try:
+    MAX_CONCURRENT_GIT_CLONES = int(os.getenv("CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES", "2"))
+except ValueError as exc:
+    raise ValueError("CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES must be a positive integer") from exc
+if MAX_CONCURRENT_GIT_CLONES < 1:
+    raise ValueError("CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES must be a positive integer")
+GIT_CLONE_WAIT_SECONDS = 5
+_git_clone_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_GIT_CLONES)
 SOURCE_IGNORE = {".git", ".venv", "node_modules", ".deployer", "__pycache__"}
 
 
@@ -188,17 +197,32 @@ def prepare_source(source: str) -> Iterator[str]:
         if source.startswith("https://"):
             url = _validate_https_git_url(source)
             dest = root / "project"
+            if not _git_clone_semaphore.acquire(timeout=GIT_CLONE_WAIT_SECONDS):
+                raise ValueError("Git clone capacity reached; retry later")
             try:
-                subprocess.run(
-                    ["git", "-c", "protocol.file.allow=never", "clone", "--depth", "1", "--", url, str(dest)],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=120,
-                    env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
-                raise ValueError(f"Git clone failed: {type(exc).__name__}") from exc
+                try:
+                    subprocess.run(
+                        [
+                            "git",
+                            "-c",
+                            "protocol.file.allow=never",
+                            "clone",
+                            "--depth",
+                            "1",
+                            "--",
+                            url,
+                            str(dest),
+                        ],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=120,
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+                    raise ValueError(f"Git clone failed: {type(exc).__name__}") from exc
+            finally:
+                _git_clone_semaphore.release()
             _inspect_source(dest)
             yield str(dest)
             return
