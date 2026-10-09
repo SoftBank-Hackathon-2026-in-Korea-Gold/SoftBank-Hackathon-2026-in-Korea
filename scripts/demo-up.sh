@@ -57,7 +57,7 @@ if [[ $PUBLIC -eq 1 ]]; then
   nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$FRONT_PORT" > "$STATE/tunnel.log" 2>&1 &
   echo $! > "$STATE/tunnel.pid"
   URL=""
-  for i in $(seq 1 40); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE/tunnel.log" | head -n 1); [[ -n "$URL" ]] && break; sleep 1; done
+  for i in $(seq 1 60); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE/tunnel.log" | head -n 1 || true); [[ -n "$URL" ]] && break; sleep 1; done  # `|| true`: under set -e a miss would silently kill the script
   [[ -n "$URL" ]] || die "tunnel URL not found, see $STATE/tunnel.log"
   for i in $(seq 1 30); do grep -q "Registered tunnel connection" "$STATE/tunnel.log" && break; sleep 1; done
   echo "$URL" > "$STATE/public_url"
