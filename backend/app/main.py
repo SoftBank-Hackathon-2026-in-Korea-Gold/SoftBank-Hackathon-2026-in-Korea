@@ -29,8 +29,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from app import analyzer, deployer, healer
@@ -214,8 +215,23 @@ def create_app() -> FastAPI:
         if x.strip()
     ]
     app.add_middleware(
-        CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"]
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Token"],
     )
+
+    # Demo guard: when CLOUDMORPH_API_TOKEN is set (e.g. while the dashboard is exposed through a
+    # Cloudflare tunnel), every /deploy* call must carry it. EventSource cannot set headers, so the
+    # SSE endpoint also accepts ?token=. /health stays open for probes. Unset -> no auth (local dev).
+    @app.middleware("http")
+    async def require_api_token(request: Request, call_next):
+        token = os.getenv("CLOUDMORPH_API_TOKEN")
+        if token and request.url.path.startswith("/deploy") and request.method != "OPTIONS":
+            supplied = request.headers.get("x-api-token") or request.query_params.get("token")
+            if supplied != token:
+                return JSONResponse({"detail": "missing or invalid X-API-Token"}, status_code=401)
+        return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, str]:

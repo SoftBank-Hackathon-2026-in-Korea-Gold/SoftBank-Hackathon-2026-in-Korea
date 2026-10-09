@@ -63,3 +63,6 @@ temp/
 
 # deployer runtime state (written into src_dir)
 .deployer/
+
+# demo-up.sh runtime state
+.demo/
