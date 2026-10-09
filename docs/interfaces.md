@@ -28,7 +28,7 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 
 ## Data types
 
-**AnalysisResult** — `target`, `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`
+**AnalysisResult** — `target`, `service_models[]` (`caas|paas|faas|iaas`, 추천 순), `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`
 
 **DeployResult** — `success`, `target`, `exit_code`, `stdout`, `stderr`, `url?`, `duration_sec?`
 

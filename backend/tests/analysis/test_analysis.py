@@ -169,6 +169,20 @@ def test_fatal_risk_stays_without_consent(flask_app):
     assert not any("박힌" in n for n in r.notes)  # 치명적이지 않으면 AI 판정을 바로 쓴다
 
 
+@pytest.mark.parametrize(
+    "found, models",
+    [
+        ({}, ["caas", "paas", "faas", "iaas"]),
+        ({"long_running": ev("app.py:1", "from flask import Flask")}, ["caas", "paas", "iaas"]),
+        ({"system_packages": ev("app.py:1", "from flask import Flask")}, ["caas", "iaas"]),
+        ({"file_write": FILE_WRITE}, ["iaas"]),
+    ],
+)
+def test_service_models_the_code_can_run_on(flask_app, found, models):
+    answers = {n: SignalReport(value="yes", reason="", evidence=[e]) for n, e in found.items()}
+    assert run(flask_app, answers).service_models == models  # 추천 순서대로, deployer가 지원하는 것을 고른다
+
+
 @pytest.mark.parametrize("name, target", [("gpu", "cloudrun"), ("sqlite", "local")])
 def test_risk_without_checked_evidence(flask_app, name, target):
     r = run(flask_app, {name: SignalReport(value="yes", reason="?", evidence=[MADE_UP])})
@@ -256,6 +270,7 @@ def test_static_site_is_served_by_nginx_on_port(tmp_path):
         {"has_server": SignalReport(value="no", reason="", evidence=[]), "is_spa": spa, "stack": stack},
     )
     assert r.target == "cloudrun" and r.notes[0] == "정적 호스팅 유형으로 판단해 cloudrun에 배포합니다."
+    assert r.service_models == ["caas", "iaas"]  # nginx 컨테이너로 감싸 보낸다
     assert "FROM node:20-slim AS build" in r.dockerfile and "RUN npm run build" in r.dockerfile
     assert "COPY --from=build /app/dist/ /usr/share/nginx/html/" in r.dockerfile
     assert "listen ${PORT};" in r.dockerfile  # nginx가 시작할 때 PORT를 채운다

@@ -33,6 +33,8 @@ from app.schemas import AnalysisResult
 DEFAULT_MODEL = "gpt-4o"
 # 고를 유형 순서와 그 타깃
 TARGETS = {2: "cloudrun", 5: "cloudrun", 4: "local"}
+# 유형 → 서비스 모델 (추천 순서). 정적 호스팅(5)은 nginx 컨테이너로 감싸 보내므로 caas·iaas로 보낸다
+SERVICE_MODELS = {2: "caas", 3: "paas", 1: "faas", 4: "iaas"}
 
 
 def analyze(src_dir: str) -> AnalysisResult:
@@ -70,8 +72,10 @@ def analyze_with(src_dir: str, inspect, write) -> AnalysisResult:
         why = f"서버리스 컨테이너로는 갈 수 없어 local(Docker)에 배포합니다: {'; '.join(dict.fromkeys(removed[2]))}"
     else:
         why = f"{TYPES[t]} 유형으로 판단해 cloudrun에 배포합니다."
+    models = [m for n, m in SERVICE_MODELS.items() if n in candidates]
     return AnalysisResult(
         target=TARGETS[t],
+        service_models=["caas", "iaas"] if t == 5 else models,
         language=app.language or "unknown",
         framework=app.framework,
         port=port,
