@@ -45,6 +45,12 @@ def analyze_with(src_dir: str, inspect) -> AnalysisResult:
 
     out = graph.run(src_dir, inspect=inspect, ask=answer)
     result = out["result"]
+    # 유형 4(VM)는 Windows VM이면 되지만 local은 리눅스 Docker다
+    if out["signals"]["os_windows"]["value"] == "yes":
+        raise ValueError(
+            "local·cloudrun 어디에도 배포할 수 없습니다. Windows 전용 코드는 리눅스 컨테이너에서 돌지 않습니다 "
+            "(Windows VM이 필요합니다)"
+        )
     if not result.get("spec"):
         reasons = [f"{TYPES[t]}: {w['reason']}" for t in TARGETS for w in result["removed"].get(t, [])]
         raise ValueError("local·cloudrun 어디에도 배포할 수 없습니다. " + "; ".join(dict.fromkeys(reasons)))

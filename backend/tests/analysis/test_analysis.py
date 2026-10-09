@@ -564,6 +564,19 @@ def test_spec_gradle(tmp_path):
     )
 
 
+@pytest.mark.parametrize(
+    "manifest, text",
+    [
+        ("pom.xml", "<project><properties><java.version>1.8</java.version></properties></project>"),
+        ("build.gradle", "sourceCompatibility = '1.8'\n"),
+        ("build.gradle", "sourceCompatibility = JavaVersion.VERSION_1_8\n"),
+    ],
+)
+def test_spec_java_8_is_8_not_1(tmp_path, manifest, text):  # eclipse-temurin:1-jdk 같은 이미지는 없다
+    (tmp_path / manifest).write_text(text)
+    assert spec_of(tmp_path, 4)["app"]["version"] == "8"
+
+
 # ---------- 프레임워크 · 추천 · 환경변수 안내 ----------
 
 
@@ -1293,6 +1306,31 @@ def test_contract_cannot_ask_so_fatal_risk_stays(cache_app):
 def test_contract_nothing_deployable(no_key):
     with pytest.raises(ValueError, match="local·cloudrun 어디에도 배포할 수 없습니다"):
         analyze(str(NEW_FIXTURES / "py-mac-menubar"))
+
+
+def test_contract_windows_only_code_cannot_go_to_linux_docker(no_key):
+    # 유형 4는 Windows VM이어야 하는데 local은 리눅스 Docker다
+    with pytest.raises(ValueError, match="local·cloudrun 어디에도 배포할 수 없습니다.*Windows"):
+        analyze(str(NEW_FIXTURES / "py-win-report"))
+
+
+def test_render_java_without_wrapper_uses_build_tool_image():
+    mvn = render(
+        App(
+            language="java",
+            version="21",
+            build="mvn -q -DskipTests package",
+            start="java -jar target/app.jar",
+        )
+    )
+    gradle = render(
+        App(language="java", version="17", build="gradle bootJar", start="java -jar build/libs/app.jar")
+    )
+    assert mvn.startswith("FROM maven:3-eclipse-temurin-21\n") and gradle.startswith("FROM gradle:jdk17\n")
+    java8 = render(
+        App(language="java", version="1.8", build="./mvnw package", start="java -jar target/app.jar")
+    )
+    assert java8.startswith("FROM eclipse-temurin:8-jdk\n")  # 검사관은 매니페스트의 1.8을 그대로 적을 수 있다
 
 
 def test_render_dockerfile_for_java_and_os_tools():

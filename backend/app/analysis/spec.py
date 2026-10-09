@@ -459,14 +459,14 @@ def _java(root: Path, signals: dict, sources: list) -> App:
         text = read_text(pom)
         tool = "./mvnw" if (root / "mvnw").is_file() else "mvn"
         version = _first(
-            r"<(?:java\.version|maven\.compiler\.release|maven\.compiler\.source|release)>(\d+)", text
-        )
+            r"<(?:java\.version|maven\.compiler\.release|maven\.compiler\.source|release)>(?:1\.)?(\d+)", text
+        )  # 1.8 → 8
         build, jar = f"{tool} -q -DskipTests package", _maven_jar(pom)
     else:
         text = _read(root / "build.gradle") or _read(root / "build.gradle.kts")
         tool = "./gradlew" if (root / "gradlew").is_file() else "gradle"
         version = _first(r"JavaLanguageVersion\.of\((\d+)\)", text) or _first(
-            r"sourceCompatibility\s*=\s*\D*(\d+)", text
+            r"sourceCompatibility\s*=\s*\D*(?:1[._])?(\d+)", text
         )
         name = (
             _first(

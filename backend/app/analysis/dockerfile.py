@@ -16,6 +16,8 @@ BASE = {
     "java": "eclipse-temurin:{v}-jdk",
     "go": "golang:{v}",
 }
+# 래퍼(mvnw·gradlew)가 없으면 빌드 도구가 든 이미지를 쓴다. JDK 이미지에는 mvn·gradle이 없다
+JAVA_TOOL_BASE = {"mvn": "maven:3-eclipse-temurin-{v}", "gradle": "gradle:jdk{v}"}
 VERSION = {"python": "3.12", "node": "20", "java": "21", "go": "1.22"}
 # 검사관이 말한 OS 도구 → Debian 패키지
 APT = {
@@ -36,6 +38,8 @@ APT = {
 def _version(app: App) -> str:
     m = re.search(r"\d+(?:\.\d+)?", app.version or "")
     v = m.group() if m else VERSION.get(app.language or "", VERSION["node"])
+    if app.language == "java":
+        v = v.removeprefix("1.")  # Java 8은 1.8로도 적는다
     return v.split(".")[0] if app.language in ("node", "java") else v
 
 
@@ -44,7 +48,10 @@ def render(app: App, port: int = 8080) -> str:
         return _static(app, port)
     if app.language not in BASE or not app.start:
         raise ValueError(f"Dockerfile을 만들 수 없습니다 (언어: {app.language}, 시작 명령: {app.start})")
-    lines = [f"FROM {BASE[app.language].format(v=_version(app))}", "WORKDIR /app", f"ENV PORT={port}"]
+    base = BASE[app.language]
+    if app.language == "java":
+        base = JAVA_TOOL_BASE.get((app.build or "").split(" ")[0], base)
+    lines = [f"FROM {base.format(v=_version(app))}", "WORKDIR /app", f"ENV PORT={port}"]
     if app.language == "python":
         lines.append("ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1")
     if tools := [APT[t] for t in app.system_tools if t in APT]:
