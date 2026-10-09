@@ -1,7 +1,4 @@
-"""Offline regression tests for source isolation and API/SSE compatibility.
-
-The 21 parametrized cases never load .env or invoke real Git, deployers or LLMs.
-"""
+"""Offline regression tests for source isolation and API/SSE compatibility."""
 
 import asyncio
 import importlib.util
@@ -172,7 +169,190 @@ def test_prepare_skips_ignored_directories(m, tmp_path, monkeypatch):
     monkeypatch.setattr(m, "MAX_SOURCE_FILES", 1)
     monkeypatch.setattr(m, "MAX_SOURCE_BYTES", 4)
     with m.prepare_source(str(source)) as prepared:
-        assert prepared == str(source.resolve())
+        assert prepared != str(source.resolve())
+        assert (Path(prepared) / "app.py").read_text() == "x"
+        assert not (Path(prepared) / "node_modules").exists()
+        assert not (Path(prepared) / ".venv").exists()
+
+
+@pytest.mark.parametrize("operation", ["prepare", "copy"])
+def test_sensitive_files_are_excluded_from_build_source(m, tmp_path, operation):
+    source = tmp_path / "source"
+    (source / ".aws").mkdir(parents=True)
+    (source / ".docker").mkdir()
+    (source / ".terraform" / "providers").mkdir(parents=True)
+    (source / ".config" / "gcloud").mkdir(parents=True)
+    (source / ".config" / "gh").mkdir(parents=True)
+    (source / ".ssh").mkdir()
+    (source / ".env").write_text("dummy credential")
+    (source / ".env.example").write_text("example only")
+    (source / ".aws" / "credentials").write_text("dummy credential")
+    (source / ".docker" / "config.json").write_text("dummy credential")
+    (source / ".docker" / "Dockerfile").write_text("FROM scratch")
+    (source / ".terraform" / "terraform.tfstate").write_text("dummy credential")
+    (source / ".terraform" / "providers" / "README.md").write_text("project metadata")
+    (source / ".config" / "gcloud" / "application_default_credentials.json").write_text("dummy credential")
+    (source / ".config" / "gh" / "hosts.yml").write_text("dummy credential")
+    (source / ".ssh" / "id_ed25519").write_text("dummy private key")
+    (source / "service-account-demo.json").write_text("dummy credential")
+    (source / "tls.pem").write_text("dummy private key")
+    (source / "terraform.tfstate.backup").write_text("dummy credential")
+    (source / ".env.production").write_text("dummy credential")
+    (source / ".env.example").write_text("APP_ENV=development")
+    (source / "app.py").write_text("print('safe')")
+
+    if operation == "prepare":
+        with m.prepare_source(str(source)) as prepared:
+            sanitized = Path(prepared)
+            assert (sanitized / "app.py").read_text() == "print('safe')"
+            assert not (sanitized / ".env").exists()
+            assert (sanitized / ".env.example").read_text() == "APP_ENV=development"
+            assert not (sanitized / ".env.production").exists()
+            assert not (sanitized / ".aws").exists()
+            assert not (sanitized / ".docker" / "config.json").exists()
+            assert (sanitized / ".docker" / "Dockerfile").read_text() == "FROM scratch"
+            assert not (sanitized / ".terraform" / "terraform.tfstate").exists()
+            assert (sanitized / ".terraform" / "providers" / "README.md").exists()
+            assert not (sanitized / ".config" / "gcloud").exists()
+            assert not (sanitized / ".config" / "gh").exists()
+            assert not (sanitized / ".ssh").exists()
+            assert not (sanitized / "service-account-demo.json").exists()
+            assert not (sanitized / "tls.pem").exists()
+            assert not (sanitized / "terraform.tfstate.backup").exists()
+    else:
+        sanitized = Path(m._copy_for_target(str(source), tmp_path / "build-context"))
+        assert (sanitized / "app.py").read_text() == "print('safe')"
+        assert (sanitized / ".env.example").read_text() == "APP_ENV=development"
+        assert not any(
+            (sanitized / relative).exists()
+            for relative in (
+                ".env.production",
+                ".env",
+                ".aws",
+                ".docker/config.json",
+                ".terraform/terraform.tfstate",
+                ".config/gcloud",
+                ".config/gh",
+                ".ssh",
+                "service-account-demo.json",
+                "tls.pem",
+                "terraform.tfstate.backup",
+            )
+        )
+        assert (sanitized / ".docker" / "Dockerfile").read_text() == "FROM scratch"
+        assert (sanitized / ".terraform" / "providers" / "README.md").exists()
+
+
+def test_sensitive_files_are_not_extracted_from_zip(m, tmp_path):
+    archive_path = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr("app.py", "safe")
+        archive.writestr(".env", "dummy credential")
+        archive.writestr(".env.production", "dummy credential")
+        archive.writestr(".env.example", "APP_ENV=development")
+        archive.writestr(".docker/config.json", "dummy credential")
+        archive.writestr(".config/gh/hosts.yml", "dummy credential")
+        archive.writestr(".terraform/terraform.tfstate", "dummy credential")
+        archive.writestr(".terraform.lock.hcl", "provider lock")
+
+    extracted = m._extract_zip_safe(archive_path, tmp_path / "extracted")
+
+    assert (extracted / "app.py").read_text() == "safe"
+    assert not (extracted / ".env").exists()
+    assert not (extracted / ".env.production").exists()
+    assert (extracted / ".env.example").read_text() == "APP_ENV=development"
+    assert not (extracted / ".docker" / "config.json").exists()
+    assert not (extracted / ".config" / "gh").exists()
+    assert not (extracted / ".terraform" / "terraform.tfstate").exists()
+    assert (extracted / ".terraform.lock.hcl").read_text() == "provider lock"
+
+
+@pytest.mark.parametrize("member_name", ["../escape.txt", "/absolute.txt", "nested/../../escape.txt"])
+def test_zip_path_traversal_and_absolute_paths_are_rejected(m, tmp_path, member_name):
+    archive_path = tmp_path / "unsafe.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(member_name, "outside")
+    destination = tmp_path / "extracted"
+    destination.mkdir()
+
+    with pytest.raises(ValueError, match="Unsafe ZIP entry"):
+        m._extract_zip_safe(archive_path, destination)
+
+    assert not (tmp_path / "escape.txt").exists()
+
+
+def test_zip_symlink_entry_is_rejected(m, tmp_path):
+    archive_path = tmp_path / "symlink.zip"
+    symlink = zipfile.ZipInfo("link")
+    symlink.create_system = 3
+    symlink.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(symlink, "../../outside")
+    destination = tmp_path / "extracted"
+    destination.mkdir()
+
+    with pytest.raises(ValueError, match="Unsafe ZIP entry"):
+        m._extract_zip_safe(archive_path, destination)
+
+    assert not (tmp_path.parent / "outside").exists()
+
+
+@pytest.mark.parametrize("limit", ["bytes", "entries"])
+def test_zip_archive_limits_include_sensitive_entries(m, tmp_path, monkeypatch, limit):
+    archive_path = tmp_path / "bounded.zip"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(".env", "x" * 8)
+        archive.writestr("app.py", "safe")
+    setting = "MAX_ZIP_UNCOMPRESSED_BYTES" if limit == "bytes" else "MAX_ZIP_ENTRIES"
+    monkeypatch.setattr(m, setting, 4 if limit == "bytes" else 1)
+
+    with pytest.raises(ValueError, match="ZIP contents exceed"):
+        m._extract_zip_safe(archive_path, tmp_path / "extracted")
+
+
+@pytest.mark.parametrize("source_kind", ["local", "zip", "git"])
+def test_filtered_source_limits_are_consistent(m, tmp_path, monkeypatch, source_kind):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / ".env").write_text("x" * 100)
+    (source / "app.py").write_text("safe")
+    if source_kind == "zip":
+        archive_path = tmp_path / "source.zip"
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            archive.writestr(".env", "x" * 100)
+            archive.writestr("app.py", "safe")
+        input_source = str(archive_path)
+    elif source_kind == "git":
+
+        def fake_clone(args, **kwargs):
+            destination = Path(args[-1])
+            destination.mkdir()
+            (destination / ".env").write_text("x" * 100)
+            (destination / "app.py").write_text("safe")
+            return subprocess.CompletedProcess(args, 0)
+
+        monkeypatch.setattr(m.subprocess, "run", fake_clone)
+        input_source = "https://github.com/example/project"
+    else:
+        input_source = str(source)
+
+    monkeypatch.setattr(m, "MAX_SOURCE_BYTES", 4)
+    monkeypatch.setattr(m, "MAX_SOURCE_FILES", 1)
+    with m.prepare_source(input_source) as prepared:
+        prepared_path = Path(prepared)
+        assert (prepared_path / "app.py").read_text() == "safe"
+        assert not (prepared_path / ".env").exists()
+
+
+def test_local_source_under_protected_root_is_rejected(m, tmp_path, monkeypatch):
+    protected = tmp_path / "server"
+    source = protected / "internal"
+    source.mkdir(parents=True)
+    (source / "app.py").write_text("not read")
+    monkeypatch.setattr(m, "_LOCAL_SOURCE_DENY_ROOTS", (protected,))
+
+    with pytest.raises(ValueError, match="protected system directory"), m.prepare_source(str(source)):
+        pytest.fail("protected server path was accepted")
 
 
 @pytest.mark.parametrize("kind", ["bytes", "count", "symlink"])
@@ -373,7 +553,15 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
 
     monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
     original_mkdtemp = m.tempfile.mkdtemp
-    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda **kwargs: original_mkdtemp(dir=tmp_path, **kwargs))
+
+    def mkdtemp_in_test_dir(*args, **kwargs):
+        if len(args) >= 3:
+            args = (*args[:2], args[2] or tmp_path, *args[3:])
+        else:
+            kwargs["dir"] = kwargs.get("dir") or tmp_path
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(m.tempfile, "mkdtemp", mkdtemp_in_test_dir)
     routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
 
     async def scenario():
@@ -391,7 +579,7 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
         await asyncio.wait_for(wait_for_jobs(), timeout=5)
         for deployment_id in ids:
             status = await routes["/deploy/{deployment_id}"](deployment_id)
-            assert status["status"] == "completed"
+            assert status["status"] == "completed", status
             assert set(status["targets"]) == {"local", "cloudrun"}
             response = await routes["/deploy/{deployment_id}/events"](deployment_id)
             events = [event async for event in response.body_iterator]
@@ -411,4 +599,157 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
     assert len({m.deployer.slug(p.name) for p in paths}) == 4
     for directory in paths:
         assert directory.name.startswith("cloudmorph-")
-        assert (directory / "app.py").read_text() == "dummy"
+        if directory.name.endswith("-cloudrun"):
+            assert not directory.exists()
+        else:
+            assert (directory / "app.py").read_text() == "dummy"
+
+
+def test_cloudrun_workspace_is_removed_after_heal_finishes(m, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    initial_dockerfile = 'FROM python:3.11-slim\nCMD ["python", "app.py"]\n'
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(target="cloudrun", language="python", dockerfile=initial_dockerfile),
+    )
+    deploy_attempts = []
+
+    def fake_deploy(directory, dockerfile, target):
+        assert Path(directory).exists()
+        assert (Path(directory) / "app.py").read_text() == "dummy"
+        deploy_attempts.append(dockerfile)
+        if len(deploy_attempts) == 1:
+            return DeployResult(
+                success=False,
+                target=target,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'flask'",
+            )
+        return DeployResult(success=True, target=target, exit_code=0, url="https://example.invalid")
+
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    original_mkdtemp = m.tempfile.mkdtemp
+
+    def mkdtemp_in_test_dir(*args, **kwargs):
+        if len(args) >= 3:
+            args = (*args[:2], args[2] or tmp_path, *args[3:])
+        else:
+            kwargs["dir"] = kwargs.get("dir") or tmp_path
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(m.tempfile, "mkdtemp", mkdtemp_in_test_dir)
+    original_remove = m._remove_workspace
+    removed_cloudrun_dirs = []
+
+    def checked_remove(path):
+        if path.name.endswith("-cloudrun"):
+            assert len(deploy_attempts) == 2
+            assert path.exists()
+            removed_cloudrun_dirs.append(path)
+        original_remove(path)
+
+    monkeypatch.setattr(m, "_remove_workspace", checked_remove)
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+
+    async def scenario():
+        response = await routes["/deploy"](DeployRequest(source=str(source), targets=["cloudrun"]))
+        deployment_id = response["deployment_id"]
+
+        async def wait_for_job():
+            while not m._jobs[deployment_id].completed:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_job(), timeout=5)
+        return await routes["/deploy/{deployment_id}"](deployment_id)
+
+    status = asyncio.run(scenario())
+    assert status["status"] == "completed"
+    assert len(deploy_attempts) == 2
+    assert "pip install --no-cache-dir flask" in deploy_attempts[1]
+    assert len(removed_cloudrun_dirs) == 1
+    assert not removed_cloudrun_dirs[0].exists()
+
+
+def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    dockerfile = (
+        "FROM python:3.11-slim\n"
+        "WORKDIR /app\n"
+        "COPY . .\n"
+        "EXPOSE 5000\n"
+        'CMD ["gunicorn", "-b", "127.0.0.1:5000", "app:app"]\n'
+    )
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(target="local", language="python", dockerfile=dockerfile),
+    )
+    deploy_attempts = []
+
+    def fake_deploy(directory, attempted_dockerfile, target):
+        deploy_attempts.append(attempted_dockerfile)
+        if len(deploy_attempts) == 1:
+            return DeployResult(
+                success=False,
+                target=target,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'flask'",
+            )
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    original_mkdtemp = m.tempfile.mkdtemp
+
+    def mkdtemp_in_test_dir(*args, **kwargs):
+        if len(args) >= 3:
+            args = (*args[:2], args[2] or tmp_path, *args[3:])
+        else:
+            kwargs["dir"] = kwargs.get("dir") or tmp_path
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(m.tempfile, "mkdtemp", mkdtemp_in_test_dir)
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+
+    async def scenario():
+        response = await routes["/deploy"](DeployRequest(source=str(source), targets=["local"]))
+        assert set(response) == {"deployment_id"}
+        deployment_id = response["deployment_id"]
+
+        async def wait_for_job():
+            while not m._jobs[deployment_id].completed:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_job(), timeout=5)
+        status = await routes["/deploy/{deployment_id}"](deployment_id)
+        assert status["status"] == "completed", status
+        events_response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        events = [event async for event in events_response.body_iterator]
+        return events
+
+    all_events = asyncio.run(scenario())
+    assert len(deploy_attempts) == 2
+    assert "pip install --no-cache-dir flask" in deploy_attempts[1]
+    # informational "log" lines (e.g. analyzer summary) may appear anywhere; the dashboard
+    # renders them, so they are part of the contract but not of the stage ordering.
+    assert all(set(json.loads(event["data"])) == {"type", "stage", "payload", "ts"} for event in all_events)
+    events = [event for event in all_events if event["event"] != "log"]
+    assert [event["event"] for event in events] == [
+        "stage",
+        "stage",
+        "stage",
+        "heal_diff",
+        "stage",
+        "done",
+    ]
+    decoded = [json.loads(event["data"]) for event in events]
+    assert all(set(event) == {"type", "stage", "payload", "ts"} for event in decoded)
+    assert decoded[2]["stage"] == "heal"
+    assert decoded[3]["stage"] == "heal"
+    assert decoded[4]["stage"] == "redeploy"
+    assert decoded[5]["type"] == "done"
+    assert decoded[5]["payload"]["success"] is True

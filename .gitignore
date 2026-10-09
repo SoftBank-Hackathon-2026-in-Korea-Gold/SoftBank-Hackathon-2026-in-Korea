@@ -68,3 +68,7 @@ temp/
 backend/nodes.json
 backend/.fleet/
 backend/.cloudmorph/
+
+
+# demo-up.sh runtime state
+.demo/

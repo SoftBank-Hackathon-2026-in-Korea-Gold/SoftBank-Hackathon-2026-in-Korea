@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -124,8 +125,11 @@ def test_projects_persist_across_restart(monkeypatch, tmp_path):
 
 
 def test_relative_sample_paths_resolve_against_repo_root():
+    # resolved against the repo root, then copied into an isolated workspace (never used in place)
+    original = main.REPO_ROOT / "sample-apps/guestbook"
     with main.prepare_source("sample-apps/guestbook") as d:
-        assert d.endswith("sample-apps/guestbook")
+        assert not d.startswith(str(main.REPO_ROOT))
+        assert (Path(d) / "app.py").read_text() == (original / "app.py").read_text()
 
 
 def test_project_status_is_persisted_when_the_job_finishes(monkeypatch, tmp_path):
