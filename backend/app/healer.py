@@ -101,6 +101,42 @@ def _error_excerpt(error_log: str, max_lines: int = 5) -> str:
     return "\n".join(lines[-max_lines:])
 
 
+# deployer stderr header: "[deployer] stage=<stage> kind=<kind> target=<target>" (docs/interfaces.md)
+_DEPLOYER_HEADER = re.compile(r"^\[deployer\] stage=(\S+) kind=(\S+)", re.MULTILINE)
+
+# Failures a Dockerfile patch cannot fix: credentials/billing/APIs, registry push, deployer bugs,
+# CLI timeouts (a retry costs up to the full build/deploy timeout). Stop and ask a human instead.
+UNHEALABLE_KINDS = frozenset({"user_action_required", "push_error", "internal_error", "timeout"})
+
+
+def deployer_header(error_log: str) -> tuple[str, str] | None:
+    """(stage, kind) from the deployer header, or None when the stderr has no header."""
+    m = _DEPLOYER_HEADER.search(error_log)
+    return (m.group(1), m.group(2)) if m else None
+
+
+def _unhealable(error_log: str) -> tuple[str, str] | None:
+    header = deployer_header(error_log)
+    return header if header and header[1] in UNHEALABLE_KINDS else None
+
+
+def _llm_context(error_log: str, tail: int = 40) -> str:
+    """Deployer header + diagnosis (lines before the first '--- ' section) + the last `tail` lines.
+
+    The header and diagnosis sit at the top of the stderr, so a plain tail drops them on long logs.
+    """
+    lines = [line for line in error_log.strip().splitlines() if line.strip()]
+    head: list[str] = []
+    if lines and lines[0].startswith("[deployer]"):
+        for line in lines[:3]:
+            if line.startswith("--- "):
+                break
+            head.append(line)
+    if len(head) + tail >= len(lines):
+        return "\n".join(lines)
+    return "\n".join([*head, "...", *lines[-tail:]])
+
+
 # --------------------------------------------------------------------------- #
 # 2. Rule-based patches. Each returns (new_dockerfile, rationale) or None.
 # --------------------------------------------------------------------------- #
@@ -187,7 +223,9 @@ def default_llm_patch(dockerfile: str, error_log: str, category: ErrorCategory) 
     from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
 
     llm = ChatOpenAI(model=os.environ.get("HEALER_MODEL", "gpt-4o"), temperature=0)
-    user = f"Error category: {category.value}\n\nstderr:\n{_error_excerpt(error_log, 40)}\n\nDockerfile:\n{dockerfile}"
+    user = (
+        f"Error category: {category.value}\n\nstderr:\n{_llm_context(error_log)}\n\nDockerfile:\n{dockerfile}"
+    )
     try:
         content = llm.invoke([("system", LLM_SYSTEM_PROMPT), ("user", user)]).content
     except Exception:  # network / quota errors must not crash the pipeline
@@ -220,7 +258,11 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
             emit(event)
 
     def classify(state: HealState) -> HealState:
-        return {"error_category": classify_error(state.get("error_log", ""))}
+        error_log = state.get("error_log", "")
+        update: HealState = {"error_category": classify_error(error_log)}
+        if _unhealable(error_log):
+            update["status"] = "gave_up"  # no Dockerfile patch can fix it: skip LLM + redeploy
+        return update
 
     def patch(state: HealState) -> HealState:
         before = state["current_dockerfile"]
@@ -267,6 +309,9 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
         status = "gave_up" if state["retry_count"] >= MAX_RETRIES else "healing"
         return {"status": status, "last_result": result, "error_log": result.stderr}
 
+    def after_classify(state: HealState) -> str:
+        return END if state.get("status") == "gave_up" else "patch"
+
     def after_patch(state: HealState) -> str:
         return END if state.get("status") == "gave_up" else "redeploy"
 
@@ -278,7 +323,7 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
     graph.add_node("patch", patch)
     graph.add_node("redeploy", redeploy)
     graph.set_entry_point("classify")
-    graph.add_edge("classify", "patch")
+    graph.add_conditional_edges("classify", after_classify, {"patch": "patch", END: END})
     graph.add_conditional_edges("patch", after_patch, {"redeploy": "redeploy", END: END})
     graph.add_conditional_edges("redeploy", after_redeploy, {"classify": "classify", END: END})
     return graph.compile()
@@ -309,11 +354,17 @@ def heal(
     success = final.get("status") == "healed"
     records = final.get("history", [])
     last = final.get("last_result")
-    summary = (
-        f"Healed after {len(records)} patch(es): " + "; ".join(r.rationale for r in records)
-        if success
-        else f"Gave up after {final.get('retry_count', 0)} attempt(s) (max {MAX_RETRIES})"
-    )
+    blocked = None if success else _unhealable(final.get("error_log", ""))
+    if success:
+        summary = f"Healed after {len(records)} patch(es): " + "; ".join(r.rationale for r in records)
+    elif blocked:
+        stage, kind = blocked
+        summary = (
+            f"Not auto-healable: deployer reported kind={kind} at stage={stage}; needs human action "
+            f"(after {len(records)} patch(es))"
+        )
+    else:
+        summary = f"Gave up after {final.get('retry_count', 0)} attempt(s) (max {MAX_RETRIES})"
     return HealReport(
         success=success,
         target=target,
