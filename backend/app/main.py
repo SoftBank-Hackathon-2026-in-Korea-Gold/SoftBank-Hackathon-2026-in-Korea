@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import os
-import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -42,6 +42,8 @@ load_dotenv()
 MAX_JOBS = 30
 MAX_EVENTS = 1000
 MAX_SOURCE_BYTES = 200 * 1024 * 1024
+MAX_SOURCE_FILES = 10_000  # Includes directories to bound traversal as well.
+SOURCE_IGNORE = {".git", ".venv", "node_modules", ".deployer", "__pycache__"}
 
 
 @dataclass
@@ -83,6 +85,8 @@ def _validate_https_git_url(source: str) -> str:
 def _extract_zip_safe(zip_path: Path, destination: Path) -> Path:
     with zipfile.ZipFile(zip_path) as archive:
         members = archive.infolist()
+        if len(members) > MAX_SOURCE_FILES:
+            raise ValueError("ZIP contents exceed file count limit")
         total = 0
         for item in members:
             name = item.filename.replace("\\", "/")
@@ -102,6 +106,66 @@ def _extract_zip_safe(zip_path: Path, destination: Path) -> Path:
     return top[0] if len(top) == 1 and top[0].is_dir() else destination
 
 
+def _inspect_source(source: str | Path, destination: Path | None = None) -> None:
+    """Validate or copy a bounded tree without following links, including during races.
+
+    Directory descriptors anchor traversal; O_NOFOLLOW also rejects entries
+    replaced by symlinks after inspection. Deployment copies omit build caches.
+    """
+    total = count = 0
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+
+    def visit(directory_fd: int, output: Path | None) -> None:
+        nonlocal total, count
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if output is not None and entry.name in SOURCE_IGNORE:
+                    continue
+                count += 1
+                if count > MAX_SOURCE_FILES:
+                    raise ValueError("Source exceeds file count limit")
+                info = os.stat(entry.name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISDIR(info.st_mode):
+                    child_fd = os.open(entry.name, directory_flags, dir_fd=directory_fd)
+                    try:
+                        child_output = output / entry.name if output is not None else None
+                        if child_output is not None:
+                            child_output.mkdir()
+                        visit(child_fd, child_output)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(info.st_mode):
+                    if output is None:
+                        total += info.st_size
+                        if total > MAX_SOURCE_BYTES:
+                            raise ValueError("Source exceeds size limit")
+                        continue
+                    file_fd = os.open(
+                        entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd
+                    )
+                    with os.fdopen(file_fd, "rb") as incoming:
+                        opened = os.fstat(incoming.fileno())
+                        if not stat.S_ISREG(opened.st_mode):
+                            raise ValueError("Source contains a non-regular file")
+                        with (output / entry.name).open("xb") as outgoing:
+                            while chunk := incoming.read(1024 * 1024):
+                                total += len(chunk)
+                                if total > MAX_SOURCE_BYTES:
+                                    raise ValueError("Source exceeds size limit")
+                                outgoing.write(chunk)
+                        (output / entry.name).chmod(stat.S_IMODE(opened.st_mode) & 0o777)
+                else:
+                    raise ValueError("Source contains a symlink or non-regular file")
+
+    root_fd = os.open(source, directory_flags)
+    try:
+        if destination is not None:
+            destination.mkdir()
+        visit(root_fd, destination)
+    finally:
+        os.close(root_fd)
+
+
 @contextmanager
 def prepare_source(source: str) -> Iterator[str]:
     """Prepare a local directory, local ZIP, or allowlisted public Git URL.
@@ -111,12 +175,15 @@ def prepare_source(source: str) -> Iterator[str]:
     """
     path = Path(source).expanduser()
     if path.is_dir():
+        _inspect_source(path)
         yield str(path.resolve())
         return
     with tempfile.TemporaryDirectory(prefix="cloudmorph-source-") as temp:
         root = Path(temp)
         if path.is_file() and path.suffix.lower() == ".zip":
-            yield _prepare_zip(path, root)
+            extracted = _prepare_zip(path, root)
+            _inspect_source(extracted)
+            yield extracted
             return
         if source.startswith("https://"):
             url = _validate_https_git_url(source)
@@ -132,6 +199,7 @@ def prepare_source(source: str) -> Iterator[str]:
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
                 raise ValueError(f"Git clone failed: {type(exc).__name__}") from exc
+            _inspect_source(dest)
             yield str(dest)
             return
         raise ValueError("Source must be an existing directory, local ZIP, or allowed HTTPS Git URL")
@@ -145,12 +213,7 @@ def _prepare_zip(path: Path, root: Path) -> str:
 
 def _copy_for_target(source: str, destination: Path) -> str:
     """Deployer writes Dockerfile and .deployer state; isolate each target."""
-    shutil.copytree(
-        source,
-        destination,
-        symlinks=True,
-        ignore=shutil.ignore_patterns(".git", ".venv", "node_modules", ".deployer", "__pycache__"),
-    )
+    _inspect_source(source, destination)
     return str(destination)
 
 
@@ -251,7 +314,9 @@ def create_app() -> FastAPI:
                 work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
                 for target in req.targets:
                     try:
-                        target_dir = _copy_for_target(source_dir, work_root / target)
+                        target_dir = _copy_for_target(
+                            source_dir, work_root / f"cloudmorph-{deployment_id}-{target}"
+                        )
                         run_pipeline(target_dir, target, emit, analysis=analysis)
                     except Exception as exc:  # noqa: BLE001 — isolate target failures
                         emit(
