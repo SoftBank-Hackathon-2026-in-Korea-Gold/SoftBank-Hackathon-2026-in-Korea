@@ -1,0 +1,37 @@
+name: 📋 작업 (Task)
+description: 여러 단계로 나뉘는 작업을 체크리스트로 관리합니다.
+title: "[Task] "
+labels: ["type:chore"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: 작업 내용 (Summary)
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 단계 (Steps)
+      description: 순서대로 진행할 단계를 적어 주세요. 단계별로 PR을 나눠도 좋습니다.
+      value: |
+        - [ ] 1단계:
+        - [ ] 2단계:
+        - [ ] 3단계:
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 대상 모듈 (Area)
+      multiple: true
+      options:
+        - analyzer
+        - deployer
+        - healer
+        - api (main.py)
+        - contract (schemas.py)
+        - frontend
+        - sample-apps
+        - infra (.github / Docker / GCP)
+        - docs

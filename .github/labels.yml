@@ -1,0 +1,97 @@
+# Single source of truth for repository labels.
+# Apply with: scripts/sync-labels.sh  (idempotent — edit this file, then re-run)
+#
+# aliases: existing labels to rename into `name` (keeps issue/PR associations).
+# delete:  labels removed from the repo if present.
+
+labels:
+  # --- type: what kind of change (matches conventional-commit prefixes) ---
+  - name: "type:feature"
+    color: "1f6feb"
+    description: "새 기능 / New feature (feat)"
+    aliases: ["enhancement"]
+  - name: "type:bug"
+    color: "0b4fb3"
+    description: "버그 수정 / Something isn't working (fix)"
+    aliases: ["bug"]
+  - name: "type:docs"
+    color: "54aeff"
+    description: "문서 / Documentation (docs)"
+    aliases: ["documentation"]
+  - name: "type:test"
+    color: "218bff"
+    description: "테스트 추가·수정 / Tests (test)"
+  - name: "type:refactor"
+    color: "80ccff"
+    description: "동작 변경 없는 구조 개선 / Refactor (refactor)"
+  - name: "type:chore"
+    color: "b6e3ff"
+    description: "잡무·설정 / Chore (chore)"
+  - name: "type:ci"
+    color: "0a3069"
+    description: "CI·워크플로 / CI (ci)"
+
+  # --- area: which module (README "Repository layout") ---
+  - name: "area:analyzer"
+    color: "1a7f37"
+    description: "backend/app/analyzer.py — 코드 분석·타깃 결정"
+  - name: "area:deployer"
+    color: "2da44e"
+    description: "backend/app/deployer.py — Docker / Cloud Run 배포"
+  - name: "area:healer"
+    color: "4ac26b"
+    description: "backend/app/healer.py — 자가치유 루프"
+  - name: "area:api"
+    color: "116329"
+    description: "backend/app/main.py — FastAPI 오케스트레이션·SSE"
+  - name: "area:contract"
+    color: "044f1e"
+    description: "schemas.py · docs/interfaces.md — 모듈 간 공용 계약 (팀 합의 필요)"
+  - name: "area:frontend"
+    color: "6fdd8b"
+    description: "frontend/ — React 대시보드"
+  - name: "area:sample-apps"
+    color: "aceebb"
+    description: "sample-apps/ — 시연용 정상/고장 샘플 앱"
+  - name: "area:docs"
+    color: "dafbe1"
+    description: "docs/ · README"
+  - name: "area:infra"
+    color: "0e4429"
+    description: ".github · Docker · GCP 설정"
+
+  # --- priority: hackathon demo impact ---
+  - name: "P0: demo-blocker"
+    color: "b60205"
+    description: "시연을 막는 문제 — 최우선"
+  - name: "P1"
+    color: "e99695"
+    description: "시연 전 처리 권장"
+  - name: "P2"
+    color: "fbca04"
+    description: "여유 있을 때"
+
+  # --- status ---
+  - name: "blocked"
+    color: "57606a"
+    description: "다른 작업·결정 대기 중"
+  - name: "needs-discussion"
+    color: "8c959f"
+    description: "팀 논의 필요"
+
+  # --- kept GitHub defaults ---
+  - name: "duplicate"
+    color: "cfd3d7"
+    description: "이미 존재하는 이슈/PR"
+  - name: "wontfix"
+    color: "ffffff"
+    description: "진행하지 않음"
+  - name: "question"
+    color: "d876e3"
+    description: "추가 정보 필요"
+
+delete:
+  - "good first issue"
+  - "help wanted"
+  - "invalid"
+  - "accessibility"
