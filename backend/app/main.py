@@ -13,8 +13,11 @@ This module orchestrates the team's analyzer, deployer, and healer unchanged.
 from __future__ import annotations
 
 import asyncio
+import errno
 import ipaddress
+import logging
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -44,6 +47,8 @@ MAX_JOBS = 30
 MAX_EVENTS = 1000
 MAX_SOURCE_BYTES = 200 * 1024 * 1024
 MAX_SOURCE_FILES = 10_000  # Includes directories to bound traversal as well.
+MAX_ZIP_UNCOMPRESSED_BYTES = MAX_SOURCE_BYTES
+MAX_ZIP_ENTRIES = MAX_SOURCE_FILES
 try:
     MAX_CONCURRENT_GIT_CLONES = int(os.getenv("CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES", "2"))
 except ValueError as exc:
@@ -53,6 +58,31 @@ if MAX_CONCURRENT_GIT_CLONES < 1:
 GIT_CLONE_WAIT_SECONDS = 5
 _git_clone_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_GIT_CLONES)
 SOURCE_IGNORE = {".git", ".venv", "node_modules", ".deployer", "__pycache__"}
+SENSITIVE_DIRS = {".aws", ".azure", ".gnupg", ".kube", ".ssh"}
+SENSITIVE_CONFIG_DIRS = {(".config", "gcloud"), (".config", "gh")}
+SAFE_ENV_TEMPLATE_NAMES = {".env.example"}
+SENSITIVE_FILE_NAMES = {
+    ".envrc",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
+    "application_default_credentials.json",
+    "credentials",
+    "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    "id_rsa",
+    "kubeconfig",
+    "terraform.tfstate",
+    "terraform.tfstate.backup",
+}
+SENSITIVE_FILE_SUFFIXES = (".jks", ".key", ".keystore", ".p12", ".p7b", ".p7c", ".p8", ".pem", ".pfx")
+_LOCAL_SOURCE_DENY_ROOTS = tuple(
+    Path(p) for p in ("/", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/var/run")
+)
+_logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -94,9 +124,10 @@ def _validate_https_git_url(source: str) -> str:
 def _extract_zip_safe(zip_path: Path, destination: Path) -> Path:
     with zipfile.ZipFile(zip_path) as archive:
         members = archive.infolist()
-        if len(members) > MAX_SOURCE_FILES:
+        if len(members) > MAX_ZIP_ENTRIES:
             raise ValueError("ZIP contents exceed file count limit")
         total = 0
+        safe_members = []
         for item in members:
             name = item.filename.replace("\\", "/")
             parts = Path(name).parts
@@ -108,27 +139,76 @@ def _extract_zip_safe(zip_path: Path, destination: Path) -> Path:
             ):
                 raise ValueError("Unsafe ZIP entry detected")
             total += item.file_size
-            if total > MAX_SOURCE_BYTES:
+            if total > MAX_ZIP_UNCOMPRESSED_BYTES:
                 raise ValueError("ZIP contents exceed size limit")
-        archive.extractall(destination)
+            if not _is_sensitive_source_path(parts):
+                safe_members.append(item)
+        archive.extractall(destination, safe_members)
     top = list(destination.iterdir())
     return top[0] if len(top) == 1 and top[0].is_dir() else destination
+
+
+def _is_sensitive_source_path(parts: tuple[str, ...]) -> bool:
+    lowered_parts = tuple(part.lower() for part in parts)
+    if any(part in SENSITIVE_DIRS for part in lowered_parts):
+        return True
+    if any(
+        lowered_parts[index : index + 2] in SENSITIVE_CONFIG_DIRS for index in range(len(lowered_parts) - 1)
+    ):
+        return True
+    if any(
+        lowered_parts[index : index + 2] == (".docker", "config.json")
+        for index in range(len(lowered_parts) - 1)
+    ):
+        return True
+
+    name = lowered_parts[-1]
+    return (
+        name == ".env"
+        or (name.startswith(".env.") and name not in SAFE_ENV_TEMPLATE_NAMES)
+        or name in SENSITIVE_FILE_NAMES
+        or name.startswith(("id_rsa", "id_ecdsa", "id_ed25519", "id_dsa", "terraform.tfstate."))
+        or name.endswith(SENSITIVE_FILE_SUFFIXES)
+        or ("service-account" in name and name.endswith(".json"))
+    )
+
+
+def _validate_local_source(path: Path) -> Path:
+    if path.is_symlink():
+        raise OSError(errno.ELOOP, "Local source root must not be a symlink", str(path))
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError("Local source does not exist or cannot be resolved") from exc
+
+    for denied in _LOCAL_SOURCE_DENY_ROOTS:
+        if (denied == Path("/") and resolved == denied) or (
+            denied != Path("/") and (resolved == denied or denied in resolved.parents)
+        ):
+            raise ValueError("Local source is under a protected system directory")
+    resolved_parts = tuple(part.lower() for part in resolved.parts)
+    if any(part in SENSITIVE_DIRS for part in resolved_parts) or any(
+        resolved_parts[index : index + 2] in SENSITIVE_CONFIG_DIRS for index in range(len(resolved_parts) - 1)
+    ):
+        raise ValueError("Local source is under a protected credentials directory")
+    return resolved
 
 
 def _inspect_source(source: str | Path, destination: Path | None = None) -> None:
     """Validate or copy a bounded tree without following links, including during races.
 
     Directory descriptors anchor traversal; O_NOFOLLOW also rejects entries
-    replaced by symlinks after inspection. Both modes skip SOURCE_IGNORE entries.
+    replaced by symlinks after inspection. Sensitive files are omitted from copied trees.
     """
     total = count = 0
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 
-    def visit(directory_fd: int, output: Path | None) -> None:
+    def visit(directory_fd: int, output: Path | None, relative_parts: tuple[str, ...]) -> None:
         nonlocal total, count
         with os.scandir(directory_fd) as entries:
             for entry in entries:
-                if entry.name in SOURCE_IGNORE:
+                entry_parts = (*relative_parts, entry.name)
+                if entry.name in SOURCE_IGNORE or _is_sensitive_source_path(entry_parts):
                     continue
                 count += 1
                 if count > MAX_SOURCE_FILES:
@@ -140,7 +220,7 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
                         child_output = output / entry.name if output is not None else None
                         if child_output is not None:
                             child_output.mkdir()
-                        visit(child_fd, child_output)
+                        visit(child_fd, child_output, entry_parts)
                     finally:
                         os.close(child_fd)
                 elif stat.S_ISREG(info.st_mode):
@@ -170,7 +250,7 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
     try:
         if destination is not None:
             destination.mkdir()
-        visit(root_fd, destination)
+        visit(root_fd, destination, ())
     finally:
         os.close(root_fd)
 
@@ -182,18 +262,9 @@ def prepare_source(source: str) -> Iterator[str]:
     Source is treated as trusted input: this is a hackathon demo API and must
     not be exposed publicly without authentication and isolation.
     """
-    path = Path(source).expanduser()
-    if path.is_dir():
-        _inspect_source(path)
-        yield str(path.resolve())
-        return
+    path = None if source.startswith("https://") else Path(source).expanduser()
     with tempfile.TemporaryDirectory(prefix="cloudmorph-source-") as temp:
         root = Path(temp)
-        if path.is_file() and path.suffix.lower() == ".zip":
-            extracted = _prepare_zip(path, root)
-            _inspect_source(extracted)
-            yield extracted
-            return
         if source.startswith("https://"):
             url = _validate_https_git_url(source)
             dest = root / "project"
@@ -223,8 +294,16 @@ def prepare_source(source: str) -> Iterator[str]:
                     raise ValueError(f"Git clone failed: {type(exc).__name__}") from exc
             finally:
                 _git_clone_semaphore.release()
-            _inspect_source(dest)
-            yield str(dest)
+            yield _copy_for_target(str(dest), root / "prepared")
+            return
+        if path is not None and path.is_dir():
+            local_source = _validate_local_source(path)
+            yield _copy_for_target(str(local_source), root / "prepared")
+            return
+        if path is not None and path.is_file() and path.suffix.lower() == ".zip":
+            zip_source = _validate_local_source(path)
+            extracted = _prepare_zip(zip_source, root)
+            yield _copy_for_target(extracted, root / "prepared")
             return
         raise ValueError("Source must be an existing directory, local ZIP, or allowed HTTPS Git URL")
 
@@ -239,6 +318,15 @@ def _copy_for_target(source: str, destination: Path) -> str:
     """Deployer writes Dockerfile and .deployer state; isolate each target."""
     _inspect_source(source, destination)
     return str(destination)
+
+
+def _remove_workspace(path: Path) -> None:
+    try:
+        shutil.rmtree(path)
+    except FileNotFoundError:
+        return
+    except OSError:
+        _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
 def run_pipeline(
@@ -333,14 +421,12 @@ def create_app() -> FastAPI:
                 analysis = analyzer.analyze(source_dir)
                 # Separate target workspaces because deployer writes Dockerfile
                 # and may leave background local container/tunnel artifacts.
-                # Keep workspaces while deployments are running; they can be
-                # removed by the operator after the demo.
+                # Local deployment state is retained for container/tunnel cleanup.
                 work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
                 for target in req.targets:
+                    target_dir = work_root / f"cloudmorph-{deployment_id}-{target}"
                     try:
-                        target_dir = _copy_for_target(
-                            source_dir, work_root / f"cloudmorph-{deployment_id}-{target}"
-                        )
+                        target_dir = Path(_copy_for_target(source_dir, target_dir))
                         run_pipeline(target_dir, target, emit, analysis=analysis)
                     except Exception as exc:  # noqa: BLE001 — isolate target failures
                         emit(
@@ -352,6 +438,11 @@ def create_app() -> FastAPI:
                                 },
                             )
                         )
+                    finally:
+                        if target == "cloudrun":
+                            _remove_workspace(target_dir)
+                if "local" not in req.targets:
+                    _remove_workspace(work_root)
 
         async def worker() -> None:
             job.state = "running"
