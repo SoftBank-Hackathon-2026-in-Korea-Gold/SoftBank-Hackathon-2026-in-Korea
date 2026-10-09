@@ -1,5 +1,5 @@
 // Thin client for the CloudMorph backend. Same-origin: the Vite dev server (and the demo tunnel)
-// proxy /deploy, /health and /fleet to FastAPI, so no base URL and no CORS.
+// proxy /deploy, /health, /fleet, /projects and /webhook to FastAPI, so no base URL and no CORS.
 const TOKEN_KEY = 'cloudmorph.apiToken'
 
 export const getToken = () => localStorage.getItem(TOKEN_KEY) || ''
@@ -10,9 +10,10 @@ const headers = () => ({
   ...(getToken() ? { 'X-API-Token': getToken() } : {}),
 })
 
-export async function startDeploy(source, targets) {
-  const res = await fetch('/deploy', { method: 'POST', headers: headers(), body: JSON.stringify({ source, targets }) })
-  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 200)}`)
+export async function startDeploy({ source, targets, name, ref }) {
+  const body = { source, targets, ...(name ? { name } : {}), ...(ref ? { ref } : {}) }
+  const res = await fetch('/deploy', { method: 'POST', headers: headers(), body: JSON.stringify(body) })
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
   return (await res.json()).deployment_id
 }
 
@@ -22,10 +23,25 @@ export async function getDeployment(id) {
   return res.json()
 }
 
+export async function getHealth() {
+  try {
+    const res = await fetch('/health')
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 export async function getFleet() {
   const res = await fetch('/fleet', { headers: headers() })
-  if (!res.ok) return null // older backend without the node pool
+  if (!res.ok) return null // backend without the node pool
   return res.json()
+}
+
+export async function getProjects() {
+  const res = await fetch('/projects', { headers: headers() })
+  if (!res.ok) return null
+  return (await res.json()).projects
 }
 
 /** Subscribe to the SSE stream. `onEvent(type, payload, raw)`; returns a close() function. */
