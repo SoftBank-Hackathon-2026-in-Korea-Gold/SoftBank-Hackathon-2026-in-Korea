@@ -21,6 +21,7 @@ import difflib
 import logging
 import os
 import re
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
@@ -132,7 +133,10 @@ class AppCodeError(NamedTuple):
     func: str  # "<module>" = crashed while importing
 
 
-_EXCEPTION_LINE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception): .*$", re.MULTILINE)
+_EXCEPTION_LINE = re.compile(
+    r"^(?!Traceback|During|The above)[A-Za-z_][\w.]*(?:Error|Exception|[A-Z][A-Za-z0-9_]*)(?::\s*.*)?$",
+    re.MULTILINE,
+)
 _FRAME_LINE = re.compile(r'^\s*File "([^"]+)", line (\d+), in (\S+)', re.MULTILINE)
 _LIBRARY_PATH = re.compile(r"site-packages|dist-packages|^<|/usr/(?:local/)?lib/python")
 
@@ -345,10 +349,14 @@ def _configured_providers() -> list[str]:
         if provider is None:
             logger.warning("Unknown LLM_PROVIDER=%r; falling back to auto-detect", forced)
         else:
+            if provider == "local" and not _base_url():
+                logger.warning("LLM_PROVIDER=%r selected but no base URL configured; skipping", forced)
+                return []
             return [provider]
+    openai_key = (os.environ.get("OPENAI_API_KEY") or "").strip()
     available = {
         "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY")),
-        "openai": bool(os.environ.get("OPENAI_API_KEY")) and not _base_url(),
+        "openai": bool(openai_key and openai_key != "EMPTY"),
         "local": bool(_base_url()),
     }
     return [p for p in PROVIDER_ORDER if available[p]]
@@ -372,10 +380,10 @@ def _model_for(provider: str) -> str | None:
     return DEFAULT_MODELS.get(provider)  # local has no default: the served model name must be given
 
 
-def _call_anthropic(system: str, user: str, model: str) -> str | None:
+def _call_anthropic(system: str, user: str, model: str, timeout: float = LLM_TIMEOUT_S) -> str | None:
     import anthropic  # lazy: keep import cost off the rule path
 
-    client = anthropic.Anthropic(timeout=LLM_TIMEOUT_S, max_retries=1)
+    client = anthropic.Anthropic(timeout=timeout, max_retries=0)
     r = client.messages.create(
         model=model, max_tokens=8000, system=system, messages=[{"role": "user", "content": user}]
     )
@@ -386,12 +394,18 @@ def _call_anthropic(system: str, user: str, model: str) -> str | None:
     return text
 
 
-def _call_openai_compatible(system: str, user: str, model: str, provider: str) -> str | None:
+def _call_openai_compatible(
+    system: str, user: str, model: str, provider: str, timeout: float = LLM_TIMEOUT_S
+) -> str | None:
     from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
 
-    kwargs: dict = {"model": model, "temperature": 0, "timeout": LLM_TIMEOUT_S, "max_retries": 1}
+    kwargs: dict = {"model": model, "temperature": 0, "timeout": timeout, "max_retries": 0}
     if provider == "local":
-        kwargs["base_url"] = _base_url()
+        base_url = _base_url()
+        if not base_url:
+            logger.warning("Local provider selected but no base_url configured; skipping")
+            return None
+        kwargs["base_url"] = base_url
         kwargs["api_key"] = os.environ.get("OPENAI_API_KEY") or "EMPTY"  # local servers ignore the key
     else:
         kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
@@ -407,16 +421,22 @@ def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
             "No LLM configured (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL); rule patches only"
         )
         return None
+    deadline = time.monotonic() + LLM_TIMEOUT_S
     for provider in providers:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            logger.warning("Overall LLM deadline exceeded; skipping provider %s", provider)
+            break
         model = _model_for(provider)
         if not model:
             logger.warning("LLM provider %s needs HEALER_MODEL (served model name); skipping", provider)
             continue
         try:
+            timeout = max(1, round(remaining))
             if provider == "anthropic":
-                text = _call_anthropic(system, user, model)
+                text = _call_anthropic(system, user, model, timeout=timeout)
             else:
-                text = _call_openai_compatible(system, user, model, provider)
+                text = _call_openai_compatible(system, user, model, provider, timeout=timeout)
         except Exception:  # network / auth / quota / timeout / bad model id must not crash the pipeline
             logger.exception("LLM call failed (provider=%s, model=%s)", provider, model)
             continue

@@ -306,3 +306,100 @@ def test_no_llm_configured_returns_none(clean_llm_env):
     from app.healer import default_llm_patch
 
     assert default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN) is None
+
+
+def test_app_code_failure_bare_exception_and_custom_name():
+    from app.healer import app_code_failure
+
+    bare_err_log = (
+        "[deployer] stage=verify kind=runtime_error target=local\n"
+        "Traceback (most recent call last):\n"
+        '  File "/app/main.py", line 42, in run\n'
+        "    raise RuntimeError\n"
+        "RuntimeError\n"
+    )
+    res = app_code_failure(bare_err_log)
+    assert res is not None
+    assert res.exception == "RuntimeError"
+    assert res.line == 42
+    assert res.path == "/app/main.py"
+
+    custom_err_log = (
+        "[deployer] stage=verify kind=runtime_error target=local\n"
+        "Traceback (most recent call last):\n"
+        '  File "/app/server.py", line 15, in <module>\n'
+        '    raise CustomFatalCrash("fatal")\n'
+        "CustomFatalCrash: fatal\n"
+    )
+    res_custom = app_code_failure(custom_err_log)
+    assert res_custom is not None
+    assert res_custom.exception == "CustomFatalCrash: fatal"
+    assert res_custom.line == 15
+    assert res_custom.path == "/app/server.py"
+
+
+def test_forced_local_provider_without_base_url_never_hits_openai(clean_llm_env):
+    from app.healer import default_llm_patch
+
+    clean_llm_env.setenv("LLM_PROVIDER", "vllm")
+    clean_llm_env.setenv("OPENAI_API_KEY", "sk-secret-real-key")
+    # No OPENAI_BASE_URL set!
+    created: dict = {}
+    _fake_chat_openai(clean_llm_env, "FROM leak\n", created)
+
+    assert default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN) is None
+    assert not created  # Must never call OpenAI
+
+
+def test_openai_falls_through_to_local_when_both_configured(clean_llm_env):
+    import langchain_openai
+
+    from app.healer import default_llm_patch
+
+    clean_llm_env.setenv("OPENAI_API_KEY", "sk-test")
+    clean_llm_env.setenv("OPENAI_BASE_URL", "http://local:8000/v1")
+    clean_llm_env.setenv("HEALER_MODEL", "qwen")
+    clean_llm_env.setenv("HEALER_MODEL_OPENAI", "gpt-4o")
+
+    calls = []
+
+    class MockChatOpenAI:
+        def __init__(self, **kwargs):
+            calls.append(kwargs)
+            self.base_url = kwargs.get("base_url")
+
+        def invoke(self, *args, **kwargs):
+            if not self.base_url:
+                raise RuntimeError("OpenAI rate limit 429")
+            return type("R", (), {"content": "FROM local\n"})()
+
+    clean_llm_env.setattr(langchain_openai, "ChatOpenAI", MockChatOpenAI)
+
+    assert default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN) == "FROM local\n"
+    assert len(calls) == 2
+    assert "base_url" not in calls[0]
+    assert calls[1]["base_url"] == "http://local:8000/v1"
+
+
+def test_deadline_skips_further_providers_on_timeout(clean_llm_env, monkeypatch):
+    import time
+
+    from app.healer import default_llm_patch
+
+    clean_llm_env.setenv("ANTHROPIC_API_KEY", "test-key")
+    clean_llm_env.setenv("OPENAI_API_KEY", "sk-test")
+
+    start_time = 1000.0
+    times = [start_time, start_time + 35.0, start_time + 35.0]
+
+    def mock_monotonic():
+        return times.pop(0) if times else start_time + 50.0
+
+    monkeypatch.setattr(time, "monotonic", mock_monotonic)
+
+    _fake_anthropic(clean_llm_env, RuntimeError("timeout"), {})
+    openai_created: dict = {}
+    _fake_chat_openai(clean_llm_env, "FROM openai\n", openai_created)
+
+    assert default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN) is None
+    assert not openai_created  # OpenAI was skipped because deadline was exceeded
