@@ -40,8 +40,10 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 | **cloudflared CLI** (선택) | 최신 버전 | 로컬 배포 성공 시 외부 접속 가능한 Quick Tunnel 공개 URL 발급 | `cloudflared --version` |
 
 ### 2.3 외부 클라우드 및 API 계정 요구사항
-- **Anthropic API Key**:
-  - Claude 모델(기본 `claude-haiku-5-5`) 호출 권한 필요.
+- **LLM (셋 중 하나 이상)**:
+  - Claude API (`ANTHROPIC_API_KEY`, 기본 `claude-haiku-5-5`) — analyzer는 현재 Claude 필수
+  - OpenAI API (`OPENAI_API_KEY`, healer 기본 `gpt-4o`)
+  - 로컬 서빙 vLLM / SGLang / Ollama / llama.cpp (`OPENAI_BASE_URL`, healer 전용, `HEALER_MODEL`에 모델명 지정)
   - Healer의 복합 에러 분석/수선 및 Analyzer의 AI 심층 검사관에서 사용.
 - **Google Cloud Platform (GCP) 계정**:
   - GCP Project 생성 및 결제 계정(Billing) 연결 필수.
@@ -61,8 +63,11 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 
 | 환경변수명 | 필수 여부 | 기본값 | 사용 모듈 | 상세 설명 |
 |---|:---:|---|---|---|
-| `ANTHROPIC_API_KEY` | **필수** | - | `healer`, `analyzer` | Anthropic API 인증 키. 미설정 시 자가치유는 규칙 패치만 동작하며 analyzer는 분석하지 않습니다. |
-| `HEALER_MODEL` | 선택 | `claude-haiku-5-5` | `healer.py` | 자가치유 LLM 에이전트가 코드 패치 생성에 사용할 Claude 모델. |
+| `ANTHROPIC_API_KEY` | analyzer 필수 · healer 선택 | - | `healer`, `analyzer` | Anthropic(Claude) API 키. analyzer는 이 키가 없으면 분석하지 않습니다. |
+| `OPENAI_API_KEY` | 선택 | - | `healer.py` | OpenAI API 키. 로컬 서버가 키를 요구하면 그 키를 넣습니다. |
+| `OPENAI_BASE_URL` | 선택 | - | `healer.py` | 로컬/호환 서버 엔드포인트(vLLM, SGLang, Ollama, llama.cpp 등). 예: `http://localhost:8000/v1` |
+| `LLM_PROVIDER` | 선택 | 자동 | `healer.py` | 제공자 고정: `anthropic`/`openai`/`local`/`vllm`/`sglang`/`ollama`/`llamacpp`. 비우면 Claude → OpenAI → 로컬 순서로 시도 |
+| `HEALER_MODEL` | 선택 (로컬은 필수) | 제공자별 (`claude-haiku-5-5` / `gpt-4o`) | `healer.py` | healer 모델. 다른 제공자용 이름이면 무시하고 기본값 사용. 제공자별 지정: `HEALER_MODEL_ANTHROPIC` / `HEALER_MODEL_OPENAI` / `HEALER_MODEL_LOCAL` |
 | `ANALYZER_MODEL` | 선택 | `claude-haiku-5-5` | `analyzer.py` | 소스코드 정적 분석 및 위험 탐지에 사용할 AI 검사관 모델. |
 | `ANALYZER_MAX_LLM_CALLS` | 선택 | `6` | `analyzer.py` | 서버 전체에서 동시 실행 가능한 검사관 LLM 호출 수 상한(세마포어). |
 | `ANALYZER_MAX_TURNS` | 선택 | `15` | `analyzer.py` | 검사관 에이전트의 저장소 파일 탐색 도구(tool calling) 최대 턴 수. |
@@ -185,7 +190,7 @@ cd one-action-cloudmorph
 
 # 2. 환경변수 파일 준비
 cp .env.example .env
-# .env 파일을 열어 ANTHROPIC_API_KEY 및 필요 시 GCP_PROJECT_ID 설정
+# .env 파일을 열어 ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL 중 하나 이상과, 필요 시 GCP_PROJECT_ID 설정
 
 # 3. 백엔드 디렉토리 이동 및 의존성 설치
 cd backend
