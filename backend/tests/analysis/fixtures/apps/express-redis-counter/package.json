@@ -1,7 +1,0 @@
-{
-  "name": "express-redis-counter",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "dependencies": { "express": "^4.21.2", "redis": "^4.7.0" }
-}
