@@ -9,6 +9,7 @@ from app.deployer import Config, detect_database, wants_database
 
 
 def _app(tmp_path: Path, **files: str) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     for name, body in files.items():
         (tmp_path / name).write_text(body)
     return tmp_path
@@ -48,7 +49,8 @@ def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
     calls: list[list[str]] = []
 
     class R:
-        steps = []
+        def __init__(self):
+            self.steps = []
 
         def run(self, name, cmd, **kw):
             calls.append(cmd)
