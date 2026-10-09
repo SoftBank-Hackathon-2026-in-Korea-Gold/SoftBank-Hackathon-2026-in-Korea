@@ -2,7 +2,8 @@
 
     HEALER_LIVE_LLM=1 uv run pytest -q tests/test_healer_live_llm.py -s
 
-Reads ANTHROPIC_API_KEY / HEALER_MODEL from the repo .env. Two short Claude calls (shared team key).
+Reads the repo .env: ANTHROPIC_API_KEY (Claude) / OPENAI_API_KEY (OpenAI) / OPENAI_BASE_URL (local server),
+plus optional LLM_PROVIDER / HEALER_MODEL. Two short calls to whichever provider is configured.
 Assertions are loose on purpose: the model's exact wording varies, the shape must not.
 """
 
@@ -29,8 +30,10 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 @pytest.fixture(autouse=True, scope="module")
 def _env():
     load_dotenv(ROOT / ".env")  # tests import app.healer, never app.main, so load it here
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        pytest.skip("no ANTHROPIC_API_KEY in env or .env")
+    from app.healer import _configured_providers
+
+    if not _configured_providers():
+        pytest.skip("no ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL in env or .env")
 
 
 def test_dockerfile_fallback_returns_a_changed_dockerfile():

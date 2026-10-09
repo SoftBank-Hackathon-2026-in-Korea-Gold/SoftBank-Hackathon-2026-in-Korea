@@ -8,7 +8,7 @@ Dockerfile, redeploy, and repeat until success or MAX_RETRIES.
        +----(still failing)---+--(retry_count >= MAX_RETRIES)--> END (gave_up)
 
 Design notes
-- Deterministic rules first, LLM (Claude) only as fallback: the demo cases
+- Deterministic rules first, LLM (OpenAI / Claude / local OpenAI-compatible) only as fallback: the demo cases
   (port binding, missing package) must not depend on an API call landing,
   and it keeps cost inside the team budget.
 - The deployer is injected (`deploy_fn`) so healer owns the retry loop
@@ -285,7 +285,7 @@ RULE_PATCHES: dict[ErrorCategory, Callable[[str, str], tuple[str, str] | None]] 
 
 
 # --------------------------------------------------------------------------- #
-# 3. LLM fallback (Claude). Skipped silently when ANTHROPIC_API_KEY is absent.
+# 3. LLM fallback: OpenAI / Claude / local (vLLM, SGLang, Ollama, llama.cpp ...). Skipped when none is set.
 # --------------------------------------------------------------------------- #
 LLM_SYSTEM_PROMPT = (
     "You are a container deployment repair agent. Given a Dockerfile and the stderr of a failed "
@@ -300,41 +300,131 @@ SOURCE_SYSTEM_PROMPT = (
 )
 
 LLM_TIMEOUT_S = 30  # a slow endpoint must not freeze the demo; on timeout the caller just gets None
-DEFAULT_HEALER_MODEL = "claude-haiku-5-5"
+
+# Provider is picked from whatever is in .env, so any of the three works without code changes:
+#   anthropic : ANTHROPIC_API_KEY                         (Claude API, Anthropic SDK)
+#   openai    : OPENAI_API_KEY                            (OpenAI API)
+#   local     : OPENAI_BASE_URL / LLM_BASE_URL            (vLLM, SGLang, Ollama, llama.cpp, LM Studio,
+#                                                          or any OpenAI-compatible proxy)
+# LLM_PROVIDER forces one (anthropic|claude|openai|local|vllm|sglang|ollama|llamacpp). Otherwise every
+# configured provider is tried in the order below until one answers, so a dead key falls through.
+PROVIDER_ORDER = ("anthropic", "openai", "local")
+DEFAULT_MODELS = {"anthropic": "claude-haiku-5-5", "openai": "gpt-4o"}
+_PROVIDER_ALIASES = {
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "openai": "openai",
+    "gpt": "openai",
+    "local": "local",
+    "vllm": "local",
+    "sglang": "local",
+    "ollama": "local",
+    "llamacpp": "local",
+    "llama.cpp": "local",
+    "lmstudio": "local",
+    "compatible": "local",
+}
+OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 
 
-def _claude_client():
-    """Anthropic client for the shared team key, or None when ANTHROPIC_API_KEY is not set."""
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        logger.info("ANTHROPIC_API_KEY not set; skipping LLM call (rule patches only)")
-        return None
+def _base_url() -> str | None:
+    url = (
+        os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_API_BASE")
+        or os.environ.get("LLM_BASE_URL")
+    )
+    if not url and (os.environ.get("LLM_PROVIDER") or "").strip().lower() == "ollama":
+        url = OLLAMA_DEFAULT_BASE_URL
+    return url
+
+
+def _configured_providers() -> list[str]:
+    forced = (os.environ.get("LLM_PROVIDER") or "").strip().lower()
+    if forced:
+        provider = _PROVIDER_ALIASES.get(forced)
+        if provider is None:
+            logger.warning("Unknown LLM_PROVIDER=%r; falling back to auto-detect", forced)
+        else:
+            return [provider]
+    available = {
+        "anthropic": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "openai": bool(os.environ.get("OPENAI_API_KEY")) and not _base_url(),
+        "local": bool(_base_url()),
+    }
+    return [p for p in PROVIDER_ORDER if available[p]]
+
+
+def _model_for(provider: str) -> str | None:
+    """HEALER_MODEL_<PROVIDER> > HEALER_MODEL (if it fits the provider) > provider default."""
+    specific = os.environ.get(f"HEALER_MODEL_{provider.upper()}")
+    if specific:
+        return specific
+    model = os.environ.get("HEALER_MODEL")
+    if model:
+        name = model.lower()
+        # A model id meant for another provider would just 404; use this provider's default instead.
+        if provider == "anthropic" and not name.startswith("claude"):
+            logger.info("HEALER_MODEL=%s is not a Claude model; using %s", model, DEFAULT_MODELS["anthropic"])
+        elif provider == "openai" and name.startswith("claude"):
+            logger.info("HEALER_MODEL=%s is not an OpenAI model; using %s", model, DEFAULT_MODELS["openai"])
+        else:
+            return model
+    return DEFAULT_MODELS.get(provider)  # local has no default: the served model name must be given
+
+
+def _call_anthropic(system: str, user: str, model: str) -> str | None:
     import anthropic  # lazy: keep import cost off the rule path
 
-    return anthropic.Anthropic(timeout=LLM_TIMEOUT_S, max_retries=1)
+    client = anthropic.Anthropic(timeout=LLM_TIMEOUT_S, max_retries=1)
+    r = client.messages.create(
+        model=model, max_tokens=8000, system=system, messages=[{"role": "user", "content": user}]
+    )
+    # Read text blocks by type: the reply can start with thinking blocks
+    text = "".join(getattr(b, "text", "") for b in r.content if b.type == "text").strip()
+    if r.stop_reason == "refusal":
+        return None
+    return text
+
+
+def _call_openai_compatible(system: str, user: str, model: str, provider: str) -> str | None:
+    from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
+
+    kwargs: dict = {"model": model, "temperature": 0, "timeout": LLM_TIMEOUT_S, "max_retries": 1}
+    if provider == "local":
+        kwargs["base_url"] = _base_url()
+        kwargs["api_key"] = os.environ.get("OPENAI_API_KEY") or "EMPTY"  # local servers ignore the key
+    else:
+        kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
+    content = ChatOpenAI(**kwargs).invoke([("system", system), ("user", user)]).content
+    return str(content).strip()
 
 
 def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
-    """One Claude round trip; returns the fenced (or bare) body. Network / quota / model errors -> None."""
-    client = _claude_client()
-    if client is None:
-        return None
-    try:
-        r = client.messages.create(
-            model=os.environ.get("HEALER_MODEL") or DEFAULT_HEALER_MODEL,
-            max_tokens=8000,
-            system=system,
-            messages=[{"role": "user", "content": user}],
+    """One LLM round trip over the configured providers; returns the fenced (or bare) body, or None."""
+    providers = _configured_providers()
+    if not providers:
+        logger.info(
+            "No LLM configured (ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL); rule patches only"
         )
-    except Exception:  # network / quota / timeout / bad model id must not crash the pipeline
-        logger.exception("LLM call failed")
         return None
-    # Read text blocks by type: the reply can start with thinking blocks
-    text = "".join(getattr(b, "text", "") for b in r.content if b.type == "text").strip()
-    if r.stop_reason == "refusal" or not text:
-        logger.warning("LLM returned no text (stop_reason=%s)", r.stop_reason)
-        return None
-    fenced = re.search(rf"```(?:{fence_langs})?\n(.*?)```", text, re.DOTALL)
-    return (fenced.group(1) if fenced else text).strip() + "\n"
+    for provider in providers:
+        model = _model_for(provider)
+        if not model:
+            logger.warning("LLM provider %s needs HEALER_MODEL (served model name); skipping", provider)
+            continue
+        try:
+            if provider == "anthropic":
+                text = _call_anthropic(system, user, model)
+            else:
+                text = _call_openai_compatible(system, user, model, provider)
+        except Exception:  # network / auth / quota / timeout / bad model id must not crash the pipeline
+            logger.exception("LLM call failed (provider=%s, model=%s)", provider, model)
+            continue
+        if text:
+            fenced = re.search(rf"```(?:{fence_langs})?\n(.*?)```", text, re.DOTALL)
+            return (fenced.group(1) if fenced else text).strip() + "\n"
+        logger.warning("LLM returned no text (provider=%s, model=%s)", provider, model)
+    return None
 
 
 def default_llm_patch(dockerfile: str, error_log: str, category: ErrorCategory) -> str | None:
