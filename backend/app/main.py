@@ -494,6 +494,7 @@ def create_app() -> FastAPI:
                     urls={t: v.get("url") for t, v in job.targets.items()},
                     updated_at=time.time(),
                 )
+                _save_projects()
                 _publish(job, None)
 
         asyncio.create_task(worker())

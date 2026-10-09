@@ -126,3 +126,48 @@ def test_projects_persist_across_restart(monkeypatch, tmp_path):
 def test_relative_sample_paths_resolve_against_repo_root():
     with main.prepare_source("sample-apps/guestbook") as d:
         assert d.endswith("sample-apps/guestbook")
+
+
+def test_project_status_is_persisted_when_the_job_finishes(monkeypatch, tmp_path):
+    """Regression: the finish-time save was missing, so a restart showed finished apps as 'running'."""
+    import asyncio
+
+    monkeypatch.setattr(main, "PROJECTS_FILE", tmp_path / "projects.json")
+    monkeypatch.setattr(
+        main, "prepare_source", lambda source, ref=None: __import__("contextlib").nullcontext(str(tmp_path))
+    )
+    monkeypatch.setattr(
+        main.analyzer,
+        "analyze",
+        lambda d: type(
+            "A",
+            (),
+            {
+                "target": "local",
+                "language": "python",
+                "framework": None,
+                "port": 8080,
+                "service_models": [],
+                "notes": [],
+                "dockerfile": "FROM x",
+            },
+        )(),
+    )
+    monkeypatch.setattr(main, "_copy_for_target", lambda src, dst: str(dst))
+
+    def fake_pipeline(target_dir, target, emit, analysis=None):
+        emit(main.PipelineEvent(type="done", payload={"target": target, "url": "http://x"}))
+        return True
+
+    monkeypatch.setattr(main, "run_pipeline", fake_pipeline)
+    app = main.create_app()
+
+    async def scenario():
+        app.state.launch("/src", ["local"], name="persist-me")
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if main._load_projects().get("persist-me", {}).get("last_status") == "completed":
+                return True
+        return False
+
+    assert asyncio.run(scenario())
