@@ -34,6 +34,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
 from app import analyzer, deployer, healer
+from app import fleet as fleetmod
+from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
 
 load_dotenv()
@@ -220,6 +222,55 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    # --- node pool / fleet (target "node") -------------------------------------------------------
+    fleet_events: deque[dict] = deque(maxlen=200)
+
+    @app.on_event("startup")
+    async def start_fleet_watcher() -> None:
+        # Opt-in: CLOUDMORPH_FLEET_WATCH=1 starts the auto scale-out watcher inside the API process.
+        if os.getenv("CLOUDMORPH_FLEET_WATCH") == "1" and nodepool.load_registry().nodes:
+            fleetmod.start_background_watcher(
+                float(os.getenv("CLOUDMORPH_FLEET_INTERVAL", "10")), emit=fleet_events.append
+            )
+
+    @app.get("/fleet")
+    async def fleet_status() -> dict:
+        """Nodes (with live load), apps, replicas and recent scale events — for the dashboard."""
+        reg = nodepool.load_registry()
+        state = fleetmod.load_state()
+        metrics = await asyncio.to_thread(
+            lambda: nodepool.metrics_dict([nodepool.probe(n) for n in reg.nodes])
+        )
+        return {
+            "router": {"host": reg.router.host, "public_port": reg.router.public_port}
+            if reg.router
+            else None,
+            "nodes": [
+                {**m, "provider": n.provider, "arch": n.arch, "host": n.host}
+                for n, m in zip(reg.nodes, metrics, strict=True)
+            ],
+            "apps": [
+                {
+                    "name": a.name,
+                    "url": f"http://{a.hostname}",
+                    "image": a.image,
+                    "replicas": [
+                        {"node": r.node, "upstream": r.upstream, "cpu": r.last_cpu} for r in a.replicas
+                    ],
+                    "events": a.events[-10:],
+                }
+                for a in state.apps.values()
+            ],
+            "watch": list(fleet_events)[-20:],
+        }
+
+    @app.post("/fleet/{app_name}/scale/{n}")
+    async def fleet_scale(app_name: str, n: int) -> dict:
+        if app_name not in fleetmod.load_state().apps:
+            raise HTTPException(status_code=404, detail="unknown app")
+        result = await asyncio.to_thread(fleetmod.scale, app_name, n)
+        return {"app": app_name, "replicas": [r.upstream for r in result.replicas]}
 
     @app.post("/deploy")
     async def start_deploy(req: DeployRequest) -> dict[str, str]:

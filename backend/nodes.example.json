@@ -1,0 +1,9 @@
+{
+  "router": { "name": "router", "provider": "gcp", "host": "ROUTER_PUBLIC_IP", "user": "cloudmorph", "key": "~/.ssh/id_ed25519",
+              "public_port": 80, "domain_suffix": null },
+  "nodes": [
+    { "name": "gcp-node-1", "provider": "gcp",    "host": "NODE_IP", "user": "cloudmorph", "key": "~/.ssh/id_ed25519", "arch": "amd64", "ports": [8000, 8100] },
+    { "name": "oci-node-1", "provider": "oracle", "host": "NODE_IP", "user": "ubuntu",     "key": "~/.ssh/id_ed25519", "arch": "arm64", "ports": [8000, 8100] },
+    { "name": "aws-node-1", "provider": "aws",    "host": "NODE_IP", "user": "ubuntu",     "key": "~/.ssh/aws.pem",    "arch": "amd64", "ports": [8000, 8100] }
+  ]
+}

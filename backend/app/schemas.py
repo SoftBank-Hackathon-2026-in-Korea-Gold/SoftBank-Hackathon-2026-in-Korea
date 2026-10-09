@@ -21,7 +21,9 @@ from pydantic import BaseModel, Field
 # Upper bound on heal -> redeploy cycles. Caps API cost and prevents infinite loops.
 MAX_RETRIES = 3
 
-DeployTarget = Literal["local", "cloudrun"]
+DeployTarget = Literal[
+    "local", "cloudrun", "node"
+]  # node = SSH-reachable Docker host in the node pool (any cloud)
 
 
 # --------------------------------------------------------------------------- #
