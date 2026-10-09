@@ -1,5 +1,7 @@
-"""초기 Dockerfile: 검사관이 찾은 실행 방법(명세의 app)으로 만든다.
+"""초기 Dockerfile: 검사관이 찾은 실행 방법(명세의 app)으로 템플릿을 만든다.
 
+저장소에 Dockerfile이 없으면 AI가 이 템플릿을 초안으로 받아 고친다 (llm.make_dockerfile_writer).
+AI가 쓴 것은 check()를 통과해야 쓰고, 아니면 템플릿을 쓴다.
 팀 계약대로 0.0.0.0:$PORT로 받는다 (Cloud Run이 PORT=8080을 넣는다). 배포가 실패하면 healer가 이 Dockerfile을 고친다.
 CMD는 셸 형식이라 실행할 때 $PORT가 풀린다.
 """
@@ -7,6 +9,7 @@ CMD는 셸 형식이라 실행할 때 $PORT가 풀린다.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from .spec import App
 
@@ -92,3 +95,23 @@ def _static(app: App, port: int) -> str:
         f"EXPOSE {port}",
     ]
     return "\n".join(lines) + "\n"
+
+
+def check(text: str, root: Path, port: int) -> str | None:
+    """AI가 쓴 Dockerfile의 울타리. 통과하면 None, 아니면 이유. 빌드가 되는지는 배포해 봐야 알고, 실패하면 healer가 고친다."""
+    lines = [line.split() for line in text.splitlines() if line.strip()]
+    ops = [w[0].upper() for w in lines]
+    if "FROM" not in ops:
+        return "FROM이 없습니다"
+    if not any(
+        op == "ENV" and (f"PORT={port}" in w or w[1:] == ["PORT", str(port)]) for op, w in zip(ops, lines)
+    ):
+        return f"ENV PORT={port}가 없습니다 (계약: $PORT로 받는다)"
+    for op, w in zip(ops, lines):
+        if op not in ("COPY", "ADD") or any(a.startswith("--from") for a in w):
+            continue
+        for src in [a for a in w[1:-1] if not a.startswith("--") and a != "\\"]:
+            pattern = src.removeprefix("./").lstrip("/")
+            if pattern not in ("", ".") and not src.startswith("http") and not any(root.glob(pattern)):
+                return f"저장소에 없는 파일을 복사합니다: {src}"
+    return None

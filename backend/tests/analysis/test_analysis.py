@@ -1349,3 +1349,92 @@ def test_render_dockerfile_for_java_and_os_tools():
     assert "apt-get install -y --no-install-recommends chromium &&" in node
     with pytest.raises(ValueError):
         render(App(language="elixir", start="mix run"))
+
+
+# ---------- 저장소에 Dockerfile이 없으면 AI가 쓴다 ----------
+
+from app.analysis.dockerfile import check
+from app.analyzer import _dockerfile
+
+TORCH_APP = str(NEW_FIXTURES / "py-torch-infer")
+CPU_TORCH = "RUN pip install --index-url https://download.pytorch.org/whl/cpu torch && pip install -r requirements.txt"
+
+
+def fake_writer(dockerfile=None, changes=(), error=None, drafts=None):
+    """dockerfile: 돌려줄 내용, 또는 초안을 고치는 함수. drafts에 받은 초안을 남긴다"""
+
+    def write(app, port, draft, files):
+        if drafts is not None:
+            drafts.append(draft)
+        if error:
+            raise error
+        text = dockerfile(draft) if callable(dockerfile) else dockerfile
+        return llm.DockerfileReport(dockerfile=text, changes=list(changes))
+
+    return write
+
+
+def test_contract_ai_fixes_template_draft(no_key):
+    template, drafts = analyze(TORCH_APP).dockerfile, []
+    write = fake_writer(
+        lambda d: d.replace("RUN pip install -r requirements.txt", CPU_TORCH),
+        ["GPU를 쓰지 않아 torch를 CPU 휠로 설치합니다"],
+        drafts=drafts,
+    )
+    r = analyze_with(TORCH_APP, None, write)
+    assert drafts == [template] and CPU_TORCH in r.dockerfile
+    assert (
+        "AI가 저장소를 읽고 Dockerfile을 고쳤습니다: GPU를 쓰지 않아 torch를 CPU 휠로 설치합니다" in r.notes
+    )
+
+
+@pytest.mark.parametrize(
+    "bad, why",
+    [
+        (lambda d: d.replace("ENV PORT=8080\n", ""), "ENV PORT=8080"),
+        (lambda d: d.replace("COPY . .", "COPY requirements-gpu.txt ."), "requirements-gpu.txt"),
+        (lambda d: "", "FROM"),
+    ],
+)
+def test_contract_ai_dockerfile_must_pass_fence(no_key, bad, why):
+    r = analyze_with(TORCH_APP, None, fake_writer(bad))
+    assert r.dockerfile == analyze(TORCH_APP).dockerfile  # 울타리를 못 넘으면 템플릿을 쓴다
+    assert any(n.startswith("AI가 쓴 Dockerfile을 쓰지 않았습니다") and why in n for n in r.notes)
+
+
+def test_contract_ai_dockerfile_error_falls_back_to_template(no_key):
+    r = analyze_with(TORCH_APP, None, fake_writer(error=TimeoutError("응답 없음")))
+    assert r.dockerfile == analyze(TORCH_APP).dockerfile
+    assert any("TimeoutError: 응답 없음" in n for n in r.notes)
+
+
+def test_contract_repo_dockerfile_is_not_rewritten(no_key, tmp_path):
+    app, drafts = copy_app(APP_FIXTURES / "node-pg-visits", tmp_path), []
+    (app / "Dockerfile").write_text("FROM node:22\n")
+    r = analyze_with(str(app), None, fake_writer("FROM node:20\n", drafts=drafts))
+    assert r.dockerfile == "FROM node:22\n" and drafts == []
+
+
+def test_ai_writes_dockerfile_for_language_without_template(tmp_path):
+    (tmp_path / "Gemfile").write_text("source 'https://rubygems.org'\ngem 'sinatra'\n")
+    ruby = App(language="ruby", start="bundle exec ruby app.rb -o 0.0.0.0 -p $PORT")
+    text = (
+        "FROM ruby:3.3-slim\nWORKDIR /app\nENV PORT=8080\nCOPY Gemfile ./\nRUN bundle install\nCOPY . .\n"
+        "CMD bundle exec ruby app.rb -o 0.0.0.0 -p $PORT\n"
+    )
+    drafts = []
+    dockerfile, _ = _dockerfile(tmp_path, ruby, 8080, fake_writer(text, drafts=drafts))
+    assert dockerfile == text and drafts == [None]  # 템플릿이 없으면 처음부터 쓴다
+    with pytest.raises(ValueError):
+        _dockerfile(tmp_path, ruby, 8080, None)  # AI도 없으면 지금처럼 만들 수 없다
+
+
+def test_check_dockerfile(tmp_path):
+    (tmp_path / "requirements.txt").write_text("flask\n")
+    ok = (
+        "FROM node:20-slim AS build\nCOPY ./requirements*.txt ./\nCOPY --chown=1000 . .\n\n"
+        "FROM nginx:alpine\nENV PORT=8080\nCOPY --from=build /app/dist/ /usr/share/nginx/html/\n"
+    )
+    assert check(ok, tmp_path, 8080) is None
+    assert "ENV PORT=3000" in check(ok, tmp_path, 3000)
+    assert "Pipfile" in check("FROM python:3.12\nENV PORT 8080\nCOPY Pipfile .\n", tmp_path, 8080)

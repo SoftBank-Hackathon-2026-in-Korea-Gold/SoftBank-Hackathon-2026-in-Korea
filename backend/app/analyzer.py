@@ -15,7 +15,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.analysis import graph, inspectors, llm, offers
-from app.analysis.dockerfile import render
+from app.analysis.dockerfile import check, render
 from app.analysis.rules import TYPES
 from app.analysis.signals import read_text
 from app.analysis.spec import App
@@ -28,11 +28,13 @@ TARGETS = {2: "cloudrun", 5: "cloudrun", 4: "local"}
 def analyze(src_dir: str) -> AnalysisResult:
     """Analyze `src_dir` and return the deploy decision + initial Dockerfile."""
     model = llm.load_model(src_dir)
-    return analyze_with(src_dir, inspectors.make_inspector(model) if model else None)
+    if not model:
+        return analyze_with(src_dir, None)
+    return analyze_with(src_dir, inspectors.make_inspector(model), llm.make_dockerfile_writer(model))
 
 
-def analyze_with(src_dir: str, inspect) -> AnalysisResult:
-    """검사관(inspect)을 바꿔 끼울 수 있게 나눴다. 테스트는 가짜 검사관을 넣는다."""
+def analyze_with(src_dir: str, inspect, write=None) -> AnalysisResult:
+    """검사관(inspect)과 Dockerfile 작성자(write)를 바꿔 끼울 수 있게 나눴다. 테스트는 가짜를 넣는다."""
     unconsented = []
 
     def answer(payload):  # 물어볼 사람이 없으니 안전한 쪽으로 답한다
@@ -58,8 +60,7 @@ def analyze_with(src_dir: str, inspect) -> AnalysisResult:
     t, spec = result["target"], result["spec"]
     app = App(**spec["app"])
     port = app.port if app.port and not app.port_env else 8080  # $PORT를 못 받는 앱은 고정 포트로 듣는다
-    existing = Path(src_dir) / "Dockerfile"
-    dockerfile = read_text(existing) if existing.is_file() else render(app, port)
+    dockerfile, dockerfile_notes = _dockerfile(Path(src_dir).resolve(), app, port, write)
     return AnalysisResult(
         target=TARGETS[t],
         language=app.language or "unknown",
@@ -67,12 +68,41 @@ def analyze_with(src_dir: str, inspect) -> AnalysisResult:
         port=port,
         entrypoint=app.start,
         dockerfile=dockerfile,
-        notes=_notes(out, t, spec, unconsented, existing.is_file(), inspect is not None),
+        notes=_notes(out, t, spec, unconsented, dockerfile_notes, inspect is not None),
     )
 
 
-def _notes(out: dict, t: int, spec: dict, unconsented: list, own_dockerfile: bool, ai: bool) -> list[str]:
-    result, app = out["result"], spec["app"]
+def _dockerfile(root: Path, app: App, port: int, write) -> tuple[str, list[str]]:
+    """저장소의 Dockerfile > AI가 쓴 것(울타리 통과) > 템플릿. (Dockerfile, notes)"""
+    existing = root / "Dockerfile"
+    if existing.is_file():
+        return read_text(existing), ["저장소에 있는 Dockerfile을 그대로 씁니다."]
+    try:
+        draft = render(app, port)
+    except ValueError:
+        if not write:
+            raise
+        draft = None  # 템플릿이 없는 언어: AI가 처음부터 쓴다
+    made = f"Dockerfile을 만들었습니다. 시작 명령: {app.start or '-'}"
+    if not write:
+        return draft, [made]
+    try:
+        r = write(app.model_dump(), port, draft, graph.read_sources(root))
+        why = check(r.dockerfile, root, port)
+    except Exception as e:  # noqa: BLE001 — AI가 실패하면 템플릿을 쓴다
+        why = f"{type(e).__name__}: {e}"
+    if why is None:
+        if r.dockerfile == draft:
+            return draft, [made]
+        did = "고쳤습니다" if draft else "썼습니다"
+        return r.dockerfile, [f"AI가 저장소를 읽고 Dockerfile을 {did}: {'; '.join(r.changes) or '-'}"]
+    if draft is None:
+        raise ValueError(f"Dockerfile을 만들 수 없습니다 (언어: {app.language}): {why}")
+    return draft, [made, f"AI가 쓴 Dockerfile을 쓰지 않았습니다 ({why}). 템플릿으로 만든 것을 씁니다."]
+
+
+def _notes(out: dict, t: int, spec: dict, unconsented: list, dockerfile_notes: list, ai: bool) -> list[str]:
+    result = out["result"]
     notes = []
     if t == 4:
         why = [w["reason"] for w in result["removed"].get(2, [])] or ["큰 코드 수정이 필요합니다"]
@@ -86,11 +116,7 @@ def _notes(out: dict, t: int, spec: dict, unconsented: list, own_dockerfile: boo
         "(사용자가 동의하면 풀 수 있습니다)"
         for it in unconsented
     ]
-    notes.append(
-        "저장소에 있는 Dockerfile을 그대로 씁니다."
-        if own_dockerfile
-        else f"Dockerfile을 만들었습니다. 시작 명령: {app['start'] or '-'}"
-    )
+    notes += dockerfile_notes
     notes += [
         f"외부 저장소가 필요합니다: {r['kind']} ({', '.join(r['env'].values()) or '환경변수 못 찾음'}). "
         "배포 전에 만들어 연결해야 합니다."

@@ -154,6 +154,13 @@ class Conversion(BaseModel):
     )
 
 
+class DockerfileReport(BaseModel):
+    dockerfile: str = Field(description="Dockerfile 전체 내용")
+    changes: list[str] = Field(
+        description="초안에서 바꾼 것과 그 이유를 한국어 한 문장씩. 초안 그대로면 빈 목록, 초안이 없었으면 무엇을 보고 썼는지"
+    )
+
+
 # ---------- 저장소 읽기 도구 ----------
 
 
@@ -319,3 +326,41 @@ def make_converter(model):
         )
 
     return convert
+
+
+def make_dockerfile_writer(model):
+    """write(app, port, draft, files) -> DockerfileReport. 저장소에 Dockerfile이 없을 때 쓴다. 내용만 돌려받고 파일에 쓰지 않는다.
+    draft는 템플릿(dockerfile.render)으로 만든 초안이고, 템플릿이 없는 언어면 None이다."""
+    runner = structured(model, DockerfileReport, "dockerfile")
+
+    def write(app: dict, port: int, draft: str | None, files: dict) -> DockerfileReport:
+        how = (
+            "초안에서 시작해, 이 저장소에서 빌드·실행을 실제로 막는 것만 고친다"
+            if draft
+            else "초안이 없다 (템플릿이 없는 언어). 저장소를 보고 처음부터 쓴다"
+        )
+        found = "\n".join(f"- {k}: {v}" for k, v in app.items() if v)
+        return runner.invoke(
+            [
+                (
+                    "system",
+                    (
+                        "너는 배포 분석의 Dockerfile 작성자다. 이 앱을 리눅스 컨테이너에서 빌드·실행하는 Dockerfile을 쓴다. "
+                        f"{how}. 예: 기본 이미지에 없는 빌드 도구, GPU를 쓰지 않는데 GPU용으로 설치되는 큰 패키지, "
+                        "root로 돌면 안 되는 프로그램(헤드리스 브라우저 등), 잠금 파일이 없어 깨지는 의존성 설치.\n"
+                        f"지킬 것: ENV PORT={port} 줄을 둔다. 서버는 0.0.0.0에 바인딩하고 포트는 $PORT로 받으며, "
+                        "CMD에서 $PORT가 풀리게 셸 형식으로 쓴다. 앱 코드는 고치지 않는다. 저장소에 없는 파일은 COPY하지 않는다. "
+                        f"비밀값을 이미지에 넣지 않는다. {GUARD}"
+                    ),
+                ),
+                (
+                    "user",
+                    (
+                        f"검사관이 찾은 실행 방법:\n{found or '(없음)'}\n\n초안:\n{draft or '(없음)'}\n\n"
+                        f"프로젝트 파일:\n{sources(model, files)}"
+                    ),
+                ),
+            ]
+        )
+
+    return write

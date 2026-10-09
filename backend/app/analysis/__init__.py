@@ -6,6 +6,6 @@
 - offers.py    유형마다 필요한 코드 수정
 - graph.py     분석 흐름 (LangGraph). 중간 질문(동의·유형·수정 승인)은 interrupt로 받는다
 - spec.py      배포 명세: 실행 방법, 외부 저장소, 환경변수, 제약
-- dockerfile.py 명세의 실행 방법으로 초기 Dockerfile을 만든다
+- dockerfile.py 명세의 실행 방법으로 초기 Dockerfile 템플릿을 만든다. AI가 쓴 Dockerfile의 울타리(check)도 여기 있다
 - llm.py       OpenAI 연결과 저장소 읽기 도구
 """
