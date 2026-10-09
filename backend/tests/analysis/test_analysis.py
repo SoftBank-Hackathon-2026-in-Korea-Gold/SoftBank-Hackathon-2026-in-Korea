@@ -1,6 +1,12 @@
-"""analyzer 테스트. AI 검사관과 Dockerfile 작성자는 가짜를 넣는다 (OpenAI를 부르지 않는다)."""
+"""analyzer 테스트. AI 검사관과 Dockerfile 작성자는 가짜를 넣는다.
+실제 OpenAI는 맨 아래 test_live_openai 하나만 부르고, ANALYZER_LIVE=1일 때만 돈다."""
+
+import os
+import time
+from pathlib import Path
 
 import pytest
+from dotenv import dotenv_values
 
 from app import analyzer as an
 from app.analyzer import (
@@ -253,6 +259,8 @@ def test_static_site_is_served_by_nginx_on_port(tmp_path):
     assert "FROM node:20-slim AS build" in r.dockerfile and "RUN npm run build" in r.dockerfile
     assert "COPY --from=build /app/dist/ /usr/share/nginx/html/" in r.dockerfile
     assert "listen ${PORT};" in r.dockerfile  # nginx가 시작할 때 PORT를 채운다
+    # CMD는 nginx 이미지에 있으니 거절하지 않는다
+    assert not any(n.startswith("AI가 쓴 Dockerfile을 쓰지 않았습니다") for n in r.notes)
 
 
 def test_os_tools_go_into_dockerfile(flask_app):
@@ -339,6 +347,48 @@ def test_repo_reader_reads_only_inside_repo(flask_app):
     assert tool_out["b"].startswith("읽을 수 없는 경로")  # 저장소 밖은 막는다
 
 
+@pytest.fixture
+def outside(tmp_path_factory):
+    d = tmp_path_factory.mktemp("outside")
+    (d / "secret.txt").write_text("OUTSIDE_SECRET=1\n")
+    return d
+
+
+def test_symlinks_cannot_read_outside_repo(flask_app, outside):
+    (flask_app / "link.txt").symlink_to(outside / "secret.txt")
+    (flask_app / "linkdir").symlink_to(outside, target_is_directory=True)
+    (flask_app / "loop").symlink_to(flask_app, target_is_directory=True)  # 자기 자신을 가리킨다
+    tools = {t.name: t for t in an.repo_tools(flask_app)}
+    assert "link.txt" not in tools["list_files"].invoke({"pattern": "**/*"})
+    assert tools["grep"].invoke({"pattern": "OUTSIDE_SECRET"}) == "(찾은 줄 없음)"
+    assert tools["grep"].invoke({"pattern": "OUTSIDE_SECRET", "glob": "linkdir/*"}) == "(찾은 줄 없음)"
+    for path in ("link.txt", "linkdir/secret.txt", os.path.relpath(outside / "secret.txt", flask_app)):
+        assert tools["read_file"].invoke({"path": path}).startswith("읽을 수 없는 경로")
+    assert "OUTSIDE_SECRET" not in an.repo_text(flask_app)  # 바로가기를 따라가지 않으니 끝없이 돌지도 않는다
+    assert an.check_finding(flask_app, "link.txt:1", "OUTSIDE_SECRET=1") is None
+
+
+def test_secret_files_are_hidden_from_ai(flask_app):
+    (flask_app / ".env").write_text("OPENAI_API_KEY=sk-live-xyz\n")
+    (flask_app / ".env.example").write_text("OPENAI_API_KEY=\n")
+    (flask_app / "server.key").write_text("PRIVATE\n")
+    (flask_app / ".envrc").write_text("export AWS_SECRET=sk-live-envrc\n")
+    (flask_app / "prod.env").write_text("DB_PASSWORD=sk-live-prod\n")
+    (flask_app / "public.txt").symlink_to(flask_app / ".env")  # 바로가기로 이름을 바꿔도 막는다
+    tools = {t.name: t for t in an.repo_tools(flask_app)}
+    listed = set(tools["list_files"].invoke({"pattern": "**/*"}).splitlines())
+    assert ".env.example" in listed
+    assert not {".env", "server.key", ".envrc", "prod.env", "public.txt"} & listed
+    assert tools["grep"].invoke({"pattern": "sk-live|PRIVATE"}) == "(찾은 줄 없음)"
+    assert tools["read_file"].invoke({"path": ".env"}).startswith("읽을 수 없는 경로")
+
+
+def test_repo_dockerfile_pointing_outside_is_refused(flask_app, outside):
+    (flask_app / "Dockerfile").symlink_to(outside / "secret.txt")
+    with pytest.raises(ValueError, match="저장소 밖"):
+        run(flask_app)
+
+
 # ---------- Dockerfile: 템플릿 초안을 AI가 고친다 ----------
 
 
@@ -414,6 +464,8 @@ def test_ai_fixes_template_draft(flask_app):
         (lambda d: d.replace("ENV PORT=8080\n", ""), "ENV PORT=8080"),
         (lambda d: d.replace("COPY . .", "COPY requirements-gpu.txt ."), "requirements-gpu.txt"),
         (lambda d: "", "FROM"),
+        (lambda d: d.replace("CMD ", "# CMD "), "CMD"),
+        (lambda d: d + "\nFROM python:3.12-slim\nENV PORT=8080\n", "CMD"),  # CMD가 앞 단계에만 있다
     ],
 )
 def test_ai_dockerfile_must_pass_fence(flask_app, bad, why):
@@ -446,6 +498,9 @@ def test_ai_writes_dockerfile_for_language_without_template(tmp_path):
     drafts = []
     dockerfile, _ = _dockerfile(tmp_path, ruby, 8080, fake_writer(text, drafts=drafts))
     assert dockerfile == text and drafts == [None]  # 템플릿이 없으면 처음부터 쓴다
+    php = App(language="php", start="apache2-foreground")
+    apache = "FROM php:8.3-apache\nENV PORT=8080\nCOPY . /var/www/html/\n"  # 베이스 이미지에 CMD가 있다
+    assert _dockerfile(tmp_path, php, 8080, fake_writer(apache))[0] == apache
     with pytest.raises(ValueError):
         _dockerfile(tmp_path, ruby, 8080, fake_writer(error=TimeoutError()))  # AI도 실패하면 만들 수 없다
 
@@ -459,3 +514,34 @@ def test_check_dockerfile(tmp_path):
     assert check_dockerfile(ok, tmp_path, 8080) is None
     assert "ENV PORT=3000" in check_dockerfile(ok, tmp_path, 3000)
     assert "Pipfile" in check_dockerfile("FROM python:3.12\nENV PORT 8080\nCOPY Pipfile .\n", tmp_path, 8080)
+
+
+# ---------- 실제 OpenAI: ANALYZER_LIVE=1일 때만 돈다 ----------
+
+ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"  # 저장소 맨 위 .env (main.py가 읽는 곳)
+
+
+@pytest.mark.skipif(
+    not os.environ.get("ANALYZER_LIVE"), reason="실제 OpenAI를 부른다: ANALYZER_LIVE=1일 때만"
+)
+def test_live_openai(monkeypatch, tmp_path):
+    for k, v in dotenv_values(ROOT_ENV).items():
+        if v and k.startswith(("OPENAI_", "ANALYZER_")) and not os.environ.get(k):
+            monkeypatch.setenv(k, v)
+    if not os.environ.get("OPENAI_API_KEY"):
+        pytest.skip(f"OPENAI_API_KEY가 없습니다 ({ROOT_ENV})")
+    (tmp_path / "requirements.txt").write_text("flask\ngunicorn\n")
+    (tmp_path / "app.py").write_text(
+        "import sqlite3\nfrom flask import Flask\n\napp = Flask(__name__)\n\n\n"
+        '@app.post("/todos/<text>")\ndef add(text):\n'
+        '    with sqlite3.connect("todo.db") as db:\n'
+        '        db.execute("CREATE TABLE IF NOT EXISTS todo (text TEXT)")\n'
+        '        db.execute("INSERT INTO todo VALUES (?)", (text,))\n'
+        '    return "ok"\n'
+    )
+    started = time.monotonic()
+    r = analyze(str(tmp_path))
+    print(f"\n{time.monotonic() - started:.0f}초\n{r.model_dump_json(indent=2)}")  # 실측 결과는 -s로 본다
+    assert (r.target, r.language) == ("local", "python")  # SQLite는 데이터 손실 위험이라 local
+    assert check_dockerfile(r.dockerfile, tmp_path, r.port) is None
+    assert not any(n.startswith("AI 검사관 일부가 실패") for n in r.notes)

@@ -104,6 +104,9 @@ def _signals(reports: dict) -> tuple[dict, list[str]]:
 def _dockerfile(root: Path, app: App, port: int, write) -> tuple[str, list[str]]:
     """저장소의 Dockerfile > AI가 쓴 것(울타리 통과) > 템플릿. (Dockerfile, notes)"""
     existing = root / "Dockerfile"
+    if existing.is_symlink() and not _inside(root, existing):
+        # 그대로 쓰면 바깥 파일 내용이 결과로 나가고, 새로 만들면 deployer가 바깥 파일에 덮어쓴다
+        raise ValueError("저장소의 Dockerfile이 저장소 밖 파일을 가리키는 바로가기라 쓸 수 없습니다")
     if existing.is_file():
         return read_text(existing), ["저장소에 있는 Dockerfile을 그대로 씁니다."]
     try:
@@ -112,7 +115,7 @@ def _dockerfile(root: Path, app: App, port: int, write) -> tuple[str, list[str]]
         draft = None  # 템플릿이 없는 언어: AI가 처음부터 쓴다
     try:
         r = write(app.model_dump(), port, draft)
-        why = check_dockerfile(r.dockerfile, root, port)
+        why = check_dockerfile(r.dockerfile, root, port, need_cmd=bool(draft) and not app.static_output)
     except Exception as e:  # noqa: BLE001 — AI가 실패하면 템플릿을 쓴다
         why = f"{type(e).__name__}: {e}"
     made = f"Dockerfile을 만들었습니다. 시작 명령: {app.start or '-'}"
@@ -147,7 +150,11 @@ def _notes(t: int, values: dict, reports: dict, app: App, root: Path, errors: li
         notes.append(
             "인스턴스를 1대로 고정해야 합니다 (메모리 상태·로컬 파일·프로세스 안 주기 작업이 있습니다)."
         )
-    if kept := [h["evidence"] for n in ("sqlite", "file_write") if reports[n] for h in reports[n]["hits"]]:
+    # SQLite와 파일 쓰기 검사관이 같은 줄을 근거로 낼 수 있다
+    kept = dict.fromkeys(
+        h["evidence"] for n in ("sqlite", "file_write") if reports[n] for h in reports[n]["hits"]
+    )
+    if kept:
         notes.append(f"재시작해도 남아야 하는 데이터를 쓰는 곳: {', '.join(kept)}")
 
     server = values["has_server"] == "yes"
@@ -524,6 +531,16 @@ TEST_FILE = re.compile(
     r"test_.*\.py|.*_test\.(?:py|go)|conftest\.py|.*\.(?:test|spec)\.[jt]sx?|.*Tests?\.(?:java|kt)"
 )
 MAX_FILE_BYTES = 200_000
+# AI에게 보여 주지 않는 비밀 파일. 예시 파일(.env.example 등)은 값 없이 이름만 있으니 보여 준다
+SECRET_FILE = re.compile(
+    r"\.env(?:\.(?!example$|sample$|template$)[\w.-]+)?|\.envrc|.+\.(?:env|pem|key|p12|pfx)|id_(?:rsa|ecdsa|ed25519)"
+)
+
+
+def _inside(root: Path, p: Path) -> bool:
+    """바로가기(symlink)를 풀었을 때 실제 위치가 저장소 안인가.
+    AI 읽기 도구·근거 확인·저장소 Dockerfile은 이것을 거치고, 저장소 훑기(_walk)는 바로가기를 아예 따라가지 않는다."""
+    return p.resolve().is_relative_to(root)
 
 
 def read_text(path: Path) -> str:
@@ -536,6 +553,8 @@ def read_text(path: Path) -> str:
 
 def _walk(root: Path):
     for p in sorted(root.iterdir()):
+        if p.is_symlink():  # 저장소 밖이나 자기 자신을 가리켜 끝없이 돌 수 있다
+            continue
         if p.is_dir():
             if p.name not in SKIP_DIRS | TEST_DIRS and not p.name.startswith("."):
                 yield from _walk(p)
@@ -551,9 +570,10 @@ def repo_text(root: Path) -> str:
 def check_finding(root: Path, evidence: str, text: str) -> dict | None:
     """근거가 실제 파일에 있는지 확인한다. 있으면 hit, 없거나 테스트 코드면 None. 줄 번호가 두 줄까지 어긋나는 것은 봐준다."""
     path, _, line = evidence.rpartition(":")
-    p = (root / path).resolve()
-    if not line.isdigit() or not p.is_relative_to(root) or not p.is_file():
+    p = root / path
+    if not line.isdigit() or not _inside(root, p) or not p.is_file():
         return None
+    p = p.resolve()
     rel = p.relative_to(root)
     if any(part in TEST_DIRS for part in rel.parts) or TEST_FILE.fullmatch(p.name):
         return None
@@ -620,7 +640,8 @@ def validate(name: str, report, root: Path, text: str) -> dict:
 
 # ---------- OpenAI 연결과 저장소 읽기 도구 ----------
 # 모델은 OPENAI_API_KEY로 부른다 (healer와 같은 키). ANALYZER_MODEL로 모델을 고른다 (기본 gpt-4o).
-# 도구는 저장소 안만 읽을 수 있고, 쓰기·명령 실행 도구는 없다.
+# 도구는 저장소 안만 읽을 수 있고 (바로가기는 풀어서 실제 위치로 본다), .env·키 파일은 보여 주지 않는다.
+# 쓰기·명령 실행 도구는 없다.
 
 
 def _env_int(name: str, default: int) -> int:
@@ -633,14 +654,17 @@ def repo_tools(root: Path) -> list:
 
     root = Path(root).resolve()
 
-    def hidden(rel: Path) -> bool:
-        return any(part in SKIP_DIRS or part == ".git" for part in rel.parts)
+    def readable(p: Path) -> bool:
+        """실제 위치가 저장소 안인 파일이고, 건너뛰는 폴더·비밀 파일이 아니다"""
+        if not _inside(root, p) or not p.is_file():
+            return False
+        rel = p.resolve().relative_to(root)
+        return not any(part in SKIP_DIRS for part in rel.parts) and not SECRET_FILE.fullmatch(rel.name)
 
     def files(pattern: str):
         for p in sorted(root.glob(pattern)):
-            rel = p.relative_to(root)
-            if p.is_file() and not hidden(rel):
-                yield rel.as_posix(), p
+            if readable(p):
+                yield p.relative_to(root).as_posix(), p
 
     @tool
     def list_files(pattern: str = "**/*") -> str:
@@ -652,11 +676,9 @@ def repo_tools(root: Path) -> list:
     @tool
     def read_file(path: str, start: int = 1, end: int = 300) -> str:
         """파일을 줄 번호와 함께 읽는다 (start~end줄, 한 번에 최대 400줄)"""
-        p = (root / path).resolve()
-        if not p.is_relative_to(root) or hidden(p.relative_to(root)):
-            return f"읽을 수 없는 경로입니다: {path}"
-        if not p.is_file():
-            return f"파일이 없습니다: {path}"
+        p = root / path
+        if not readable(p):
+            return f"읽을 수 없는 경로이거나 없는 파일입니다: {path}"
         lines = read_text(p).splitlines()
         start, end = max(1, start), min(end, start + 399, len(lines))
         return "\n".join(f"{i}: {lines[i - 1]}" for i in range(start, end + 1)) or "(빈 파일)"
@@ -862,12 +884,17 @@ def _static(app: App, port: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def check_dockerfile(text: str, root: Path, port: int) -> str | None:
-    """AI가 쓴 Dockerfile의 울타리. 통과하면 None, 아니면 이유. 빌드가 되는지는 배포해 봐야 알고, 실패하면 healer가 고친다."""
+def check_dockerfile(text: str, root: Path, port: int, need_cmd: bool = False) -> str | None:
+    """AI가 쓴 Dockerfile의 울타리. 통과하면 None, 아니면 이유. 빌드가 되는지는 배포해 봐야 알고, 실패하면 healer가 고친다.
+    need_cmd: 템플릿 초안에 CMD가 있을 때만 본다. nginx·php-apache처럼 베이스 이미지에 CMD가 있는 경우가 있고,
+    초안이 없으면 거절해도 돌아갈 템플릿이 없어 분석이 실패하기 때문이다."""
     lines = [line.split() for line in text.splitlines() if line.strip()]
     ops = [w[0].upper() for w in lines]
     if "FROM" not in ops:
         return "FROM이 없습니다"
+    last_stage = ops[len(ops) - 1 - ops[::-1].index("FROM") :]
+    if need_cmd and not {"CMD", "ENTRYPOINT"} & set(last_stage):
+        return "마지막 단계에 CMD가 없습니다 (베이스 이미지의 기본 명령이 돌아 앱이 뜨지 않습니다)"
     if not any(
         op == "ENV" and (f"PORT={port}" in w or w[1:] == ["PORT", str(port)]) for op, w in zip(ops, lines)
     ):

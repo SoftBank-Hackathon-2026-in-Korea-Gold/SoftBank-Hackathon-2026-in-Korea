@@ -29,7 +29,8 @@ AI 검사관 17개 (OpenAI, 동시에)  →  울타리 (코드)  →  타깃  �
 - 타깃: 서버리스 컨테이너나 정적 사이트로 갈 수 있으면 `cloudrun`, 아니면 `local`.
 - Dockerfile: 저장소에 있으면 그대로 쓴다. 없으면 실행 방법으로 템플릿을 만들고, AI가 저장소를 읽고 그 초안을 고친다
   (예: GPU를 안 쓰는 torch는 CPU 휠, go.sum이 없으면 go mod tidy). 템플릿이 없는 언어(ruby, php …)는 AI가 처음부터 쓴다.
-  AI가 쓴 것은 울타리(`FROM`, `ENV PORT=<port>`, `COPY` 대상이 저장소에 있는지)를 넘어야 쓰고, 못 넘거나 AI가 실패하면 템플릿을 쓴다.
+  AI가 쓴 것은 울타리(`FROM`, `ENV PORT=<port>`, `COPY` 대상이 저장소에 있는지, 템플릿에 `CMD`가 있으면 마지막 단계에 `CMD`/`ENTRYPOINT`가 있는지)를
+  넘어야 쓰고, 못 넘거나 AI가 실패하면 템플릿을 쓴다.
   고친 이유는 `notes`에 적는다. 모두 `0.0.0.0:$PORT`로 받는다. 배포가 실패하면 healer가 고친다.
 
 ## 환경변수 (`.env`)
@@ -40,6 +41,9 @@ AI 검사관 17개 (OpenAI, 동시에)  →  울타리 (코드)  →  타깃  �
 | `ANALYZER_MODEL` | `gpt-4o` | 검사관 모델 |
 | `ANALYZER_MAX_LLM_CALLS` | `6` | 서버 전체에서 동시에 도는 검사관 호출 수. 분석이 여러 건 겹치면 나머지는 기다린다 |
 | `ANALYZER_MAX_TURNS` | `15` | 검사관 하나가 파일을 읽으며 주고받는 최대 횟수 |
+
+실제 OpenAI로 확인: `cd backend && ANALYZER_LIVE=1 uv run pytest tests/analysis -k live -s` (키는 저장소 맨 위 `.env`에서 읽는다).
+평소 `pytest`에서는 건너뛴다.
 
 ## 팀에 제안 (합의 필요)
 
