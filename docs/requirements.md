@@ -61,7 +61,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 
 | 환경변수명 | 필수 여부 | 기본값 | 사용 모듈 | 상세 설명 |
 |---|:---:|---|---|---|
-| `OPENAI_API_KEY` | **필수** | - | `healer`, `analyzer` | OpenAI API 인증 키. 미설정 시 자가치유는 규칙 패치만 동작하며 analyzer는 패턴 규칙으로만 판정됩니다. |
+| `OPENAI_API_KEY` | **필수** | - | `healer`, `analyzer` | OpenAI API 인증 키. 미설정 시 자가치유는 규칙 패치만 동작하며 analyzer는 분석하지 않습니다. |
 | `HEALER_MODEL` | 선택 | `gpt-4o` | `healer.py` | 자가치유 LLM 에이전트가 코드 패치 생성에 사용할 OpenAI 모델. |
 | `ANALYZER_MODEL` | 선택 | `gpt-4o` | `analyzer.py` | 소스코드 정적 분석 및 위험 탐지에 사용할 AI 검사관 모델. |
 | `ANALYZER_MAX_LLM_CALLS` | 선택 | `6` | `analyzer.py` | 서버 전체에서 동시 실행 가능한 검사관 LLM 호출 수 상한(세마포어). |
