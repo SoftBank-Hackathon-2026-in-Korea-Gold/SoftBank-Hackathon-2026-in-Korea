@@ -158,6 +158,20 @@ def test_local_limits(m, tmp_path, monkeypatch, limit, operation):
             m._copy_for_target(str(source), tmp_path / "output")
 
 
+def test_prepare_skips_ignored_directories(m, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    (source / "node_modules" / "pkg").mkdir(parents=True)
+    (source / "node_modules" / "pkg" / "a").write_bytes(b"12345")
+    (source / "node_modules" / "pkg" / "b").touch()
+    (source / ".venv" / "bin").mkdir(parents=True)
+    (source / ".venv" / "bin" / "python").symlink_to(tmp_path / "outside")
+    (source / "app.py").write_text("x")
+    monkeypatch.setattr(m, "MAX_SOURCE_FILES", 1)
+    monkeypatch.setattr(m, "MAX_SOURCE_BYTES", 4)
+    with m.prepare_source(str(source)) as prepared:
+        assert prepared == str(source.resolve())
+
+
 @pytest.mark.parametrize("kind", ["bytes", "count", "symlink"])
 def test_mock_git_rejected_before_yield(m, tmp_path, monkeypatch, kind):
     clone_paths = []

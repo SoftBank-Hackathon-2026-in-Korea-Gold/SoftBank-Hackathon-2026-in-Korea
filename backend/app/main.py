@@ -119,7 +119,7 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
     """Validate or copy a bounded tree without following links, including during races.
 
     Directory descriptors anchor traversal; O_NOFOLLOW also rejects entries
-    replaced by symlinks after inspection. Deployment copies omit build caches.
+    replaced by symlinks after inspection. Both modes skip SOURCE_IGNORE entries.
     """
     total = count = 0
     directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
@@ -128,7 +128,7 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
         nonlocal total, count
         with os.scandir(directory_fd) as entries:
             for entry in entries:
-                if output is not None and entry.name in SOURCE_IGNORE:
+                if entry.name in SOURCE_IGNORE:
                     continue
                 count += 1
                 if count > MAX_SOURCE_FILES:
