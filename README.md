@@ -41,6 +41,20 @@ uv run pytest -q             # healer 루프 테스트 (fake deployer)
 uv run uvicorn app.main:app --reload
 ```
 
+## Demo runbook (발표 노트북에서 띄우고 터널로 공개)
+
+```bash
+cp .env.example .env            # GCP_PROJECT_ID, OPENAI_API_KEY 채우기 (최초 1회)
+scripts/demo-up.sh              # 백엔드 :8000 + 대시보드 :5173 (대시보드가 /deploy, /health 를 백엔드로 프록시)
+scripts/demo-up.sh --public     # + Cloudflare quick tunnel 1개로 대시보드·API 공개, API 토큰 자동 생성
+scripts/demo-down.sh            # 전부 종료 (deployer가 띄운 로컬 컨테이너·터널 포함)
+```
+
+- `--public`이면 `CLOUDMORPH_API_TOKEN`이 생성되어 `/deploy*` 호출에 `X-API-Token` 헤더(SSE는 `?token=`)가 필요합니다. 공개 URL을 아는 사람이 아무 저장소나 빌드시키는 것을 막기 위한 최소 장치입니다. 토큰과 공개 URL은 `.demo/`에 기록됩니다.
+- 사전 조건: Docker Desktop 실행, `gcloud auth login` 완료, `cloudflared`·`uv`·`npm` 설치. 스크립트가 시작 전에 전부 점검합니다.
+- 첫 실행은 `npm install` 때문에 수 분 걸릴 수 있습니다. 발표 당일 아침에 한 번 미리 돌려 두세요.
+- Cloud Run 타깃은 로그인된 계정의 프로젝트에만 배포되므로, 발표 노트북은 GCP 인증이 된 기기여야 합니다.
+
 ## Workflow
 
 - `main` 직접 push 금지 → `feat/<module>-<topic>` 브랜치 + PR (리뷰 1인)

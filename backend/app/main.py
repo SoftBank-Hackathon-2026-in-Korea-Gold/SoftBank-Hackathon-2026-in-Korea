@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hmac
 import ipaddress
 import logging
 import os
@@ -33,8 +34,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
 from app import analyzer, deployer, healer
@@ -83,6 +85,24 @@ _LOCAL_SOURCE_DENY_ROOTS = tuple(
     Path(p) for p in ("/", "/dev", "/etc", "/proc", "/root", "/run", "/sys", "/var/run")
 )
 _logger = logging.getLogger(__name__)
+# API token guard: every path under these prefixes needs CLOUDMORPH_API_TOKEN. /health and the
+# GitHub webhook (HMAC-verified on its own) stay open.
+PROTECTED_PREFIXES = ("/deploy", "/fleet", "/projects")
+# "testclient" is Starlette TestClient's client host; ASGI servers only ever report IPs here.
+_LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+_PROXY_HEADERS = ("cf-connecting-ip", "x-forwarded-for", "forwarded")
+
+
+def _is_protected_path(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") for p in PROTECTED_PREFIXES)
+
+
+def _is_direct_local_request(request: Request) -> bool:
+    """True only for a loopback client that did not come through a tunnel or reverse proxy."""
+    host = request.client.host if request.client else ""
+    if host not in _LOOPBACK_HOSTS:
+        return False
+    return not any(h in request.headers for h in _PROXY_HEADERS)
 
 
 @dataclass
@@ -389,8 +409,30 @@ def create_app() -> FastAPI:
         if x.strip()
     ]
     app.add_middleware(
-        CORSMiddleware, allow_origins=origins, allow_methods=["GET", "POST"], allow_headers=["Content-Type"]
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-API-Token"],
     )
+
+    # Demo guard: with CLOUDMORPH_API_TOKEN set, every PROTECTED_PREFIXES call must carry it.
+    # EventSource cannot set headers, so ?token= is accepted too. Unset -> fail closed: only a
+    # direct loopback client (local dev) passes; anything via a tunnel/proxy or remote gets 503.
+    @app.middleware("http")
+    async def require_api_token(request: Request, call_next):
+        if request.method == "OPTIONS" or not _is_protected_path(request.url.path):
+            return await call_next(request)
+        token = os.getenv("CLOUDMORPH_API_TOKEN")
+        if not token:
+            if _is_direct_local_request(request):
+                return await call_next(request)
+            return JSONResponse(
+                {"detail": "API token not configured; set CLOUDMORPH_API_TOKEN"}, status_code=503
+            )
+        supplied = request.headers.get("x-api-token") or request.query_params.get("token") or ""
+        if not hmac.compare_digest(supplied.encode(), token.encode()):
+            return JSONResponse({"detail": "missing or invalid X-API-Token"}, status_code=401)
+        return await call_next(request)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
