@@ -17,6 +17,8 @@ export default defineConfig({
       '/deploy': { target: backend, changeOrigin: true },
       '/health': { target: backend, changeOrigin: true },
       '/fleet': { target: backend, changeOrigin: true },
+      '/projects': { target: backend, changeOrigin: true },
+      '/webhook': { target: backend, changeOrigin: true }, // GitHub push webhook reaches the backend through the same tunnel
     },
   },
 })
