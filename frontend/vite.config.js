@@ -16,6 +16,7 @@ export default defineConfig({
     proxy: {
       '/deploy': { target: backend, changeOrigin: true },
       '/health': { target: backend, changeOrigin: true },
+      '/fleet': { target: backend, changeOrigin: true },
     },
   },
 })
