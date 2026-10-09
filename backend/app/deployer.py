@@ -423,7 +423,7 @@ def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
 # database provisioning ("SQLite -> managed Postgres"): sidecar on local/node, Cloud SQL on cloudrun
 # --------------------------------------------------------------------------- #
 _DB_HINTS = re.compile(
-    r"DATABASE_URL|psycopg|asyncpg|sqlalchemy|pg8000|\bfrom pg\b|require\(['\"]pg['\"]\)|prisma",
+    r"DATABASE_URL|psycopg|asyncpg|sqlalchemy|pg8000|\bfrom pg\b|require\(['\"]pg['\"]\)|['\"]pg['\"]\s*:|prisma|pymysql|mysqlclient",
     re.IGNORECASE,
 )
 _SCAN_EXT = {".py", ".js", ".ts", ".mjs", ".cjs", ".txt", ".toml", ".json", ".env", ".example"}
