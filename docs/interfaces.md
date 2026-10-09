@@ -23,12 +23,12 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 |---|---|---|---|
 | `analyzer.py` | 이요환 | `analyze(src_dir: str) -> AnalysisResult` | 초기 Dockerfile은 `0.0.0.0:$PORT` 바인딩 |
 | `deployer.py` | 전동훈 | `deploy(src_dir: str, dockerfile: str, target: "local"\|"cloudrun") -> DeployResult` | **실패 시 raise 금지** → `success=False, stderr=...` 반환. `stderr`에는 CLI 출력뿐 아니라 **컨테이너 런타임 로그(`docker logs` / Cloud Run revision logs)** 포함 필수 |
-| `healer.py` | 박재현 | `heal(src_dir, target, failed: DeployResult, dockerfile, deploy_fn, llm_patch_fn=None, emit=None) -> HealReport` | 재배포 루프를 healer가 소유. 규칙 패치 우선, GPT-4o 폴백 |
+| `healer.py` | 박재현 | `heal(src_dir, target, failed: DeployResult, dockerfile, deploy_fn, llm_patch_fn=None, emit=None, suggest_fn=None) -> HealReport` | 재배포 루프를 healer가 소유. 규칙 패치 우선, LLM 폴백(Claude / OpenAI / 로컬 OpenAI 호환 서버 중 `.env`에 채워진 것, 실패 시 다음 제공자). **Dockerfile만 자동 수정**: verify 단계에서 앱 코드가 던진 예외(Traceback의 마지막 사용자 프레임)는 재배포·LLM 없이 즉시 중단하고 `summary`가 `Not auto-healable: application code error`로 시작. import 시점 크래시면 LLM 소스 수정 제안 diff를 summary와 `log` 이벤트(`payload.kind=source_suggestion`)로 리포트만 함 (적용 안 함) |
 | `main.py` | 백락원 | `POST /deploy`, `GET /deploy/{id}/events` (SSE) | 파이프라인 오케스트레이션 |
 
 ## Data types
 
-**AnalysisResult** — `target`, `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`
+**AnalysisResult** — `target`, `service_models[]` (`caas|paas|faas|iaas`, 추천 순), `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`
 
 **DeployResult** — `success`, `target`, `exit_code`, `stdout`, `stderr`, `url?`, `duration_sec?`
 
