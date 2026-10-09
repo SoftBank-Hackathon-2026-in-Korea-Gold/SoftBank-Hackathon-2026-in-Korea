@@ -1,7 +1,7 @@
 import React from 'react';
 import { Activity, Boxes, Eye, GitBranch, Layers, Radio, Server } from 'lucide-react';
 import { Badge, Bar, Card, Dot } from './ui';
-import { fmtAgo } from '../lib/style';
+import { fmtAgo, fmtTime } from '../lib/style';
 
 const STATUS = {
   running: { tone: 'violet', label: '배포 중', pulse: true },
@@ -119,7 +119,7 @@ export function FleetPanel({ fleet }) {
               </div>
               {a.events.slice(-3).reverse().map((e, i) => (
                 <div key={i} className={`mt-1.5 truncate text-[11px] ${e.type === 'scale_out' ? 'text-amber-300' : e.type === 'scale_in' ? 'text-sky-300' : 'text-slate-500'}`}>
-                  {new Date(e.ts * 1000).toLocaleTimeString('ko-KR', { hour12: false })} · {e.type} {e.node || ''} {e.reason ? `· ${e.reason}` : ''}
+                  {fmtTime(new Date(e.ts * 1000))} · {e.type} {e.node || ''} {e.reason ? `· ${e.reason}` : ''}
                 </div>
               ))}
             </div>

@@ -9,7 +9,8 @@ export const TONE = {
   slate: { text: 'text-slate-300', soft: 'bg-slate-500/10 text-slate-300 ring-slate-500/30', dot: 'bg-slate-500', bar: 'bg-slate-400', border: 'border-slate-700' },
 };
 
-export const fmtTime = (d) => d.toLocaleTimeString('ko-KR', { hour12: false });
+const pad = (n) => String(n).padStart(2, '0');
+export const fmtTime = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 export const fmtAgo = (ts) => {
   const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
   return s < 60 ? `${s}초 전` : s < 3600 ? `${Math.round(s / 60)}분 전` : `${Math.round(s / 3600)}시간 전`;
