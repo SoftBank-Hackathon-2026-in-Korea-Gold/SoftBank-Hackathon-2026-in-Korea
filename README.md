@@ -53,5 +53,5 @@ uv run uvicorn app.main:app --reload
 - [ ] 고장 샘플 앱 stderr 실측 → `healer.ERROR_PATTERNS` 보강
 - [ ] 프론트 SSE 연동 + 수정 전/후 diff 카드
 - [x] 로컬 Public URL (Cloudflare Quick Tunnel) · [x] CI (pytest + ruff, `.github/workflows/ci.yml`)
-- [ ] Notion ADR: Cloud Run 선택, Docker, LangGraph 순환 루프, 규칙 우선·LLM 폴백
+- [x] Notion ADR: Cloud Run 선택, Docker (ADR-002) · LangGraph 순환 루프, 규칙 우선·LLM 폴백 (ADR-003) — [설계 자료](https://app.notion.com/p/da58bee9ada482a79abb010aad08c0f0)
 - [ ] (stretch) Agent Memory, Langfuse 트레이싱, AWS 2nd target · 롤백은 Cloud Run 블루그린(candidate 태그 검증 후 승격)으로 대체
