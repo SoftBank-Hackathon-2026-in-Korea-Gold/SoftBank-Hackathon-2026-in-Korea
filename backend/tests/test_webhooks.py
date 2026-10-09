@@ -121,3 +121,8 @@ def test_projects_persist_across_restart(monkeypatch, tmp_path):
     main._save_projects()
     assert main._load_projects()["shop-api"]["last_status"] == "completed"
     main._projects.clear()
+
+
+def test_relative_sample_paths_resolve_against_repo_root():
+    with main.prepare_source("sample-apps/guestbook") as d:
+        assert d.endswith("sample-apps/guestbook")

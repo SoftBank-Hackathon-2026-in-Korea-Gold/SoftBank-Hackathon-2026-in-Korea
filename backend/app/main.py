@@ -71,6 +71,7 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
+REPO_ROOT = Path(__file__).resolve().parents[2]
 # name -> last deployment of that app (what a GitHub push updates). Persisted to a JSON file so the
 # dashboard's project list survives a backend restart (jobs/events themselves stay in memory).
 PROJECTS_FILE = Path(
@@ -212,6 +213,8 @@ def prepare_source(source: str, ref: str | None = None) -> Iterator[str]:
     not be exposed publicly without authentication and isolation.
     """
     path = Path(source).expanduser()
+    if not path.is_absolute() and not path.exists() and (REPO_ROOT / source).exists():
+        path = REPO_ROOT / source  # dashboard presets like "sample-apps/guestbook" are relative to the repo
     if path.is_dir():
         _inspect_source(path)
         yield str(path.resolve())
@@ -381,7 +384,10 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/fleet/{app_name}/scale/{n}")
-    async def fleet_scale(app_name: str, n: int) -> dict:
+    async def fleet_scale(app_name: str, n: int, request: Request) -> dict:
+        token = os.getenv("CLOUDMORPH_API_TOKEN")
+        if token and request.headers.get("x-api-token") != token:
+            raise HTTPException(status_code=401, detail="missing or invalid X-API-Token")
         if app_name not in fleetmod.load_state().apps:
             raise HTTPException(status_code=404, detail="unknown app")
         result = await asyncio.to_thread(fleetmod.scale, app_name, n)
