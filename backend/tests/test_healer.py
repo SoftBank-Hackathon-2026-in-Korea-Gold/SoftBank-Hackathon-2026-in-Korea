@@ -173,4 +173,3 @@ def test_default_llm_patch_uses_custom_base_url(monkeypatch):
     assert patch == "FROM python:3.12-slim\n"
     assert created["base_url"] == "http://tailscale-dgx:30000/v1"
     assert created["api_key"] == "EMPTY"
-
