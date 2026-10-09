@@ -42,6 +42,10 @@ uv run pytest -q             # healer 루프 테스트 (fake deployer)
 uv run uvicorn app.main:app --reload
 ```
 
+## CD (GitHub push → 자동 재배포)
+
+`CLOUDMORPH_WEBHOOK_SECRET`을 설정하고 저장소 웹훅을 `https://<공개 URL>/webhook/github`로 등록하면, 기본 브랜치에 push할 때마다 같은 이름의 서비스가 새 버전으로 갱신됩니다(실패 시 자가치유 포함). 자세한 내용은 [`docs/cd-github-webhook.md`](docs/cd-github-webhook.md).
+
 ## Workflow
 
 - `main` 직접 push 금지 → `feat/<module>-<topic>` 브랜치 + PR (리뷰 1인)
