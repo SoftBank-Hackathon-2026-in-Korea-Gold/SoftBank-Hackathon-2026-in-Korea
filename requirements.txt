@@ -7,9 +7,9 @@ uvicorn[standard]>=0.30
 pydantic>=2.7
 sse-starlette>=2.1
 
-# AI & Agentic Self-Healing (LangGraph, LangChain, OpenAI)
+# AI & Agentic Self-Healing (LangGraph, Anthropic Claude)
 langgraph>=0.2
-langchain-openai>=0.2
+anthropic>=1.12.1
 
 # Environment Variables
 python-dotenv>=1.0
