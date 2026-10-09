@@ -7,6 +7,7 @@
 ```bash
 cd SoftBank-Hackathon-2026-in-Korea
 export CLOUDMORPH_WEBHOOK_REPOS=Jeonsubb/cloudmorph-demo-guestbook
+# 5173을 다른 앱이 쓰고 있으면: export FRONT_PORT=5174
 scripts/demo-up.sh --public          # 백엔드+대시보드+터널, 웹훅을 새 터널 주소로 자동 재등록, 토큰 출력
 ```
 - 출력된 공개 URL을 휴대폰으로 열어 토큰 입력 → 심사위원에게 보여 줄 화면 확인
@@ -44,7 +45,7 @@ scripts/demo-up.sh --public          # 백엔드+대시보드+터널, 웹훅을 
 ## 4. 사고 대비
 | 상황 | 대응 |
 |---|---|
-| 공개 터널 DNS가 늦음 | 노트북 화면(`http://127.0.0.1:5173`)으로 진행, 휴대폰은 나중에 |
+| 공개 터널 DNS가 늦음 | 노트북 화면(`http://127.0.0.1:5173`, `FRONT_PORT`를 줬다면 그 포트)으로 진행, 휴대폰은 나중에 |
 | GitHub 웹훅이 안 옴 | 대시보드 소스에 저장소 URL 넣고 수동 배포(같은 이름이면 같은 서비스 갱신) |
 | Cloud Run이 느림 | local 타깃만으로 자가치유 시연(84초), Cloud Run은 미리 받아 둔 결과 화면 |
 | LLM API 장애 | 데모 시나리오(flask 누락, 포트)는 규칙 패치라 API 없이도 동작 |
