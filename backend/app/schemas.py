@@ -22,6 +22,8 @@ from pydantic import BaseModel, Field
 MAX_RETRIES = 3
 
 DeployTarget = Literal["local", "cloudrun"]
+# Cloud service models an app can run on (IaaS / container / PaaS / function)
+ServiceModel = Literal["iaas", "caas", "paas", "faas"]
 
 
 # --------------------------------------------------------------------------- #
@@ -31,6 +33,11 @@ class AnalysisResult(BaseModel):
     """Static analysis output: where and how to deploy the user's app."""
 
     target: DeployTarget = Field(description="Recommended deploy target")
+    service_models: list[ServiceModel] = Field(
+        default_factory=list,
+        description="Every service model the code can run on, most preferred first (caas > paas > faas > iaas). "
+        "Static sites are wrapped in an nginx container, so they get caas and iaas.",
+    )
     language: str = Field(description="e.g. 'python', 'node', 'java'")
     framework: str | None = Field(default=None, description="e.g. 'fastapi', 'flask', 'express'")
     port: int = Field(default=8080, description="Port the app should listen on inside the container")

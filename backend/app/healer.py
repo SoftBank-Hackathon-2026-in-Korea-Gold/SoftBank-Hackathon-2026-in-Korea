@@ -8,7 +8,7 @@ Dockerfile, redeploy, and repeat until success or MAX_RETRIES.
        +----(still failing)---+--(retry_count >= MAX_RETRIES)--> END (gave_up)
 
 Design notes
-- Deterministic rules first, LLM (GPT-4o) only as fallback: the demo cases
+- Deterministic rules first, LLM (Claude) only as fallback: the demo cases
   (port binding, missing package) must not depend on an API call landing,
   and it keeps cost inside the team budget.
 - The deployer is injected (`deploy_fn`) so healer owns the retry loop
@@ -285,7 +285,7 @@ RULE_PATCHES: dict[ErrorCategory, Callable[[str, str], tuple[str, str] | None]] 
 
 
 # --------------------------------------------------------------------------- #
-# 3. LLM fallback (GPT-4o). Skipped silently when OPENAI_API_KEY is absent.
+# 3. LLM fallback (Claude). Skipped silently when ANTHROPIC_API_KEY is absent.
 # --------------------------------------------------------------------------- #
 LLM_SYSTEM_PROMPT = (
     "You are a container deployment repair agent. Given a Dockerfile and the stderr of a failed "
@@ -300,46 +300,39 @@ SOURCE_SYSTEM_PROMPT = (
 )
 
 LLM_TIMEOUT_S = 30  # a slow endpoint must not freeze the demo; on timeout the caller just gets None
+DEFAULT_HEALER_MODEL = "claude-haiku-5-5"
 
 
-def _chat_llm():
-    """ChatOpenAI for the configured endpoint, or None when neither a key nor a base URL is set."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    base_url = (
-        os.environ.get("OPENAI_BASE_URL")
-        or os.environ.get("OPENAI_API_BASE")
-        or os.environ.get("LLM_BASE_URL")
-    )
-    if not api_key and not base_url:
-        logger.info("Neither OPENAI_API_KEY nor OPENAI_BASE_URL set; skipping LLM call")
+def _claude_client():
+    """Anthropic client for the shared team key, or None when ANTHROPIC_API_KEY is not set."""
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.info("ANTHROPIC_API_KEY not set; skipping LLM call (rule patches only)")
         return None
-    from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
+    import anthropic  # lazy: keep import cost off the rule path
 
-    kwargs: dict = {
-        "model": os.environ.get("HEALER_MODEL", "gpt-4o"),
-        "temperature": 0,
-        "timeout": LLM_TIMEOUT_S,
-        "max_retries": 1,
-    }
-    if base_url:
-        kwargs["base_url"] = base_url
-        kwargs["api_key"] = api_key or "EMPTY"
-    elif api_key:
-        kwargs["api_key"] = api_key
-    return ChatOpenAI(**kwargs)
+    return anthropic.Anthropic(timeout=LLM_TIMEOUT_S, max_retries=1)
 
 
 def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
-    """One LLM round trip; returns the fenced (or bare) body. Network / quota errors -> None."""
-    llm = _chat_llm()
-    if llm is None:
+    """One Claude round trip; returns the fenced (or bare) body. Network / quota / model errors -> None."""
+    client = _claude_client()
+    if client is None:
         return None
     try:
-        content = llm.invoke([("system", system), ("user", user)]).content
-    except Exception:  # network / quota / timeout errors must not crash the pipeline
+        r = client.messages.create(
+            model=os.environ.get("HEALER_MODEL") or DEFAULT_HEALER_MODEL,
+            max_tokens=8000,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+    except Exception:  # network / quota / timeout / bad model id must not crash the pipeline
         logger.exception("LLM call failed")
         return None
-    text = str(content).strip()
+    # Read text blocks by type: the reply can start with thinking blocks
+    text = "".join(getattr(b, "text", "") for b in r.content if b.type == "text").strip()
+    if r.stop_reason == "refusal" or not text:
+        logger.warning("LLM returned no text (stop_reason=%s)", r.stop_reason)
+        return None
     fenced = re.search(rf"```(?:{fence_langs})?\n(.*?)```", text, re.DOTALL)
     return (fenced.group(1) if fenced else text).strip() + "\n"
 

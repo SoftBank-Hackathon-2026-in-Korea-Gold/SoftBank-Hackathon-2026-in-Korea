@@ -147,29 +147,43 @@ def test_llm_context_returns_short_log_unchanged():
     assert _llm_context(log) == log
 
 
-def test_default_llm_patch_uses_custom_base_url(monkeypatch):
-    import langchain_openai
+def _fake_anthropic(monkeypatch, reply: str, created: dict):
+    import anthropic
 
+    class _Msg:
+        def __init__(self):
+            self.content = [type("B", (), {"type": "text", "text": reply})()]
+            self.stop_reason = "end_turn"
+
+    class _Messages:
+        def create(self, **kwargs):
+            created["create"] = kwargs
+            return _Msg()
+
+    class DummyAnthropic:
+        def __init__(self, **kwargs):
+            created["client"] = kwargs
+            self.messages = _Messages()
+
+    monkeypatch.setattr(anthropic, "Anthropic", DummyAnthropic)
+
+
+def test_default_llm_patch_uses_claude_with_team_key(monkeypatch):
     from app.healer import default_llm_patch
 
-    monkeypatch.setenv("OPENAI_BASE_URL", "http://tailscale-dgx:30000/v1")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-
-    created = {}
-
-    class DummyChatOpenAI:
-        def __init__(self, **kwargs):
-            created.update(kwargs)
-
-        def invoke(self, *args, **kwargs):
-            class DummyResponse:
-                content = "FROM python:3.12-slim\n"
-
-            return DummyResponse()
-
-    monkeypatch.setattr(langchain_openai, "ChatOpenAI", DummyChatOpenAI)
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setenv("HEALER_MODEL", "claude-test-model")
+    created: dict = {}
+    _fake_anthropic(monkeypatch, "```dockerfile\nFROM python:3.12-slim\n```", created)
 
     patch = default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN)
     assert patch == "FROM python:3.12-slim\n"
-    assert created["base_url"] == "http://tailscale-dgx:30000/v1"
-    assert created["api_key"] == "EMPTY"
+    assert created["create"]["model"] == "claude-test-model"
+    assert created["client"]["timeout"] == 30
+
+
+def test_default_llm_patch_skips_without_key(monkeypatch):
+    from app.healer import default_llm_patch
+
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    assert default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN) is None
