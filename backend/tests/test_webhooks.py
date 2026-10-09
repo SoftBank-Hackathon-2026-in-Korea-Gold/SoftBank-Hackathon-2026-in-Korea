@@ -171,3 +171,57 @@ def test_project_status_is_persisted_when_the_job_finishes(monkeypatch, tmp_path
         return False
 
     assert asyncio.run(scenario())
+
+
+def test_deployments_of_the_same_app_are_serialised(monkeypatch, tmp_path):
+    import asyncio
+    import threading
+    import time as _t
+
+    monkeypatch.setattr(main, "PROJECTS_FILE", tmp_path / "projects.json")
+    monkeypatch.setattr(
+        main, "prepare_source", lambda source, ref=None: __import__("contextlib").nullcontext(str(tmp_path))
+    )
+    monkeypatch.setattr(
+        main.analyzer,
+        "analyze",
+        lambda d: type(
+            "A",
+            (),
+            {
+                "target": "local",
+                "language": "python",
+                "framework": None,
+                "port": 8080,
+                "service_models": [],
+                "notes": [],
+                "dockerfile": "FROM x",
+            },
+        )(),
+    )
+    monkeypatch.setattr(main, "_copy_for_target", lambda src, dst: str(dst))
+    active, peak, lock = [0], [0], threading.Lock()
+
+    def slow_pipeline(target_dir, target, emit, analysis=None):
+        with lock:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        _t.sleep(0.2)
+        with lock:
+            active[0] -= 1
+        emit(main.PipelineEvent(type="done", payload={"target": target, "url": "http://x"}))
+        return True
+
+    monkeypatch.setattr(main, "run_pipeline", slow_pipeline)
+    app = main.create_app()
+
+    async def scenario():
+        app.state.launch("/src", ["local"], name="same-app")
+        app.state.launch("/src", ["local"], name="same-app")
+        for _ in range(200):
+            await asyncio.sleep(0.02)
+            if all(j.completed for j in main._jobs.values()):
+                break
+
+    asyncio.run(scenario())
+    assert peak[0] == 1  # never two at once for the same name

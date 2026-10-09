@@ -97,6 +97,9 @@ def _save_projects() -> None:
 
 
 _projects: dict[str, dict] = _load_projects()
+# One deployment per app name at a time: two quick pushes would otherwise race on the same Cloud Run
+# service (candidate tag / promotion) and the same local container name. Later pushes wait their turn.
+_app_locks: dict[str, threading.Lock] = {}
 
 
 def _validate_https_git_url(source: str) -> str:
@@ -441,6 +444,23 @@ def create_app() -> FastAPI:
         def execute() -> None:
             for line in intro or []:
                 emit(PipelineEvent(type="log", payload={"line": line}))
+            lock = _app_locks.setdefault(app_name, threading.Lock())
+            if not lock.acquire(blocking=False):
+                emit(
+                    PipelineEvent(
+                        type="log",
+                        payload={
+                            "line": f"queue: waiting for the previous deployment of {app_name} to finish"
+                        },
+                    )
+                )
+                lock.acquire()
+            try:
+                _run_locked()
+            finally:
+                lock.release()
+
+        def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
                 analysis = analyzer.analyze(source_dir)
