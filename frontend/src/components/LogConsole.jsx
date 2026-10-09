@@ -89,6 +89,7 @@ export default function LogConsole({ logs, running }) {
     <Card
       title="파이프라인 로그"
       icon={Terminal}
+      className="min-w-0"
       bodyClass="p-0"
       right={
         <>

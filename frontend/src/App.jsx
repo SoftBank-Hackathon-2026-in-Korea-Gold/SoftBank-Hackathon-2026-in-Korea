@@ -127,16 +127,16 @@ export default function App() {
           </div>
         )}
 
-        <div className="grid gap-5 xl:grid-cols-[360px_1fr]">
+        <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
           <div className="space-y-5">
             <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={run.status === 'running'} fleetAvailable={!!fleet} />
             <AnalysisCard run={run} />
           </div>
           <div className="min-w-0 space-y-5">
             <Stepper run={run} now={now} />
-            <div className="grid gap-5 2xl:grid-cols-[1fr_400px]">
+            <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
               <LogConsole logs={run.logs} running={run.status === 'running'} />
-              <div className="space-y-5">
+              <div className="min-w-0 space-y-5">
                 <Endpoints run={run} />
                 <PatchList patches={run.patches} />
               </div>

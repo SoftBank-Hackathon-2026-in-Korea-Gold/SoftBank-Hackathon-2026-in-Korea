@@ -37,7 +37,7 @@ export function AnalysisCard({ run }) {
 
 function DiffBlock({ diff }) {
   return (
-    <pre className="max-h-56 overflow-auto rounded-lg bg-black/40 p-2.5 font-mono text-[11px] leading-[1.1rem] ring-1 ring-white/5">
+    <pre className="max-h-56 max-w-full overflow-auto rounded-lg bg-black/40 p-2.5 font-mono text-[11px] leading-[1.1rem] ring-1 ring-white/5">
       {(diff || '').split('\n').filter((l) => !l.startsWith('---') && !l.startsWith('+++')).map((ln, j) => (
         <div key={j} className={ln.startsWith('+') ? 'bg-emerald-500/10 text-emerald-300' : ln.startsWith('-') ? 'bg-rose-500/10 text-rose-300' : ln.startsWith('@@') ? 'text-sky-400' : 'text-slate-500'}>
           {ln || ' '}
