@@ -9,12 +9,15 @@
 | 시나리오 | 결과 | 소요 | 검증 |
 |---|---|---|---|
 | `sample-apps/broken` → local | 자가치유 2회(flask 누락 → 포트 바인딩) 후 Live URL 200 | 128초 | ✅ 오늘 |
-| `sample-apps/broken` → cloudrun | 자가치유 2회 후 Cloud Run URL 200 | 약 160초 | ✅ 오늘 |
+| `sample-apps/broken` → cloudrun | 자가치유 2회 후 Cloud Run URL 200 | 약 160초¹ | ✅ 오늘 |
 | `sample-apps/guestbook` → local | AI가 Python/Flask, Postgres 필요, SQLite 유실 위험 감지 → Postgres 사이드카 자동 | 36초 | ✅ 오늘 |
 | 공개 터널 인증 | 토큰 없음 401 · 틀린 토큰 401 · 토큰 있음 통과 · `/health`·대시보드 200 | — | ✅ 오늘 |
-| 토큰 미설정 + 터널 경유 | 503 (fail-closed) | — | ✅ 오늘 |
+| 토큰 미설정 + 터널 경유 | 503 (fail-closed) | — | ✅ 오늘 (터널 헤더 시뮬레이션²) |
 | GitHub push → 웹훅 자동 재배포 | 감지 9초 → 치유·배포 196초 | — | ⚠️ 전동훈 노트북 실측 |
 | 노드 풀 부하 → 다른 VM 복제 | 20초 | — | ⚠️ 전동훈 노트북 실측 (VM·`nodes.json` 필요) |
+
+¹ 이 실행은 analyzer AI 판정이 `ANTHROPIC_BASE_URL` 문제로 실패한 상태에서 측정(치유는 규칙 기반이라 영향 없음). AI 분석이 정상일 때 Cloud Run 수치는 미측정.  
+² 실제 터널은 `--public`이 항상 토큰을 생성하므로, 토큰 미설정 상태는 `Cf-Connecting-Ip` 헤더를 붙인 요청으로 검증.
 
 ## 1. 발표 30분 전 체크리스트
 
