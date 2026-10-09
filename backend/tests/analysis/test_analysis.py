@@ -1,9 +1,10 @@
 """analyzer 테스트. AI 검사관과 Dockerfile 작성자는 가짜를 넣는다.
-실제 OpenAI는 맨 아래 test_live_openai 하나만 부르고, ANALYZER_LIVE=1일 때만 돈다."""
+실제 Claude는 맨 아래 test_live_claude 하나만 부르고, ANALYZER_LIVE=1일 때만 돈다."""
 
 import os
 import time
 from pathlib import Path
+from types import SimpleNamespace as NS
 
 import pytest
 from dotenv import dotenv_values
@@ -299,10 +300,10 @@ def test_windows_only_code_cannot_go_to_linux_docker(flask_app):
         run(flask_app, {"os_windows": win})
 
 
-def test_no_openai_key_cannot_analyze(monkeypatch, flask_app):
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+def test_no_api_key_cannot_analyze(monkeypatch, flask_app):
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     assert an.load_model(str(flask_app)) is None
-    with pytest.raises(ValueError, match="OPENAI_API_KEY"):
+    with pytest.raises(ValueError, match="ANTHROPIC_API_KEY"):
         analyze(str(flask_app))
 
 
@@ -322,44 +323,53 @@ def test_evidence_must_be_real_line_outside_tests(flask_app):
     assert an.check_finding(flask_app, "../app.py:2", "app = Flask(__name__)") is None
 
 
+class FakeClaude:
+    """Anthropic 클라이언트 흉내: 정해 둔 응답을 차례로 돌려주고, 받은 요청을 남긴다"""
+
+    def __init__(self, *replies):
+        self.replies, self.requests = list(replies), []
+        self.messages = self
+
+    def create(self, **request):
+        self.requests.append(request)
+        return self.replies.pop(0)
+
+
+def reply(stop_reason, *content, category=None):
+    return NS(stop_reason=stop_reason, content=list(content), stop_details=category and NS(category=category))
+
+
+def tool_use(id, name, **args):
+    return NS(type="tool_use", id=id, name=name, input=args)
+
+
+def answer(report):
+    return NS(type="text", text=report.model_dump_json())
+
+
 def test_repo_reader_reads_only_inside_repo(flask_app):
-    """OpenAI 모델에 붙이는 읽기 도구: 모델이 부른 도구를 실행해 결과를 돌려주고, 저장소 밖은 읽지 못한다"""
-    from langchain_core.messages import AIMessage, ToolMessage
-
-    class FakeChat:  # 도구를 두 번 부르고 끝낸 뒤 결론을 낸다
-        def __init__(self):
-            self.replies = [
-                AIMessage(
-                    content="",
-                    tool_calls=[
-                        {"name": "grep", "args": {"pattern": r"open\("}, "id": "a"},
-                        {"name": "read_file", "args": {"path": "../../etc/passwd"}, "id": "b"},
-                    ],
-                ),
-                AIMessage(content="다 봤다"),
-            ]
-
-        def bind_tools(self, tools):
-            return self
-
-        def invoke(self, messages):
-            return self.replies.pop(0)
-
-        def with_structured_output(self, schema, method=None):
-            chat = self
-
-            class Final:
-                def invoke(self, messages):
-                    chat.seen = messages
-                    return SignalReport(value="no", reason="캐시", evidence=[FILE_WRITE])
-
-            return Final()
-
-    reader = an.RepoReader(FakeChat(), str(flask_app))
-    assert an.make_inspector(reader)("file_write").value == "no"
-    tool_out = {m.tool_call_id: m.content for m in reader.model.seen if isinstance(m, ToolMessage)}
+    """Claude에 붙이는 읽기 도구: 모델이 부른 도구를 실행해 결과를 돌려주고, 저장소 밖은 읽지 못한다"""
+    claude = FakeClaude(  # 도구를 두 번 부르고 끝낸 뒤 결론을 낸다
+        reply(
+            "tool_use", tool_use("a", "grep", pattern=r"open\("), tool_use("b", "read_file", path="../../x")
+        ),
+        reply("end_turn", answer(SignalReport(value="no", reason="캐시", evidence=[FILE_WRITE]))),
+    )
+    assert an.make_inspector(an.RepoReader(claude, "m", str(flask_app)))("file_write").value == "no"
+    tool_out = {r["tool_use_id"]: r["content"] for r in claude.requests[-1]["messages"][-1]["content"]}
     assert tool_out["a"] == 'app.py:9: open("last.json", "w").write("{}")'
     assert tool_out["b"].startswith("읽을 수 없는 경로")  # 저장소 밖은 막는다
+
+
+def test_repo_reader_last_turn_and_refusal(monkeypatch, flask_app):
+    monkeypatch.setenv("ANALYZER_MAX_TURNS", "1")
+    report = SignalReport(value="no", reason="", evidence=[])
+    claude = FakeClaude(reply("end_turn", answer(report)), reply("refusal", category="cyber"))
+    inspect = an.make_inspector(an.RepoReader(claude, "m", str(flask_app)))
+    assert inspect("gpu") == report
+    assert claude.requests[0]["tool_choice"] == {"type": "none"}  # 마지막 턴에는 도구 없이 결론을 낸다
+    with pytest.raises(RuntimeError, match="거절.*cyber"):  # 검사관 실패로 처리된다
+        inspect("gpu")
 
 
 @pytest.fixture
@@ -531,20 +541,20 @@ def test_check_dockerfile(tmp_path):
     assert "Pipfile" in check_dockerfile("FROM python:3.12\nENV PORT 8080\nCOPY Pipfile .\n", tmp_path, 8080)
 
 
-# ---------- 실제 OpenAI: ANALYZER_LIVE=1일 때만 돈다 ----------
+# ---------- 실제 Claude: ANALYZER_LIVE=1일 때만 돈다 ----------
 
 ROOT_ENV = Path(__file__).resolve().parents[3] / ".env"  # 저장소 맨 위 .env (main.py가 읽는 곳)
 
 
 @pytest.mark.skipif(
-    not os.environ.get("ANALYZER_LIVE"), reason="실제 OpenAI를 부른다: ANALYZER_LIVE=1일 때만"
+    not os.environ.get("ANALYZER_LIVE"), reason="실제 Claude를 부른다: ANALYZER_LIVE=1일 때만"
 )
-def test_live_openai(monkeypatch, tmp_path):
+def test_live_claude(monkeypatch, tmp_path):
     for k, v in dotenv_values(ROOT_ENV).items():
-        if v and k.startswith(("OPENAI_", "ANALYZER_")) and not os.environ.get(k):
+        if v and k.startswith(("ANTHROPIC_", "ANALYZER_")) and not os.environ.get(k):
             monkeypatch.setenv(k, v)
-    if not os.environ.get("OPENAI_API_KEY"):
-        pytest.skip(f"OPENAI_API_KEY가 없습니다 ({ROOT_ENV})")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        pytest.skip(f"ANTHROPIC_API_KEY가 없습니다 ({ROOT_ENV})")
     (tmp_path / "requirements.txt").write_text("flask\ngunicorn\n")
     (tmp_path / "app.py").write_text(
         "import sqlite3\nfrom flask import Flask\n\napp = Flask(__name__)\n\n\n"

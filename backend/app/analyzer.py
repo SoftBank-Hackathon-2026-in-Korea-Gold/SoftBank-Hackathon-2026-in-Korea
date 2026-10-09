@@ -3,7 +3,7 @@
 Scan the user's source, decide the deploy target, and generate the initial Dockerfile.
 Contract: see app/schemas.py::AnalysisResult and docs/interfaces.md.
 
-찾고 판정하는 일은 AI 검사관이 한다 (OPENAI_API_KEY). 키가 없으면 분석할 수 없다.
+찾고 판정하는 일은 AI 검사관이 한다 (Claude, ANTHROPIC_API_KEY). 키가 없으면 분석할 수 없다.
 검사관은 찾는 것마다 하나씩 있고, 모델에 읽기 도구(파일 목록·읽기·검색)를 붙여 저장소를 직접 읽게 한다.
 패턴 규칙은 저장소마다 새 문법이 나와 끝없이 늘어나서 쓰지 않는다. 코드는 울타리만 친다:
 - 근거 확인: 검사관이 낸 근거(파일:줄 + 그 줄 코드)가 실제 파일에 있어야 한다. 없으면 버린다
@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 
 from app.schemas import AnalysisResult
 
-DEFAULT_MODEL = "gpt-4o"
+DEFAULT_MODEL = "claude-haiku-5-5"
 # 고를 유형 순서와 그 타깃
 TARGETS = {2: "cloudrun", 5: "cloudrun", 4: "local"}
 # 유형 → 서비스 모델 (추천 순서). 정적 호스팅(5)은 nginx 컨테이너로 감싸 보내므로 caas·iaas로 보낸다
@@ -41,7 +41,7 @@ def analyze(src_dir: str) -> AnalysisResult:
     """Analyze `src_dir` and return the deploy decision + initial Dockerfile."""
     model = load_model(src_dir)
     if not model:
-        raise ValueError("OPENAI_API_KEY가 없어 분석할 수 없습니다 (analyzer는 AI 검사관으로 판정합니다)")
+        raise ValueError("ANTHROPIC_API_KEY가 없어 분석할 수 없습니다 (analyzer는 AI 검사관으로 판정합니다)")
     return analyze_with(src_dir, make_inspector(model), make_dockerfile_writer(model))
 
 
@@ -642,8 +642,8 @@ def validate(name: str, report, root: Path, text: str) -> dict:
     return {"items": items}
 
 
-# ---------- OpenAI 연결과 저장소 읽기 도구 ----------
-# 모델은 OPENAI_API_KEY로 부른다 (healer와 같은 키). ANALYZER_MODEL로 모델을 고른다 (기본 gpt-4o).
+# ---------- Claude 연결과 저장소 읽기 도구 ----------
+# 모델은 ANTHROPIC_API_KEY로 부른다 (healer와 같은 키). ANALYZER_MODEL로 모델을 고른다 (기본 claude-haiku-5-5).
 # 도구는 저장소 안만 읽을 수 있고 (바로가기는 풀어서 실제 위치로 본다), .env·키 파일은 보여 주지 않는다.
 # 쓰기·명령 실행 도구는 없다.
 
@@ -724,9 +724,17 @@ def llm_slots() -> threading.BoundedSemaphore:
 class RepoReader:
     """모델에 저장소 읽기 도구를 붙인다. 검사관은 도구로 필요한 파일을 열어 보고, 다 보면 정해진 형식으로 결론을 낸다."""
 
-    def __init__(self, model, repo: str):
-        self.model = model
+    def __init__(self, client, model: str, repo: str):
+        self.client, self.model = client, model
         self.tools = repo_tools(Path(repo))
+        self.specs = [
+            {
+                "name": t.name,
+                "description": t.description,
+                "input_schema": t.tool_call_schema.model_json_schema(),
+            }
+            for t in self.tools
+        ]
 
     def with_structured_output(self, schema_model):
         reader = self
@@ -738,40 +746,58 @@ class RepoReader:
         return Runner()
 
     def ask(self, schema_model, messages):
-        from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
+        """도구로 읽다가 정해진 형식(JSON)으로 결론을 낸다. 요청은 매 턴 같은 모양에 대화만 덧붙인다
+        (앞부분을 바꾸면 thinking 블록이 무효가 되고 캐시도 깨진다). 마지막 턴에는 도구 없이 결론을 내게 한다."""
+        import anthropic
 
         by_name = {t.name: t for t in self.tools}
         system = "\n".join(c for role, c in messages if role == "system")
         system += "\n저장소는 list_files·read_file·grep 도구로 직접 읽는다. 충분히 봤으면 도구를 그만 부르고 결론을 낸다."
-        convo = [
-            SystemMessage(system),
-            HumanMessage("\n\n".join(c for role, c in messages if role == "user")),
+        convo: list[dict] = [
+            {"role": "user", "content": "\n\n".join(c for role, c in messages if role == "user")}
         ]
+        fmt = {"type": "json_schema", "schema": anthropic.transform_schema(schema_model.model_json_schema())}
+        turns = _env_int("ANALYZER_MAX_TURNS", 15)
         with llm_slots():
-            agent = self.model.bind_tools(self.tools)
-            for _ in range(_env_int("ANALYZER_MAX_TURNS", 15)):
-                reply = agent.invoke(convo)
-                convo.append(reply)
-                if not reply.tool_calls:
-                    break
-                for call in reply.tool_calls:
-                    t = by_name.get(call["name"])
-                    out = t.invoke(call["args"]) if t else f"없는 도구입니다: {call['name']}"
-                    convo.append(ToolMessage(str(out)[:20000], tool_call_id=call["id"]))
-            return self.model.with_structured_output(schema_model, method="function_calling").invoke(
-                convo + [HumanMessage("지금까지 읽은 내용으로 결과를 정해진 형식에 맞춰 낸다.")]
-            )
+            for turn in range(turns):
+                r = self.client.messages.create(
+                    model=self.model,
+                    max_tokens=16000,
+                    system=system,
+                    tools=self.specs,
+                    tool_choice={"type": "auto" if turn < turns - 1 else "none"},
+                    output_config={"effort": "medium", "format": fmt},
+                    cache_control={"type": "ephemeral"},  # 앞 턴까지는 캐시에서 읽는다
+                    messages=convo,
+                )
+                if r.stop_reason == "refusal":
+                    raise RuntimeError(
+                        f"모델이 판정을 거절했습니다 ({r.stop_details and r.stop_details.category})"
+                    )
+                if r.stop_reason != "tool_use":
+                    return schema_model.model_validate_json(
+                        "".join(b.text for b in r.content if b.type == "text")
+                    )
+                convo.append({"role": "assistant", "content": r.content})  # thinking 블록도 그대로 돌려준다
+                results = []
+                for b in r.content:
+                    if b.type == "tool_use":
+                        t = by_name.get(b.name)
+                        out = t.invoke(b.input) if t else f"없는 도구입니다: {b.name}"
+                        results.append(
+                            {"type": "tool_result", "tool_use_id": b.id, "content": str(out)[:20000]}
+                        )
+                convo.append({"role": "user", "content": results})
+        raise RuntimeError("ANALYZER_MAX_TURNS 안에 결론을 내지 못했습니다")
 
 
 def load_model(repo: str | None = None):
-    """OPENAI_API_KEY가 있으면 ANALYZER_MODEL(기본 gpt-4o)에 저장소 읽기 도구를 붙여 돌려준다. 없으면 None."""
-    if not repo or not os.environ.get("OPENAI_API_KEY"):
+    """ANTHROPIC_API_KEY가 있으면 ANALYZER_MODEL(기본 claude-haiku-5-5)에 저장소 읽기 도구를 붙여 돌려준다. 없으면 None."""
+    if not repo or not os.environ.get("ANTHROPIC_API_KEY"):
         return None
-    from langchain_openai import ChatOpenAI
+    import anthropic
 
-    return RepoReader(
-        ChatOpenAI(model=os.environ.get("ANALYZER_MODEL") or DEFAULT_MODEL, temperature=0), repo
-    )
+    return RepoReader(anthropic.Anthropic(), os.environ.get("ANALYZER_MODEL") or DEFAULT_MODEL, repo)
 
 
 # ---------- Dockerfile ----------

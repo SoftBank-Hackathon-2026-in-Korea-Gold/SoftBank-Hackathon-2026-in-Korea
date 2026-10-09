@@ -23,7 +23,7 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 |---|---|---|---|
 | `analyzer.py` | 이요환 | `analyze(src_dir: str) -> AnalysisResult` | 초기 Dockerfile은 `0.0.0.0:$PORT` 바인딩 |
 | `deployer.py` | 전동훈 | `deploy(src_dir: str, dockerfile: str, target: "local"\|"cloudrun") -> DeployResult` | **실패 시 raise 금지** → `success=False, stderr=...` 반환. `stderr`에는 CLI 출력뿐 아니라 **컨테이너 런타임 로그(`docker logs` / Cloud Run revision logs)** 포함 필수 |
-| `healer.py` | 박재현 | `heal(src_dir, target, failed: DeployResult, dockerfile, deploy_fn, llm_patch_fn=None, emit=None) -> HealReport` | 재배포 루프를 healer가 소유. 규칙 패치 우선, GPT-4o 폴백 |
+| `healer.py` | 박재현 | `heal(src_dir, target, failed: DeployResult, dockerfile, deploy_fn, llm_patch_fn=None, emit=None) -> HealReport` | 재배포 루프를 healer가 소유. 규칙 패치 우선, Claude 폴백 |
 | `main.py` | 백락원 | `POST /deploy`, `GET /deploy/{id}/events` (SSE) | 파이프라인 오케스트레이션 |
 
 ## Data types

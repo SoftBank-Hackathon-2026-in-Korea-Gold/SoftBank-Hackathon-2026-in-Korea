@@ -6,7 +6,7 @@
 ## 어떻게 판정하나
 
 ```
-AI 검사관 17개 (OpenAI, 동시에)  →  울타리 (코드)  →  타깃  →  Dockerfile (AI, 울타리)
+AI 검사관 17개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  →  Dockerfile (AI, 울타리)
 ```
 
 - **AI 검사관**: 찾는 것마다 각자의 기준으로 판정한다. 위험 신호 13개(서버 코드, 상주 작업, 주기 작업, 메모리 상태, SQLite,
@@ -41,12 +41,12 @@ AI 검사관 17개 (OpenAI, 동시에)  →  울타리 (코드)  →  타깃  �
 
 | 이름 | 기본값 | 뜻 |
 |---|---|---|
-| `OPENAI_API_KEY` | | healer와 같은 키. 없으면 analyzer는 분석하지 않는다 |
-| `ANALYZER_MODEL` | `gpt-4o` | 검사관 모델 |
+| `ANTHROPIC_API_KEY` | | healer와 같은 키. 없으면 analyzer는 분석하지 않는다 |
+| `ANALYZER_MODEL` | `claude-haiku-5-5` | 검사관 모델 |
 | `ANALYZER_MAX_LLM_CALLS` | `6` | 서버 전체에서 동시에 도는 검사관 호출 수. 분석이 여러 건 겹치면 나머지는 기다린다 |
 | `ANALYZER_MAX_TURNS` | `15` | 검사관 하나가 파일을 읽으며 주고받는 최대 횟수 |
 
-실제 OpenAI로 확인: `cd backend && ANALYZER_LIVE=1 uv run pytest tests/analysis -k live -s` (키는 저장소 맨 위 `.env`에서 읽는다).
+실제 Claude로 확인: `cd backend && ANALYZER_LIVE=1 uv run pytest tests/analysis -k live -s` (키는 저장소 맨 위 `.env`에서 읽는다).
 평소 `pytest`에서는 건너뛴다.
 
 ## 팀에 제안 (합의 필요)
