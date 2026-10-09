@@ -40,8 +40,8 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 | **cloudflared CLI** (선택) | 최신 버전 | 로컬 배포 성공 시 외부 접속 가능한 Quick Tunnel 공개 URL 발급 | `cloudflared --version` |
 
 ### 2.3 외부 클라우드 및 API 계정 요구사항
-- **OpenAI API Key**:
-  - LLM 모델(`gpt-4o`) 호출 권한 필요.
+- **LLM API (OpenAI 또는 On-Premise SGLang / vLLM / Claude 호환 엔드포인트)**:
+  - OpenAI 공식 API(`gpt-4o`) 또는 사내 온프레미스 GPU 클러스터(DGX, SGLang, vLLM, Ollama), Claude/프록시(OpenRouter, LiteLLM) 엔드포인트 지원.
   - Healer의 복합 에러 분석/수선 및 Analyzer의 AI 심층 검사관에서 사용.
 - **Google Cloud Platform (GCP) 계정**:
   - GCP Project 생성 및 결제 계정(Billing) 연결 필수.
@@ -61,8 +61,9 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 
 | 환경변수명 | 필수 여부 | 기본값 | 사용 모듈 | 상세 설명 |
 |---|:---:|---|---|---|
-| `OPENAI_API_KEY` | **필수** | - | `healer`, `analyzer` | OpenAI API 인증 키. 미설정 시 자가치유는 규칙 패치만 동작하며 analyzer는 패턴 규칙으로만 판정됩니다. |
-| `HEALER_MODEL` | 선택 | `gpt-4o` | `healer.py` | 자가치유 LLM 에이전트가 코드 패치 생성에 사용할 OpenAI 모델. |
+| `OPENAI_API_KEY` | **필수** (공식 API 시) | - | `healer`, `analyzer` | OpenAI API 인증 키. (온프레미스 사설 GPU/SGLang 서빙 시에는 빈값 또는 더미키 `EMPTY` 허용) |
+| `OPENAI_BASE_URL` | 선택 | `https://api.openai.com/v1` | `healer.py` | 온프레미스 GPU 서빙(DGX, SGLang, vLLM) 또는 프록시(OpenRouter, LiteLLM Claude 연동) 엔드포인트 URL. |
+| `HEALER_MODEL` | 선택 | `gpt-4o` | `healer.py` | 자가치유 LLM 에이전트가 코드 패치 생성에 사용할 모델명 (온프레미스 예: `Qwen/Qwen2.5-Coder-32B-Instruct`, Claude 예: `anthropic/claude-3.5-sonnet`). |
 | `ANALYZER_MODEL` | 선택 | `gpt-4o` | `analyzer.py` | 소스코드 정적 분석 및 위험 탐지에 사용할 AI 검사관 모델. |
 | `ANALYZER_MAX_LLM_CALLS` | 선택 | `6` | `analyzer.py` | 서버 전체에서 동시 실행 가능한 검사관 LLM 호출 수 상한(세마포어). |
 | `ANALYZER_MAX_TURNS` | 선택 | `15` | `analyzer.py` | 검사관 에이전트의 저장소 파일 탐색 도구(tool calling) 최대 턴 수. |

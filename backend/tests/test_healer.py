@@ -145,3 +145,32 @@ def test_llm_context_keeps_deployer_header_and_tail():
 def test_llm_context_returns_short_log_unchanged():
     log = "[deployer] stage=build kind=build_error target=local\n--- error ---\nERROR [3/4] RUN pip install"
     assert _llm_context(log) == log
+
+
+def test_default_llm_patch_uses_custom_base_url(monkeypatch):
+    import langchain_openai
+
+    from app.healer import default_llm_patch
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://tailscale-dgx:30000/v1")
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+    created = {}
+
+    class DummyChatOpenAI:
+        def __init__(self, **kwargs):
+            created.update(kwargs)
+
+        def invoke(self, *args, **kwargs):
+            class DummyResponse:
+                content = "FROM python:3.12-slim\n"
+
+            return DummyResponse()
+
+    monkeypatch.setattr(langchain_openai, "ChatOpenAI", DummyChatOpenAI)
+
+    patch = default_llm_patch("FROM scratch", "err", ErrorCategory.UNKNOWN)
+    assert patch == "FROM python:3.12-slim\n"
+    assert created["base_url"] == "http://tailscale-dgx:30000/v1"
+    assert created["api_key"] == "EMPTY"
+

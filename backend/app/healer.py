@@ -217,12 +217,28 @@ LLM_SYSTEM_PROMPT = (
 
 
 def default_llm_patch(dockerfile: str, error_log: str, category: ErrorCategory) -> str | None:
-    if not os.environ.get("OPENAI_API_KEY"):
-        logger.info("OPENAI_API_KEY not set; skipping LLM patch")
+    api_key = os.environ.get("OPENAI_API_KEY")
+    base_url = (
+        os.environ.get("OPENAI_BASE_URL")
+        or os.environ.get("OPENAI_API_BASE")
+        or os.environ.get("LLM_BASE_URL")
+    )
+    if not api_key and not base_url:
+        logger.info("Neither OPENAI_API_KEY nor OPENAI_BASE_URL set; skipping LLM patch")
         return None
     from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
 
-    llm = ChatOpenAI(model=os.environ.get("HEALER_MODEL", "gpt-4o"), temperature=0)
+    kwargs: dict = {
+        "model": os.environ.get("HEALER_MODEL", "gpt-4o"),
+        "temperature": 0,
+    }
+    if base_url:
+        kwargs["base_url"] = base_url
+        kwargs["api_key"] = api_key or "EMPTY"
+    elif api_key:
+        kwargs["api_key"] = api_key
+
+    llm = ChatOpenAI(**kwargs)
     user = (
         f"Error category: {category.value}\n\nstderr:\n{_llm_context(error_log)}\n\nDockerfile:\n{dockerfile}"
     )
