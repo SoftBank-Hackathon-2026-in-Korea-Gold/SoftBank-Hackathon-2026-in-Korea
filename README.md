@@ -13,7 +13,7 @@ SoftBank Hackathon 2026 in Korea · Term 2 · Team Gold
             → Live Public URL + AI 수정 전/후 리포트 (SSE → dashboard)
 ```
 
-인터페이스 계약: [`docs/interfaces.md`](docs/interfaces.md) · 소스: [`backend/app/schemas.py`](backend/app/schemas.py)
+인터페이스 계약: [`docs/interfaces.md`](docs/interfaces.md) · 요구사항 명세: [`docs/requirements.md`](docs/requirements.md) · 소스: [`backend/app/schemas.py`](backend/app/schemas.py)
 
 ## Repository layout
 
@@ -26,14 +26,17 @@ SoftBank Hackathon 2026 in Korea · Term 2 · Team Gold
 | `backend/app/schemas.py` | 전원 (합의) | 모듈 간 공용 계약 |
 | `frontend/` | 유예인 | React + Tailwind 대시보드 |
 | `sample-apps/` | 전동훈 | 시연용 정상/고장 샘플 앱 |
-| `docs/` | 박재현 | 인터페이스·설계 문서 (Notion 원본 미러) |
+| `docs/` | 박재현 | 요구사항·인터페이스·설계 문서 |
 
 ## Quick start (backend)
 
 ```bash
+# 1. 환경변수 준비
+cp .env.example .env         # 키는 각자 로컬에만 (git 커밋 금지)
+
+# 2. 백엔드 구동 (uv 권장 또는 pip)
 cd backend
-uv sync
-cp ../.env.example ../.env   # 키는 각자 로컬에만
+uv sync                      # 또는 pip install -r requirements.txt
 uv run pytest -q             # healer 루프 테스트 (fake deployer)
 uv run uvicorn app.main:app --reload
 ```
