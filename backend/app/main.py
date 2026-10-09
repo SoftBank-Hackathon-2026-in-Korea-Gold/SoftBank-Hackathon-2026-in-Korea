@@ -148,6 +148,7 @@ def _copy_for_target(source: str, destination: Path) -> str:
     shutil.copytree(
         source,
         destination,
+        symlinks=True,
         ignore=shutil.ignore_patterns(".git", ".venv", "node_modules", ".deployer", "__pycache__"),
     )
     return str(destination)
