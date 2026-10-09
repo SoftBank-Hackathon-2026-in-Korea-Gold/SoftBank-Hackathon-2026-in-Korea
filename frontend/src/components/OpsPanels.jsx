@@ -3,6 +3,19 @@ import { Activity, Boxes, Eye, GitBranch, Layers, Radio, Server } from 'lucide-r
 import { Badge, Bar, Card, Dot } from './ui';
 import { fmtAgo, fmtTime } from '../lib/style';
 
+const EVENT_LABEL = { deploy: '배포', scale_out: '확장', scale_in: '축소', scale_out_blocked: '확장 보류' };
+
+/** Newest first; consecutive events of the same type collapse into one line with a count. */
+function groupEvents(events) {
+  const out = [];
+  for (const e of [...events].reverse()) {
+    const last = out[out.length - 1];
+    if (last && last.type === e.type && e.type !== 'deploy') last.count += 1;
+    else out.push({ ...e, count: 1 });
+  }
+  return out;
+}
+
 const STATUS = {
   running: { tone: 'violet', label: '배포 중', pulse: true },
   completed: { tone: 'emerald', label: '정상' },
@@ -117,9 +130,9 @@ export function FleetPanel({ fleet }) {
                   </div>
                 ))}
               </div>
-              {a.events.slice(-3).reverse().map((e, i) => (
-                <div key={i} className={`mt-1.5 truncate text-[11px] ${e.type === 'scale_out' ? 'text-amber-300' : e.type === 'scale_in' ? 'text-sky-300' : 'text-slate-500'}`}>
-                  {fmtTime(new Date(e.ts * 1000))} · {e.type} {e.node || ''} {e.reason ? `· ${e.reason}` : ''}
+              {groupEvents(a.events).slice(0, 3).map((e, i) => (
+                <div key={i} className={`mt-1.5 truncate text-[11px] ${e.type === 'scale_out' ? 'text-amber-300' : e.type === 'scale_in' ? 'text-sky-300' : e.type === 'scale_out_blocked' ? 'text-rose-300/80' : 'text-slate-500'}`}>
+                  {fmtTime(new Date(e.ts * 1000))} · {EVENT_LABEL[e.type] || e.type}{e.count > 1 ? ` ×${e.count}` : ''} {e.node || ''} {e.type === 'scale_out_blocked' ? '· 남은 노드 없음' : e.reason ? `· ${e.reason}` : ''}
                 </div>
               ))}
             </div>
