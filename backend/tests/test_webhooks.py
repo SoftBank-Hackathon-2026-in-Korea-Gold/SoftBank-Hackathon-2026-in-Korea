@@ -107,3 +107,17 @@ def test_deploy_accepts_stable_name_and_ref(monkeypatch):
         "/deploy", json={"source": "/tmp/x", "targets": ["local"], "name": "shop-api", "ref": "main"}
     )
     assert r.status_code == 200 and launched[0][2]["name"] == "shop-api" and launched[0][2]["ref"] == "main"
+
+
+def test_projects_persist_across_restart(monkeypatch, tmp_path):
+    monkeypatch.setattr(main, "PROJECTS_FILE", tmp_path / "projects.json")
+    main._projects.clear()
+    main._projects["shop-api"] = {
+        "name": "shop-api",
+        "last_status": "completed",
+        "history": ["d1"],
+        "updated_at": 1.0,
+    }
+    main._save_projects()
+    assert main._load_projects()["shop-api"]["last_status"] == "completed"
+    main._projects.clear()

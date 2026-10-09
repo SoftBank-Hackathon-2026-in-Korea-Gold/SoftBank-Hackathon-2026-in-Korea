@@ -71,8 +71,31 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
-# name -> last deployment of that app (what a GitHub push updates). In-memory, like _jobs.
-_projects: dict[str, dict] = {}
+# name -> last deployment of that app (what a GitHub push updates). Persisted to a JSON file so the
+# dashboard's project list survives a backend restart (jobs/events themselves stay in memory).
+PROJECTS_FILE = Path(
+    os.getenv(
+        "CLOUDMORPH_PROJECTS_FILE", Path(__file__).resolve().parents[1] / ".cloudmorph" / "projects.json"
+    )
+)
+
+
+def _load_projects() -> dict[str, dict]:
+    try:
+        return json.loads(PROJECTS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_projects() -> None:
+    try:
+        PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PROJECTS_FILE.write_text(json.dumps(_projects, ensure_ascii=False, indent=2))
+    except OSError:
+        pass  # persistence is best-effort; the in-memory copy is still correct
+
+
+_projects: dict[str, dict] = _load_projects()
 
 
 def _validate_https_git_url(source: str) -> str:
@@ -403,6 +426,7 @@ def create_app() -> FastAPI:
             updated_at=time.time(),
         )
         project["history"] = [*project["history"][-19:], deployment_id]
+        _save_projects()
         loop = asyncio.get_running_loop()
 
         def emit(event: PipelineEvent) -> None:
