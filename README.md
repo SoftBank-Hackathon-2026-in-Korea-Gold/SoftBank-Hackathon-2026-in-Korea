@@ -21,7 +21,8 @@ SoftBank Hackathon 2026 in Korea · Term 2 · Team Gold
 |---|---|---|
 | `backend/app/main.py` | 백락원 | FastAPI 오케스트레이션, SSE 스트리밍 |
 | `backend/app/analyzer.py` | 이요환 | 코드·의존성 분석, 배포 타깃 결정, 초기 Dockerfile |
-| `backend/app/deployer.py` | 전동훈 | Docker 빌드/실행, Cloud Run 배포 |
+| `backend/app/deployer.py` | 전동훈 | Docker 빌드/실행, Cloud Run 블루그린, 노드 풀 배포 |
+| `backend/app/nodes.py`, `backend/app/fleet.py` | 전동훈 | 멀티 클라우드 노드 풀(SSH+Docker), 라우터, 자동 확장 ([docs](docs/node-pool-fleet.md)) |
 | `backend/app/healer.py` | 박재현 | LangGraph 자가치유 루프, diff 리포트 |
 | `backend/app/schemas.py` | 전원 (합의) | 모듈 간 공용 계약 |
 | `frontend/` | 유예인 | React + Tailwind 대시보드 |

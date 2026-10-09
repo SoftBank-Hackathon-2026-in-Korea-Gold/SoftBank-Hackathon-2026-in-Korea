@@ -46,6 +46,7 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from app import nodes as nodepool
 from app.schemas import DeployResult, DeployTarget
 
 TAIL = 6000  # max chars kept per captured stream
@@ -140,6 +141,11 @@ class Config:
     deploy_timeout: int = 600
     build_timeout: int = 900
     skip_preflight: bool = False
+    env: dict = field(
+        default_factory=dict
+    )  # extra env vars injected into the app container (e.g. DATABASE_URL)
+    node_arch: str | None = None  # restrict node pool to an architecture; None -> any
+    node_exclude: tuple = ()  # node names to skip (used by fleet scale-out)
 
     @classmethod
     def from_env(cls) -> Config:
@@ -523,6 +529,8 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
 
         out.stage = "deploy"
         run_cmd = ["docker", "run", "-d", "--name", cname, "-e", f"PORT={cfg.container_port}"]
+        for k, v in cfg.env.items():
+            run_cmd += ["-e", f"{k}={v}"]
         run_cmd += ["-p", f"{host_port}:{cfg.container_port}", image]
         cp = r.run("docker run", run_cmd, stage="deploy")
         out.handles["container_id"] = cp.stdout.strip()
@@ -782,13 +790,146 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
 
 
 # --------------------------------------------------------------------------- #
+# node target: least-loaded SSH/Docker host in the pool (GCP / Oracle / AWS / anything)
+# --------------------------------------------------------------------------- #
+def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
+    reg = nodepool.load_registry()
+    if not reg.nodes:
+        raise StepError(
+            "preflight",
+            "user_action_required",
+            "node pool is empty: create backend/nodes.json (see nodes.example.json)",
+        )
+    name = slug(src_dir.name)
+    tag = cfg.tag or time.strftime("n%Y%m%d-%H%M%S")
+
+    out.stage = "deploy"
+    t0 = time.time()
+    try:
+        node, metrics = nodepool.select_node(reg, arch=cfg.node_arch, exclude=set(cfg.node_exclude))
+    except RuntimeError as e:
+        raise StepError("deploy", "user_action_required", f"node selection failed: {e}") from None
+    r.steps.append(
+        Step(
+            "select node",
+            f"ssh probe x{len(metrics)}",
+            0,
+            time.time() - t0,
+            json.dumps(nodepool.metrics_dict(metrics)),
+            "",
+        )
+    )
+    image, cname = f"{name}:{tag}", f"{name}-{tag}"
+    out.handles.update(
+        node=node.name,
+        provider=node.provider,
+        host=node.host,
+        image=image,
+        container_name=cname,
+        candidates=nodepool.metrics_dict(metrics),
+    )
+
+    out.stage = "build"
+    build_image(src_dir, image, node.platform, cfg, r)
+
+    out.stage = "push"
+    t0 = time.time()
+    try:
+        secs = nodepool.ship_image(node, image)
+    except (RuntimeError, subprocess.TimeoutExpired) as e:
+        r.steps.append(
+            Step(
+                "ship image",
+                f"docker save {image} | ssh {node.name} docker load",
+                1,
+                time.time() - t0,
+                "",
+                str(e),
+            )
+        )
+        raise StepError("push", "push_error", f"could not ship image to {node.name}: {e}") from None
+    r.steps.append(Step("ship image", f"docker save {image} | ssh {node.name} docker load", 0, secs, "", ""))
+
+    out.stage = "deploy"
+    t0 = time.time()
+    try:
+        host_port = nodepool.free_port_on(node)
+        cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, cfg.env)
+    except RuntimeError as e:
+        r.steps.append(
+            Step("docker run (remote)", f"ssh {node.name} docker run ...", 1, time.time() - t0, "", str(e))
+        )
+        raise StepError("deploy", "deploy_error", str(e)) from None
+    r.steps.append(
+        Step(
+            "docker run (remote)",
+            f"ssh {node.name} docker run -p {host_port}:{cfg.container_port} {image}",
+            0,
+            time.time() - t0,
+            cid,
+            "",
+        )
+    )
+    node_url = f"http://{node.host}:{host_port}"
+    out.handles.update(container_id=cid, host_port=host_port, node_url=node_url)
+
+    out.stage = "verify"
+    ok, why = wait_up(
+        node_url,
+        cfg.health_path,
+        cfg.verify_timeout,
+        is_dead=lambda: nodepool.container_status(node, cname)[0] != "running",
+    )
+    if not ok:
+        status, code = nodepool.container_status(node, cname)
+        logs = nodepool.container_logs(node, cname)
+        nodepool.remove_container(node, cname)
+        raise StepError(
+            "verify",
+            "runtime_error",
+            f"container on {node.name} status={status} exit_code={code}; {why}",
+            app_logs=logs,
+            diagnosis=diagnose_not_reachable(cfg.container_port, why, logs, exited=status != "running"),
+        )
+    out.url = node_url
+    if reg.router is not None:  # publish through the fleet router: stable hostname, scale-out target
+        from app import fleet
+
+        out.stage = "expose"
+        t0 = time.time()
+        try:
+            public = fleet.register(
+                name,
+                image,
+                cfg.container_port,
+                fleet.Replica(node=node.name, container=cname, host=node.host, port=host_port),
+                str(src_dir),
+            )
+            r.steps.append(
+                Step("router register", f"caddy route {public} -> {node_url}", 0, time.time() - t0, "", "")
+            )
+            ok, why = wait_up(public, cfg.health_path, 60, interval=3)
+            if ok:
+                out.handles["public_url"] = public
+                out.url = public
+            else:
+                out.warnings.append(
+                    f"router hostname not verified yet ({why}); node URL {node_url} is healthy"
+                )
+                out.url = public
+        except RuntimeError as e:
+            r.steps.append(Step("router register", "fleet.register", 1, time.time() - t0, "", str(e)))
+            out.warnings.append(f"router registration failed ({e}); serving directly at {node_url}")
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 def run_pipeline(src_dir: str | os.PathLike, target: str, cfg: Config | None = None) -> Outcome:
     """Full-detail variant of deploy(): stages, handles, warnings. Does not raise."""
     cfg = cfg or Config.from_env()
-    if target not in ("local", "cloudrun"):
-        raise ValueError("target must be 'local' or 'cloudrun'")
+    if target not in ("local", "cloudrun", "node"):
+        raise ValueError("target must be 'local', 'cloudrun' or 'node'")
     if target == "cloudrun" and not cfg.project:
         cfg.project = gcloud_default_project()
 
@@ -798,7 +939,7 @@ def run_pipeline(src_dir: str | os.PathLike, target: str, cfg: Config | None = N
     try:
         if not cfg.skip_preflight:
             preflight(target, pdir, cfg, r)
-        (deploy_local if target == "local" else deploy_cloudrun)(pdir, cfg, r, out)
+        {"local": deploy_local, "cloudrun": deploy_cloudrun, "node": deploy_node}[target](pdir, cfg, r, out)
         out.ok = True
     except StepError as e:
         out.ok, out.stage, out.kind, out.error, out.app_logs, out.diagnosis = (
@@ -851,7 +992,7 @@ def _main(argv: list[str]) -> int:
         prog="python -m app.deployer", description="CloudMorph deployer (manual run)"
     )
     ap.add_argument("src_dir")
-    ap.add_argument("target", choices=["local", "cloudrun"])
+    ap.add_argument("target", choices=["local", "cloudrun", "node"])
     ap.add_argument("--dockerfile", help="Dockerfile to write into src_dir (default: reuse existing)")
     ap.add_argument("--service")
     ap.add_argument("--tag")

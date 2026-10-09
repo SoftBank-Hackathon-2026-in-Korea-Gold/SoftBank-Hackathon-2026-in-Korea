@@ -64,5 +64,9 @@ temp/
 # deployer runtime state (written into src_dir)
 .deployer/
 
+# node pool registry (environment-specific; see backend/nodes.example.json)
+backend/nodes.json
+backend/.fleet/
+
 # demo-up.sh runtime state
 .demo/
