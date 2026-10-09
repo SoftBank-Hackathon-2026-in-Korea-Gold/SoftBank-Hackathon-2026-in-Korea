@@ -3,6 +3,8 @@
 #   backend (uvicorn :8000) + dashboard (vite :5173, proxies /deploy & /health to the backend)
 #   --public : also open ONE Cloudflare quick tunnel to the dashboard and require an API token.
 # Usage: scripts/demo-up.sh [--public]        Stop: scripts/demo-down.sh
+#   CLOUDMORPH_WEBHOOK_REPOS=owner/repo[,owner/repo2]  with --public: (re)register each repo's GitHub push webhook
+#   to this run's tunnel URL (quick-tunnel URLs change every run). Needs `gh auth login`.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 STATE="$ROOT/.demo"; mkdir -p "$STATE"
@@ -32,6 +34,12 @@ for port in "$BACKEND_PORT" "$FRONT_PORT"; do
 done
 [[ -d "$ROOT/frontend/node_modules" ]] || { say "npm install (first run)"; (cd "$ROOT/frontend" && npm install --no-audit --no-fund >/dev/null); }
 
+WEBHOOK_REPOS="${CLOUDMORPH_WEBHOOK_REPOS:-}"
+if [[ $PUBLIC -eq 1 && -n "$WEBHOOK_REPOS" ]]; then
+  command -v gh >/dev/null || die "gh CLI not installed (needed for CLOUDMORPH_WEBHOOK_REPOS)"
+  export CLOUDMORPH_WEBHOOK_SECRET="${CLOUDMORPH_WEBHOOK_SECRET:-$(openssl rand -hex 16)}"
+fi
+
 # ---- token (only when public) -----------------------------------------------
 if [[ $PUBLIC -eq 1 ]]; then
   export CLOUDMORPH_API_TOKEN="${CLOUDMORPH_API_TOKEN:-$(openssl rand -hex 12)}"
@@ -57,10 +65,25 @@ if [[ $PUBLIC -eq 1 ]]; then
   nohup cloudflared tunnel --no-autoupdate --url "http://127.0.0.1:$FRONT_PORT" > "$STATE/tunnel.log" 2>&1 &
   echo $! > "$STATE/tunnel.pid"
   URL=""
-  for i in $(seq 1 40); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE/tunnel.log" | head -n 1); [[ -n "$URL" ]] && break; sleep 1; done
+  for i in $(seq 1 60); do URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$STATE/tunnel.log" | head -n 1 || true); [[ -n "$URL" ]] && break; sleep 1; done  # `|| true`: under set -e a miss would silently kill the script
   [[ -n "$URL" ]] || die "tunnel URL not found, see $STATE/tunnel.log"
   for i in $(seq 1 30); do grep -q "Registered tunnel connection" "$STATE/tunnel.log" && break; sleep 1; done
   echo "$URL" > "$STATE/public_url"
+  if [[ -n "$WEBHOOK_REPOS" ]]; then
+    IFS=',' read -ra REPOS <<< "$WEBHOOK_REPOS"
+    for repo in "${REPOS[@]}"; do
+      repo="$(echo "$repo" | xargs)"; [[ -z "$repo" ]] && continue
+      for old in $(gh api "repos/$repo/hooks" --jq '.[] | select(.config.url | test("trycloudflare\\.com/webhook/github")) | .id' 2>/dev/null); do
+        gh api -X DELETE "repos/$repo/hooks/$old" >/dev/null 2>&1 || true
+      done
+      body=$(printf '{"name":"web","active":true,"events":["push"],"config":{"url":"%s/webhook/github","content_type":"json","secret":"%s","insecure_ssl":"0"}}' "$URL" "$CLOUDMORPH_WEBHOOK_SECRET")
+      if hook=$(printf '%s' "$body" | gh api -X POST "repos/$repo/hooks" --input - --jq '.id' 2>"$STATE/webhook.err"); then
+        say "webhook          : $repo -> $URL/webhook/github (id $hook)"
+      else
+        say "WARNING: webhook registration failed for $repo: $(tail -n 1 "$STATE/webhook.err")"
+      fi
+    done
+  fi
   echo
   say "PUBLIC dashboard : $URL   (DNS may take ~1 min to propagate)"
   say "API token        : $CLOUDMORPH_API_TOKEN   (header X-API-Token, or ?token= for SSE)"

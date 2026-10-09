@@ -9,8 +9,9 @@ dependencies = [
     "pydantic>=2.7",
     "sse-starlette>=2.1",
     "langgraph>=0.2",
-    "langchain-openai>=0.2",
     "python-dotenv>=1.0",
+    "anthropic>=1.12.1",
+    "langchain-openai>=0.2",
 ]
 
 [dependency-groups]
