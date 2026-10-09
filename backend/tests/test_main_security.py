@@ -21,7 +21,7 @@ from app.schemas import AnalysisResult, DeployRequest, DeployResult
 
 
 @pytest.fixture
-def m(monkeypatch):
+def m(monkeypatch, tmp_path):
     """Load an isolated orchestrator without .env access or real deployments."""
     monkeypatch.setattr("dotenv.load_dotenv", lambda: False)
     # Git preparation copies os.environ, so expose only synthetic settings.
@@ -43,6 +43,9 @@ def m(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, module_name, module)
     spec.loader.exec_module(module)
+    # the project registry is persisted to disk; keep this private module's copy in tmp
+    monkeypatch.setattr(module, "PROJECTS_FILE", tmp_path / "projects.json")
+    module._projects.clear()
 
     def forbidden(*args, **kwargs):
         raise AssertionError("Real commands, deployments and LLM calls are forbidden")
