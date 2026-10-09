@@ -1,0 +1,20 @@
+name: Labeler
+
+# Auto-apply area:* / type:* labels from changed paths and branch prefix.
+# Rules: .github/labeler.yml. Uses pull_request_target so fork PRs get labels too;
+# safe because no PR code is checked out or executed.
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  label:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/labeler@v5
+        with:
+          sync-labels: false

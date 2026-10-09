@@ -1,0 +1,52 @@
+name: ✨ 기능 제안 (Feature)
+description: 새 기능이나 개선을 제안합니다.
+title: "[Feature] "
+labels: ["type:feature"]
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: 목적 (Goal)
+      description: 무엇을, 왜 하려는지. 시연 시나리오와 어떻게 연결되는지 적어 주세요.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: 대상 모듈 (Area)
+      multiple: true
+      options:
+        - analyzer
+        - deployer
+        - healer
+        - api (main.py)
+        - contract (schemas.py)
+        - frontend
+        - sample-apps
+        - infra (.github / Docker / GCP)
+    validations:
+      required: true
+  - type: textarea
+    id: done
+    attributes:
+      label: 완료 기준 (Definition of done)
+      value: |
+        - [ ]
+        - [ ] 테스트 추가 (backend 변경 시)
+    validations:
+      required: true
+  - type: dropdown
+    id: contract
+    attributes:
+      label: 공용 계약 변경 (schemas.py / docs/interfaces.md)
+      description: 다른 모듈에 영향을 주는 계약 변경은 팀 합의가 필요합니다.
+      options:
+        - 없음
+        - 있음 — 팀 합의 필요
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: 참고 (Notes)
+      description: 대안, 참고 링크, 스크린샷 등

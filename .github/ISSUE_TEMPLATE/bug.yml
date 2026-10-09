@@ -1,0 +1,67 @@
+name: 🐛 버그 리포트 (Bug)
+description: 배포·분석·자가치유·대시보드에서 잘못 동작하는 것을 알립니다.
+title: "[Bug] "
+labels: ["type:bug"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: 모듈 (Area)
+      description: 문제가 발생한 모듈을 고르세요. 잘 모르겠으면 비워 두세요.
+      multiple: true
+      options:
+        - analyzer
+        - deployer
+        - healer
+        - api (main.py)
+        - contract (schemas.py)
+        - frontend
+        - sample-apps
+        - infra (.github / Docker / GCP)
+  - type: dropdown
+    id: target
+    attributes:
+      label: 실행 환경 (Target)
+      options:
+        - local Docker
+        - Cloud Run
+        - 해당 없음 / 모름
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 재현 절차 (Steps to reproduce)
+      placeholder: |
+        1. sample-apps/broken-port 로 배포 실행
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 기대 결과 (Expected)
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 실제 결과 (Actual)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 로그 / stderr (Logs)
+      description: deployer stderr, healer 리포트, 브라우저 콘솔 등. API 키·토큰·자격증명은 반드시 지우세요.
+      render: shell
+  - type: dropdown
+    id: demo-impact
+    attributes:
+      label: 시연 영향 (Demo impact)
+      options:
+        - 시연을 막음 (P0)
+        - 시연 전 고치면 좋음 (P1)
+        - 영향 적음 (P2)
+    validations:
+      required: true

@@ -1,0 +1,63 @@
+# actions/labeler v5 config — used by .github/workflows/labeler.yml
+# Label names must exist in .github/labels.yml.
+
+# --- area: by changed paths ---
+"area:analyzer":
+  - changed-files:
+      - any-glob-to-any-file: ["backend/app/analyzer.py", "backend/tests/test_analyzer*.py"]
+
+"area:deployer":
+  - changed-files:
+      - any-glob-to-any-file: ["backend/app/deployer.py", "backend/tests/test_deployer*.py"]
+
+"area:healer":
+  - changed-files:
+      - any-glob-to-any-file: ["backend/app/healer.py", "backend/tests/test_healer*.py"]
+
+"area:api":
+  - changed-files:
+      - any-glob-to-any-file: ["backend/app/main.py", "backend/tests/test_main*.py"]
+
+"area:contract":
+  - changed-files:
+      - any-glob-to-any-file: ["backend/app/schemas.py", "docs/interfaces.md"]
+
+"area:frontend":
+  - changed-files:
+      - any-glob-to-any-file: ["frontend/**"]
+
+"area:sample-apps":
+  - changed-files:
+      - any-glob-to-any-file: ["sample-apps/**"]
+
+"area:docs":
+  - changed-files:
+      - any-glob-to-any-file: ["docs/**", "*.md"]
+
+"area:infra":
+  - changed-files:
+      - any-glob-to-any-file: [".github/**", "scripts/**", "Dockerfile", "backend/Dockerfile", "docker-compose*.yml"]
+
+# --- type: tests touched, or branch prefix (feat/, fix/, ...) ---
+"type:test":
+  - changed-files:
+      - any-glob-to-any-file: ["backend/tests/**"]
+  - head-branch: ["^test/"]
+
+"type:feature":
+  - head-branch: ["^feat/"]
+
+"type:bug":
+  - head-branch: ["^fix/"]
+
+"type:docs":
+  - head-branch: ["^docs/"]
+
+"type:refactor":
+  - head-branch: ["^refactor/"]
+
+"type:chore":
+  - head-branch: ["^chore/"]
+
+"type:ci":
+  - head-branch: ["^ci/"]
