@@ -10,7 +10,18 @@ from pathlib import Path
 
 import pytest
 
-from app.healer import _llm_context, _unhealable, classify_error, deployer_header, heal
+from app.healer import (
+    APP_CODE_STOP,
+    _llm_context,
+    _patch_unresolvable_pin,
+    _source_file,
+    _stops_on_app_code,
+    _unhealable,
+    app_code_failure,
+    classify_error,
+    deployer_header,
+    heal,
+)
 from app.schemas import DeployResult, ErrorCategory
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -108,17 +119,188 @@ def test_broken_port_sample_rebinds_cmd():
     assert "--bind 0.0.0.0:8080" in report.final_dockerfile
 
 
-@pytest.mark.parametrize(
-    "name",
-    ["broken-requirements.local", "broken-import.local", "broken-import.cloudrun", "broken-health.local"],
-)
-def test_source_level_failures_need_llm(name):
-    """No rule covers these yet: without an LLM patch healer gives up without redeploying."""
+# --------------------------------------------------------------------------- #
+# M2 demo contract: every real failure ends the same way on every run, without the LLM deciding it.
+# "healed" = a rule patch fixed the Dockerfile; "stopped" = intended stop, nothing redeployed.
+# --------------------------------------------------------------------------- #
+OUTCOME = {
+    "broken.local": "healed",
+    "broken-port.local": "healed",
+    "broken-requirements.local": "healed",
+    "broken-import.local": "stopped",
+    "broken-import.cloudrun": "stopped",
+    "broken-health.local": "stopped",
+}
 
-    def never_called(*_):
-        raise AssertionError("must not redeploy without a patch")
+
+def _forbidden(what: str):
+    def fail(*_):
+        raise AssertionError(f"{what} must not be called")
+
+    return fail
+
+
+def _succeed(target: str):
+    return lambda *_: DeployResult(success=True, target=target, exit_code=0, url="https://x")
+
+
+def test_every_fixture_has_an_outcome():
+    assert set(OUTCOME) == set(EXPECTED)
+
+
+@pytest.mark.parametrize(("name", "outcome"), OUTCOME.items())
+def test_fixture_outcome_is_deterministic_and_llm_free(name, outcome):
+    failed = _failed(name)
+    deploy = _succeed(failed.target) if outcome == "healed" else _forbidden("redeploy")
 
     report = heal(
-        "/tmp/app", _failed(name).target, _failed(name), _dockerfile(name), never_called, lambda *_: None
+        "/tmp/app",
+        failed.target,
+        failed,
+        _dockerfile(name),
+        deploy,
+        _forbidden("Dockerfile LLM patch"),
+        suggest_fn=lambda *_: None,
     )
-    assert not report.success and report.attempts == 0
+
+    if outcome == "healed":
+        assert report.success and report.attempts >= 1
+        assert all(r.source == "rule" for r in report.records)
+    else:
+        assert not report.success and report.attempts == 0 and report.records == []
+        assert report.final_dockerfile == _dockerfile(name)
+        assert report.summary.startswith(APP_CODE_STOP)
+
+
+def test_broken_requirements_unpins_before_pip_install():
+    report = heal(
+        "/tmp/app",
+        "local",
+        _failed("broken-requirements.local"),
+        _dockerfile("broken-requirements.local"),
+        _succeed("local"),
+        _forbidden("Dockerfile LLM patch"),
+    )
+    lines = report.final_dockerfile.splitlines()
+    sed = next(i for i, line in enumerate(lines) if line.startswith("RUN sed -i -E"))
+    assert "flask" in lines[sed] and "requirements.txt" in lines[sed]
+    assert lines[sed + 1].startswith("RUN pip install") and lines[sed - 1].startswith("COPY requirements.txt")
+    assert report.records[0].category == ErrorCategory.BUILD_FAILURE
+    assert "flask==99.99.99" in report.records[0].rationale
+
+
+def test_unpin_rule_handles_inline_pin_and_is_idempotent():
+    stderr = _stderr("broken-requirements.local")
+    inline = "FROM python:3.12-slim\nRUN pip install --no-cache-dir flask==99.99.99 gunicorn\nCMD gunicorn app:app\n"
+    patched, _ = _patch_unresolvable_pin(inline, stderr)
+    assert "pip install --no-cache-dir flask gunicorn" in patched
+
+    once, _ = _patch_unresolvable_pin(_dockerfile("broken-requirements.local"), stderr)
+    assert _patch_unresolvable_pin(once, stderr) is None  # same patch twice -> stop instead of looping
+
+
+def test_unpin_rule_ignores_missing_package_without_pin():
+    stderr = "ERROR: No matching distribution found for flaskk"
+    assert _patch_unresolvable_pin(_dockerfile("broken-requirements.local"), stderr) is None
+
+
+@pytest.mark.parametrize(
+    ("name", "where"),
+    [
+        ("broken-import.local", ("/app/app.py", 5, "<module>")),
+        ("broken-import.cloudrun", ("/app/app.py", 5, "<module>")),
+        ("broken-health.local", ("/app/app.py", 20, "health")),
+    ],
+)
+def test_app_code_failure_points_at_user_frame(name, where):
+    error = app_code_failure(_stderr(name))
+    assert error is not None and (error.path, error.line, error.func) == where
+    assert error.exception.split(":")[0] in {"NameError", "RuntimeError"}
+
+
+@pytest.mark.parametrize("name", ["broken.local", "broken-port.local", "broken-requirements.local"])
+def test_app_code_check_never_overrides_rule_categories(name):
+    assert _stops_on_app_code(_stderr(name)) is None
+
+
+def test_import_crash_reports_suggested_source_diff_without_applying_it(tmp_path):
+    app_py = tmp_path / "app.py"
+    original = (SAMPLE_APPS / "broken-import" / "app.py").read_text()
+    app_py.write_text(original)
+    seen: list[str] = []
+    events = []
+
+    def suggest(path, source, traceback):
+        seen.append(path)
+        assert "NameError" in traceback
+        return "from flask import Flask, jsonify\n" + source
+
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _forbidden("redeploy"),
+        _forbidden("Dockerfile LLM patch"),
+        emit=events.append,
+        suggest_fn=suggest,
+    )
+
+    assert seen == ["app.py"]
+    assert report.summary.startswith(APP_CODE_STOP)
+    assert "Suggested source fix (not applied):" in report.summary
+    assert "+from flask import Flask, jsonify" in report.summary
+    assert app_py.read_text() == original  # suggestion only: the source is never modified
+    assert [e.payload["kind"] for e in events if e.type == "log"] == ["source_suggestion"]
+
+
+def test_request_time_error_gets_traceback_summary_only(tmp_path):
+    (tmp_path / "app.py").write_text((SAMPLE_APPS / "broken-health" / "app.py").read_text())
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-health.local"),
+        _dockerfile("broken-health.local"),
+        _forbidden("redeploy"),
+        _forbidden("Dockerfile LLM patch"),
+        suggest_fn=_forbidden("source suggestion"),
+    )
+    assert "RuntimeError: database handshake failed" in report.summary
+    assert "Suggested source fix" not in report.summary
+
+
+def test_missing_source_file_still_stops_cleanly(tmp_path):
+    report = heal(
+        str(tmp_path),  # empty dir: nothing to suggest against
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _forbidden("redeploy"),
+        _forbidden("Dockerfile LLM patch"),
+        suggest_fn=_forbidden("source suggestion"),
+    )
+    assert report.summary.startswith(APP_CODE_STOP) and "Suggested source fix" not in report.summary
+
+
+@pytest.mark.parametrize("container_path", ["/app/../../etc/passwd", "/etc/passwd", "../outside.py"])
+def test_source_mapping_refuses_paths_outside_src_dir(tmp_path, container_path):
+    (tmp_path.parent / "outside.py").write_text("x = 1\n")
+    assert _source_file(str(tmp_path), "FROM x\nWORKDIR /app\n", container_path) is None
+
+
+def test_suggester_exception_does_not_break_the_stop(tmp_path):
+    (tmp_path / "app.py").write_text((SAMPLE_APPS / "broken-import" / "app.py").read_text())
+
+    def broken_suggester(*_):
+        raise TimeoutError("LLM endpoint timed out")
+
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _forbidden("redeploy"),
+        _forbidden("Dockerfile LLM patch"),
+        suggest_fn=broken_suggester,
+    )
+    assert report.summary.startswith(APP_CODE_STOP) and report.attempts == 0
