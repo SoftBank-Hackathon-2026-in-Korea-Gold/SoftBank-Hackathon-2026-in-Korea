@@ -8,7 +8,7 @@ Dockerfile, redeploy, and repeat until success or MAX_RETRIES.
        +----(still failing)---+--(retry_count >= MAX_RETRIES)--> END (gave_up)
 
 Design notes
-- Deterministic rules first, LLM (GPT-4o) only as fallback: the demo cases
+- Deterministic rules first, LLM (Claude) only as fallback: the demo cases
   (port binding, missing package) must not depend on an API call landing,
   and it keeps cost inside the team budget.
 - The deployer is injected (`deploy_fn`) so healer owns the retry loop
@@ -207,7 +207,7 @@ RULE_PATCHES: dict[ErrorCategory, Callable[[str, str], tuple[str, str] | None]] 
 
 
 # --------------------------------------------------------------------------- #
-# 3. LLM fallback (GPT-4o). Skipped silently when OPENAI_API_KEY is absent.
+# 3. LLM fallback (Claude). Skipped silently when ANTHROPIC_API_KEY is absent.
 # --------------------------------------------------------------------------- #
 LLM_SYSTEM_PROMPT = (
     "You are a container deployment repair agent. Given a Dockerfile and the stderr of a failed "
@@ -217,21 +217,30 @@ LLM_SYSTEM_PROMPT = (
 
 
 def default_llm_patch(dockerfile: str, error_log: str, category: ErrorCategory) -> str | None:
-    if not os.environ.get("OPENAI_API_KEY"):
-        logger.info("OPENAI_API_KEY not set; skipping LLM patch")
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        logger.info("ANTHROPIC_API_KEY not set; skipping LLM patch")
         return None
-    from langchain_openai import ChatOpenAI  # lazy: keep import cost off the rule path
+    import anthropic  # lazy: keep import cost off the rule path
 
-    llm = ChatOpenAI(model=os.environ.get("HEALER_MODEL", "gpt-4o"), temperature=0)
     user = (
         f"Error category: {category.value}\n\nstderr:\n{_llm_context(error_log)}\n\nDockerfile:\n{dockerfile}"
     )
     try:
-        content = llm.invoke([("system", LLM_SYSTEM_PROMPT), ("user", user)]).content
+        r = anthropic.Anthropic().messages.create(
+            model=os.environ.get("HEALER_MODEL") or "claude-haiku-5-5",
+            max_tokens=16000,
+            system=LLM_SYSTEM_PROMPT,
+            output_config={"effort": "medium"},
+            messages=[{"role": "user", "content": user}],
+        )
     except Exception:  # network / quota errors must not crash the pipeline
         logger.exception("LLM patch failed")
         return None
-    text = str(content).strip()
+    # Read text blocks by type: the reply can start with thinking blocks
+    text = "".join(b.text for b in r.content if b.type == "text").strip()
+    if r.stop_reason == "refusal" or not text:
+        logger.warning("LLM returned no patch (stop_reason=%s)", r.stop_reason)
+        return None
     fenced = re.search(r"```(?:dockerfile|Dockerfile)?\n(.*?)```", text, re.DOTALL)
     return (fenced.group(1) if fenced else text).strip() + "\n"
 

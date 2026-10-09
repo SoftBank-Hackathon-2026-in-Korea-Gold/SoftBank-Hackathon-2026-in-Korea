@@ -40,8 +40,8 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 | **cloudflared CLI** (선택) | 최신 버전 | 로컬 배포 성공 시 외부 접속 가능한 Quick Tunnel 공개 URL 발급 | `cloudflared --version` |
 
 ### 2.3 외부 클라우드 및 API 계정 요구사항
-- **OpenAI API Key**:
-  - LLM 모델(`gpt-4o`) 호출 권한 필요.
+- **Anthropic API Key**:
+  - Claude 모델(기본 `claude-haiku-5-5`) 호출 권한 필요.
   - Healer의 복합 에러 분석/수선 및 Analyzer의 AI 심층 검사관에서 사용.
 - **Google Cloud Platform (GCP) 계정**:
   - GCP Project 생성 및 결제 계정(Billing) 연결 필수.
@@ -61,9 +61,9 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 
 | 환경변수명 | 필수 여부 | 기본값 | 사용 모듈 | 상세 설명 |
 |---|:---:|---|---|---|
-| `OPENAI_API_KEY` | **필수** | - | `healer`, `analyzer` | OpenAI API 인증 키. 미설정 시 자가치유는 규칙 패치만 동작하며 analyzer는 패턴 규칙으로만 판정됩니다. |
-| `HEALER_MODEL` | 선택 | `gpt-4o` | `healer.py` | 자가치유 LLM 에이전트가 코드 패치 생성에 사용할 OpenAI 모델. |
-| `ANALYZER_MODEL` | 선택 | `gpt-4o` | `analyzer.py` | 소스코드 정적 분석 및 위험 탐지에 사용할 AI 검사관 모델. |
+| `ANTHROPIC_API_KEY` | **필수** | - | `healer`, `analyzer` | Anthropic API 인증 키. 미설정 시 자가치유는 규칙 패치만 동작하며 analyzer는 분석하지 않습니다. |
+| `HEALER_MODEL` | 선택 | `claude-haiku-5-5` | `healer.py` | 자가치유 LLM 에이전트가 코드 패치 생성에 사용할 Claude 모델. |
+| `ANALYZER_MODEL` | 선택 | `claude-haiku-5-5` | `analyzer.py` | 소스코드 정적 분석 및 위험 탐지에 사용할 AI 검사관 모델. |
 | `ANALYZER_MAX_LLM_CALLS` | 선택 | `6` | `analyzer.py` | 서버 전체에서 동시 실행 가능한 검사관 LLM 호출 수 상한(세마포어). |
 | `ANALYZER_MAX_TURNS` | 선택 | `15` | `analyzer.py` | 검사관 에이전트의 저장소 파일 탐색 도구(tool calling) 최대 턴 수. |
 | `GCP_PROJECT_ID` | **선택** (Cloud Run 배포 시 필수) | - | `deployer.py` | Google Cloud 프로젝트 식별자 (예: `bdai-n8n-2609161021`). |
@@ -89,7 +89,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 | `pydantic` | `>=2.7` | 데이터 검증 및 모듈 간 데이터 계약(Schema) 직렬화 |
 | `sse-starlette` | `>=2.1` | Server-Sent Events (SSE) 실시간 이벤트 스트리밍 지원 |
 | `langgraph` | `>=0.2` | 순환 루프(StateGraph) 기반 에이전트 워크플로우 제어 (자연스러운 재배포 루프) |
-| `langchain-openai` | `>=0.2` | OpenAI ChatCompletion (GPT-4o) 연동 및 구조화된 도구 호출 |
+| `anthropic` | `>=1.12.1` | Claude API 연동 (도구 호출, 구조화된 출력) |
 | `python-dotenv` | `>=1.0` | `.env` 파일 로드 및 환경변수 주입 |
 | `pytest` (dev) | `>=8` | 단위/통합 테스트 프레임워크 (fake deployer 기반 healer 루프 검증 등) |
 | `ruff` (dev) | `>=0.6` | 고속 정적 린터 및 포매터 (PEP 8, 라인 길이 110 준수) |
@@ -134,7 +134,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
   - `bad_entrypoint` (잘못된 실행 명령어, 파일명 불일치)
   - `build_failure` (빌드 타임 문법 오류/패키지 설치 불가)
   - `unknown` (기타 미분류 오류)
-- **FR-3.2**: **규칙 우선(Deterministic Rules First)** 패치를 적용하여 데모 시연의 결정성과 속도를 보장하고, 미분류/복합 에러의 경우 GPT-4o LLM 폴백 패치를 실행한다.
+- **FR-3.2**: **규칙 우선(Deterministic Rules First)** 패치를 적용하여 데모 시연의 결정성과 속도를 보장하고, 미분류/복합 에러의 경우 Claude LLM 폴백 패치를 실행한다.
 - **FR-3.3**: 수정 전/후 Dockerfile의 `unified diff`를 생성하고 시도별 이력(`PatchRecord`)을 기록한다.
 - **FR-3.4**: 최대 재시도 횟수(`MAX_RETRIES = 3`) 내에서 수정된 Dockerfile로 재배포를 순환 실행한다.
 - **FR-3.5**: 최종 결과는 `HealReport` 형태로 반환한다.
@@ -167,7 +167,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
    - 불필요한 LLM 비용을 아끼기 위해 규칙 기반 패치를 우선 적용합니다.
    - 동시 AI 분석 요청 시 세마포어(`ANALYZER_MAX_LLM_CALLS = 6`)로 동시성을 제어합니다.
 3. **보안 및 시크릿 관리 (Security)**:
-   - OpenAI API 키, GCP 서비스 계정 키 등 민감 정보는 형상 관리(Git)에 절대 노출되지 않아야 합니다.
+   - Anthropic API 키, GCP 서비스 계정 키 등 민감 정보는 형상 관리(Git)에 절대 노출되지 않아야 합니다.
    - `.gitignore`를 통해 `.env`, `*.key`, `*.pem` 파일의 커밋을 원천 차단합니다.
 4. **모듈 간 디커플링 (Decoupling)**:
    - 각 모듈은 `backend/app/schemas.py`의 Pydantic 모델만을 통해 소통하며 상호 직접 임포트를 최소화합니다.
@@ -185,7 +185,7 @@ cd one-action-cloudmorph
 
 # 2. 환경변수 파일 준비
 cp .env.example .env
-# .env 파일을 열어 OPENAI_API_KEY 및 필요 시 GCP_PROJECT_ID 설정
+# .env 파일을 열어 ANTHROPIC_API_KEY 및 필요 시 GCP_PROJECT_ID 설정
 
 # 3. 백엔드 디렉토리 이동 및 의존성 설치
 cd backend
