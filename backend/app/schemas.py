@@ -134,3 +134,9 @@ class DeployRequest(BaseModel):
 
     source: str = Field(description="Git URL or server-side path of the uploaded source")
     targets: list[DeployTarget] = Field(default_factory=lambda: ["local", "cloudrun"])
+    name: str | None = Field(
+        default=None,
+        description="Stable app/service name (lowercase, [a-z0-9-]). Redeploys with the same name update the same "
+        "Cloud Run service / node app instead of creating new ones. Default: derived from the deployment id.",
+    )
+    ref: str | None = Field(default=None, description="Git branch or tag to clone when `source` is a Git URL")

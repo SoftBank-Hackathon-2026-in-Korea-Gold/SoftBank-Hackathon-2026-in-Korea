@@ -66,5 +66,6 @@ def test_token_required_on_fleet_and_projects(monkeypatch):
 def test_unprotected_paths_bypass_guard(monkeypatch):
     client = _client(monkeypatch, None, client=REMOTE)
     # the GitHub webhook is HMAC-verified by its own handler; lookalike prefixes are not protected
-    assert client.post("/webhook/github", content=b"{}").status_code != 503
-    assert client.get("/deployments-lookalike").status_code != 503
+    guard_detail = "API token not configured; set CLOUDMORPH_API_TOKEN"
+    for resp in (client.post("/webhook/github", content=b"{}"), client.get("/deployments-lookalike")):
+        assert resp.json().get("detail") != guard_detail

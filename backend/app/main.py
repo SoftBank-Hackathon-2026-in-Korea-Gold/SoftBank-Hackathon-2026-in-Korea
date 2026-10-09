@@ -16,8 +16,10 @@ import asyncio
 import errno
 import hmac
 import ipaddress
+import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -39,7 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer
+from app import analyzer, deployer, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
@@ -119,6 +121,35 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
+REPO_ROOT = Path(__file__).resolve().parents[2]
+# name -> last deployment of that app (what a GitHub push updates). Persisted to a JSON file so the
+# dashboard's project list survives a backend restart (jobs/events themselves stay in memory).
+PROJECTS_FILE = Path(
+    os.getenv(
+        "CLOUDMORPH_PROJECTS_FILE", Path(__file__).resolve().parents[1] / ".cloudmorph" / "projects.json"
+    )
+)
+
+
+def _load_projects() -> dict[str, dict]:
+    try:
+        return json.loads(PROJECTS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_projects() -> None:
+    try:
+        PROJECTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PROJECTS_FILE.write_text(json.dumps(_projects, ensure_ascii=False, indent=2))
+    except OSError:
+        pass  # persistence is best-effort; the in-memory copy is still correct
+
+
+_projects: dict[str, dict] = _load_projects()
+# One deployment per app name at a time: two quick pushes would otherwise race on the same Cloud Run
+# service (candidate tag / promotion) and the same local container name. Later pushes wait their turn.
+_app_locks: dict[str, threading.Lock] = {}
 
 
 def _validate_https_git_url(source: str) -> str:
@@ -278,13 +309,15 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
 
 
 @contextmanager
-def prepare_source(source: str) -> Iterator[str]:
+def prepare_source(source: str, ref: str | None = None) -> Iterator[str]:
     """Prepare a local directory, local ZIP, or allowlisted public Git URL.
 
     Source is treated as trusted input: this is a hackathon demo API and must
     not be exposed publicly without authentication and isolation.
     """
     path = None if source.startswith("https://") else Path(source).expanduser()
+    if path is not None and not path.is_absolute() and not path.exists() and (REPO_ROOT / source).exists():
+        path = REPO_ROOT / source  # dashboard presets like "sample-apps/guestbook" are relative to the repo
     with tempfile.TemporaryDirectory(prefix="cloudmorph-source-") as temp:
         root = Path(temp)
         if source.startswith("https://"):
@@ -302,6 +335,7 @@ def prepare_source(source: str) -> Iterator[str]:
                             "clone",
                             "--depth",
                             "1",
+                            *(["--branch", ref] if ref else []),
                             "--",
                             url,
                             str(dest),
@@ -483,16 +517,30 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/fleet/{app_name}/scale/{n}")
-    async def fleet_scale(app_name: str, n: int) -> dict:
+    async def fleet_scale(app_name: str, n: int, request: Request) -> dict:
+        token = os.getenv("CLOUDMORPH_API_TOKEN")
+        if token and request.headers.get("x-api-token") != token:
+            raise HTTPException(status_code=401, detail="missing or invalid X-API-Token")
         if app_name not in fleetmod.load_state().apps:
             raise HTTPException(status_code=404, detail="unknown app")
         result = await asyncio.to_thread(fleetmod.scale, app_name, n)
         return {"app": app_name, "replicas": [r.upstream for r in result.replicas]}
 
-    @app.post("/deploy")
-    async def start_deploy(req: DeployRequest) -> dict[str, str]:
-        if not req.targets or len(req.targets) != len(set(req.targets)):
+    def _launch(
+        source: str,
+        targets: list[str],
+        *,
+        name: str | None = None,
+        ref: str | None = None,
+        intro: list[str] | None = None,
+        trigger: str = "api",
+    ) -> str:
+        """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
+        Shared by POST /deploy (user click) and POST /webhook/github (push)."""
+        if not targets or len(targets) != len(set(targets)):
             raise HTTPException(status_code=422, detail="targets must be non-empty and unique")
+        if name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+            raise HTTPException(status_code=422, detail="name must match [a-z0-9][a-z0-9-]{0,39}")
         if len(_jobs) >= MAX_JOBS:
             # Retire oldest *completed* job; never evict a running job.
             finished = [key for key, val in _jobs.items() if val.completed]
@@ -501,15 +549,49 @@ def create_app() -> FastAPI:
             _jobs.pop(min(finished, key=lambda key: _jobs[key].created_at))
 
         deployment_id = uuid.uuid4().hex[:12]
-        job = Job(targets={t: {"success": None, "url": None} for t in req.targets})
+        app_name = name or f"cloudmorph-{deployment_id}"
+        job = Job(targets={t: {"success": None, "url": None} for t in targets})
         _jobs[deployment_id] = job
+        project = _projects.setdefault(
+            app_name, {"name": app_name, "source": source, "ref": ref, "history": []}
+        )
+        project.update(
+            source=source,
+            ref=ref,
+            targets=targets,
+            last_deployment_id=deployment_id,
+            last_status="running",
+            trigger=trigger,
+            updated_at=time.time(),
+        )
+        project["history"] = [*project["history"][-19:], deployment_id]
+        _save_projects()
         loop = asyncio.get_running_loop()
 
         def emit(event: PipelineEvent) -> None:
             loop.call_soon_threadsafe(_publish, job, event)
 
         def execute() -> None:
-            with prepare_source(req.source) as source_dir:
+            for line in intro or []:
+                emit(PipelineEvent(type="log", payload={"line": line}))
+            lock = _app_locks.setdefault(app_name, threading.Lock())
+            if not lock.acquire(blocking=False):
+                emit(
+                    PipelineEvent(
+                        type="log",
+                        payload={
+                            "line": f"queue: waiting for the previous deployment of {app_name} to finish"
+                        },
+                    )
+                )
+                lock.acquire()
+            try:
+                _run_locked()
+            finally:
+                lock.release()
+
+        def _run_locked() -> None:
+            with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
                 analysis = analyzer.analyze(source_dir)
                 emit(
@@ -524,12 +606,13 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                # Separate target workspaces because deployer writes Dockerfile
-                # and may leave background local container/tunnel artifacts.
-                # Local deployment state is retained for container/tunnel cleanup.
+                # Separate target workspaces because deployer writes Dockerfile and may leave background
+                # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
+                # so a stable `name` means "update the same service" (CD) instead of "create another one";
+                # the default name is per-deployment unique. Local state is retained for container/tunnel cleanup.
                 work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
-                for target in req.targets:
-                    target_dir = work_root / f"cloudmorph-{deployment_id}-{target}"
+                for target in targets:
+                    target_dir = work_root / f"{app_name}-{target}"
                     try:
                         target_dir = Path(_copy_for_target(source_dir, target_dir))
                         run_pipeline(target_dir, target, emit, analysis=analysis)
@@ -537,16 +620,13 @@ def create_app() -> FastAPI:
                         emit(
                             PipelineEvent(
                                 type="error",
-                                payload={
-                                    "target": target,
-                                    "message": f"{type(exc).__name__}: {exc}",
-                                },
+                                payload={"target": target, "message": f"{type(exc).__name__}: {exc}"},
                             )
                         )
                     finally:
                         if target == "cloudrun":
                             _remove_workspace(target_dir)
-                if "local" not in req.targets:
+                if "local" not in targets:
                     _remove_workspace(work_root)
 
         async def worker() -> None:
@@ -566,10 +646,62 @@ def create_app() -> FastAPI:
                 job.error = f"{type(exc).__name__}: {exc}"
                 _publish(job, PipelineEvent(type="error", payload={"message": job.error}))
             finally:
+                project.update(
+                    last_status=job.state,
+                    urls={t: v.get("url") for t, v in job.targets.items()},
+                    updated_at=time.time(),
+                )
+                _save_projects()
                 _publish(job, None)
 
         asyncio.create_task(worker())
-        return {"deployment_id": deployment_id}
+        return deployment_id
+
+    app.state.launch = _launch  # tests swap this for a fake
+
+    @app.post("/deploy")
+    async def start_deploy(req: DeployRequest) -> dict[str, str]:
+        return {"deployment_id": app.state.launch(req.source, req.targets, name=req.name, ref=req.ref)}
+
+    @app.get("/projects")
+    async def projects() -> dict:
+        """Apps known to this server (by stable name) with their last deployment — what CD updates."""
+        return {"projects": sorted(_projects.values(), key=lambda p: -p.get("updated_at", 0))}
+
+    @app.post("/webhook/github")
+    async def github_webhook(request: Request) -> dict:
+        """GitHub push -> redeploy the repository under its own name (CD). Secret-signed; default branch only."""
+        secret = os.getenv("CLOUDMORPH_WEBHOOK_SECRET", "")
+        if not secret:
+            raise HTTPException(status_code=503, detail="CLOUDMORPH_WEBHOOK_SECRET not configured")
+        body = await request.body()
+        if not webhooks.verify_signature(secret, body, request.headers.get("x-hub-signature-256")):
+            raise HTTPException(status_code=401, detail="bad signature")
+        event = request.headers.get("x-github-event", "")
+        if event == "ping":
+            return {"ok": True, "event": "ping"}
+        if event != "push":
+            return {"ok": True, "ignored": event}
+        info = webhooks.parse_push(json.loads(body))
+        if info is None or info.deleted:
+            return {"ok": True, "ignored": "not a branch push"}
+        if not webhooks.branch_allowed(info):
+            return {"ok": True, "ignored": f"branch {info.branch} (not in CD branches)"}
+        targets = webhooks.cd_targets()
+        intro = [
+            f"github push by {info.pusher}: {info.repo_full_name}@{info.branch} {info.sha} — {info.message}"
+        ]
+        deployment_id = app.state.launch(
+            info.clone_url, targets, name=info.app_name, ref=info.branch, intro=intro, trigger="github-push"
+        )
+        return {
+            "ok": True,
+            "deployment_id": deployment_id,
+            "name": info.app_name,
+            "targets": targets,
+            "branch": info.branch,
+            "sha": info.sha,
+        }
 
     @app.get("/deploy/{deployment_id}")
     async def deploy_status(deployment_id: str) -> dict:

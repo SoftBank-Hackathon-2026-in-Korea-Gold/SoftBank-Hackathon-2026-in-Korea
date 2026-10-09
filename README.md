@@ -42,6 +42,10 @@ uv run pytest -q             # healer 루프 테스트 (fake deployer)
 uv run uvicorn app.main:app --reload
 ```
 
+## CD (GitHub push → 자동 재배포)
+
+`CLOUDMORPH_WEBHOOK_SECRET`을 설정하고 저장소 웹훅을 `https://<공개 URL>/webhook/github`로 등록하면, 기본 브랜치에 push할 때마다 같은 이름의 서비스가 새 버전으로 갱신됩니다(실패 시 자가치유 포함). 자세한 내용은 [`docs/cd-github-webhook.md`](docs/cd-github-webhook.md).
+
 ## Demo runbook (발표 노트북에서 띄우고 터널로 공개)
 
 ```bash
@@ -51,7 +55,7 @@ scripts/demo-up.sh --public     # + Cloudflare quick tunnel 1개로 대시보드
 scripts/demo-down.sh            # 전부 종료 (deployer가 띄운 로컬 컨테이너·터널 포함)
 ```
 
-- `--public`이면 `CLOUDMORPH_API_TOKEN`이 생성되어 `/deploy*` 호출에 `X-API-Token` 헤더(SSE는 `?token=`)가 필요합니다. 공개 URL을 아는 사람이 아무 저장소나 빌드시키는 것을 막기 위한 최소 장치입니다. 토큰과 공개 URL은 `.demo/`에 기록됩니다.
+- `--public`이면 `CLOUDMORPH_API_TOKEN`이 생성되어 `/deploy*`·`/fleet*`·`/projects` 호출에 `X-API-Token` 헤더(SSE는 `?token=`)가 필요합니다. 토큰이 없으면 터널·원격 요청은 503으로 막힙니다(fail-closed). 공개 URL을 아는 사람이 아무 저장소나 빌드시키는 것을 막기 위한 최소 장치입니다. 토큰과 공개 URL은 `.demo/`에 기록됩니다.
 - 사전 조건: Docker Desktop 실행, `gcloud auth login` 완료, `cloudflared`·`uv`·`npm` 설치. 스크립트가 시작 전에 전부 점검합니다.
 - 첫 실행은 `npm install` 때문에 수 분 걸릴 수 있습니다. 발표 당일 아침에 한 번 미리 돌려 두세요.
 - Cloud Run 타깃은 로그인된 계정의 프로젝트에만 배포되므로, 발표 노트북은 GCP 인증이 된 기기여야 합니다.

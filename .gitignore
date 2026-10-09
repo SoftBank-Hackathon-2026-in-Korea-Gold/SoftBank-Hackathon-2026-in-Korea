@@ -67,6 +67,8 @@ temp/
 # node pool registry (environment-specific; see backend/nodes.example.json)
 backend/nodes.json
 backend/.fleet/
+backend/.cloudmorph/
+
 
 # demo-up.sh runtime state
 .demo/
