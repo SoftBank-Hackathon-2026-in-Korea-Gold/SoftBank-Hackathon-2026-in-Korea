@@ -70,6 +70,7 @@ class App:
     src_dir: str | None = None
     replicas: list[Replica] = field(default_factory=list)
     hot_streak: int = 0
+    stateful: bool = False  # has a database sidecar on its node -> never replicate (data would diverge)
     events: list[dict] = field(default_factory=list)  # scale history shown in the dashboard
 
 
@@ -192,7 +193,13 @@ def push_config(reg: Registry, state: State) -> None:
 # Registration (called by deployer.deploy_node) and scaling
 # --------------------------------------------------------------------------- #
 def register(
-    app_name: str, image: str, container_port: int, replica: Replica, src_dir: str | None = None
+    app_name: str,
+    image: str,
+    container_port: int,
+    replica: Replica,
+    src_dir: str | None = None,
+    *,
+    stateful: bool = False,
 ) -> str:
     """Add/replace the primary replica of an app and publish it through the router. Returns the public URL."""
     reg = nodepool.load_registry()
@@ -217,6 +224,7 @@ def register(
         [replica],
         0,
     )
+    app.stateful = stateful
     app.events.append(
         {"ts": time.time(), "type": "deploy", "node": replica.node, "upstream": replica.upstream}
     )
@@ -352,7 +360,9 @@ def tick(emit=None) -> list[dict]:
         action = None
         if (hottest is not None and hottest >= CPU_HOT) or node_hot:
             app.hot_streak += 1
-            if app.hot_streak >= HOT_STREAK and len(app.replicas) < MAX_REPLICAS:
+            if app.stateful:
+                action = "hot but stateful (database on this node): not replicating"
+            elif app.hot_streak >= HOT_STREAK and len(app.replicas) < MAX_REPLICAS:
                 rep = scale_out(
                     app, reg, state, f"replica cpu {hottest:.0f}% >= {CPU_HOT:.0f}% x{HOT_STREAK}"
                 )

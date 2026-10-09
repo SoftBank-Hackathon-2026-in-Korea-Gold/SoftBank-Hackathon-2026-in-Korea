@@ -512,6 +512,18 @@ def create_app() -> FastAPI:
             with prepare_source(req.source) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
                 analysis = analyzer.analyze(source_dir)
+                emit(
+                    PipelineEvent(
+                        type="log",
+                        stage="analyze",
+                        payload={
+                            "line": f"analyzer: target={analysis.target} language={analysis.language} framework={analysis.framework} "
+                            f"port={analysis.port} service_models={analysis.service_models}"
+                        },
+                    )
+                )
+                for note in analysis.notes[:8]:
+                    emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
                 # Separate target workspaces because deployer writes Dockerfile
                 # and may leave background local container/tunnel artifacts.
                 # Local deployment state is retained for container/tunnel cleanup.

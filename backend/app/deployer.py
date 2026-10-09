@@ -36,6 +36,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import subprocess
@@ -146,6 +147,8 @@ class Config:
     )  # extra env vars injected into the app container (e.g. DATABASE_URL)
     node_arch: str | None = None  # restrict node pool to an architecture; None -> any
     node_exclude: tuple = ()  # node names to skip (used by fleet scale-out)
+    database: str | None = "auto"  # "auto": Postgres when the app reads DATABASE_URL; "postgres"; None: never
+    cloudsql_instance: str = "cloudmorph-pg"  # Cloud SQL instance (cloudrun target)
 
     @classmethod
     def from_env(cls) -> Config:
@@ -159,6 +162,8 @@ class Config:
             tunnel=env.get("DEPLOYER_TUNNEL", "1") not in ("0", "false", "no"),
             probe_path=env.get("DEPLOYER_PROBE_PATH") or None,
             verify_timeout=int(env.get("DEPLOYER_VERIFY_TIMEOUT", "60")),
+            database=env.get("DEPLOYER_DATABASE", "auto") or None,
+            cloudsql_instance=env.get("CLOUDSQL_INSTANCE", "cloudmorph-pg"),
         )
 
 
@@ -415,6 +420,180 @@ def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# database provisioning ("SQLite -> managed Postgres"): sidecar on local/node, Cloud SQL on cloudrun
+# --------------------------------------------------------------------------- #
+_DB_HINTS = re.compile(
+    r"DATABASE_URL|psycopg|asyncpg|sqlalchemy|pg8000|\bfrom pg\b|require\(['\"]pg['\"]\)|['\"]pg['\"]\s*:|prisma|pymysql|mysqlclient",
+    re.IGNORECASE,
+)
+_SCAN_EXT = {".py", ".js", ".ts", ".mjs", ".cjs", ".txt", ".toml", ".json", ".env", ".example"}
+
+
+def detect_database(src_dir: Path) -> str | None:
+    """'postgres' when the app reads DATABASE_URL or ships a Postgres driver; else None.
+    (An app that hard-codes a SQLite path gets nothing: injecting a URL it never reads would be theatre.)"""
+    for p in src_dir.rglob("*"):
+        if (
+            p.is_file()
+            and p.suffix in _SCAN_EXT
+            and ".deployer" not in p.parts
+            and "node_modules" not in p.parts
+        ):
+            try:
+                if _DB_HINTS.search(p.read_text(errors="ignore")[:200_000]):
+                    return "postgres"
+            except OSError:
+                continue
+    return None
+
+
+def wants_database(src_dir: Path, cfg: Config) -> str | None:
+    if cfg.database == "auto":
+        return detect_database(src_dir)
+    return cfg.database or None
+
+
+def ensure_local_postgres(app: str, r: Runner) -> str:
+    """Postgres sidecar `<app>-db` on the local docker network; data in volume `<app>-dbdata`."""
+    db, net = f"{app}-db", nodepool.NETWORK
+    r.run("docker network", ["docker", "network", "create", net], check=False)
+    exists = subprocess.run(
+        ["docker", "ps", "-q", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
+    )
+    if not exists.stdout.strip():
+        r.run(
+            "docker run (postgres)",
+            [
+                "docker",
+                "run",
+                "-d",
+                "--restart",
+                "unless-stopped",
+                "--name",
+                db,
+                "--network",
+                net,
+                "-e",
+                "POSTGRES_USER=app",
+                "-e",
+                "POSTGRES_PASSWORD=app",
+                "-e",
+                "POSTGRES_DB=app",
+                "-v",
+                f"{app}-dbdata:/var/lib/postgresql/data",
+                "postgres:16-alpine",
+            ],
+            stage="deploy",
+        )
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        if (
+            subprocess.run(
+                ["docker", "exec", db, "pg_isready", "-U", "app", "-q"], capture_output=True, check=False
+            ).returncode
+            == 0
+        ):
+            return f"postgresql://app:app@{db}:5432/app"
+        time.sleep(1)
+    raise StepError("deploy", "deploy_error", f"postgres sidecar {db} did not become ready")
+
+
+def ensure_cloudsql_database(app: str, cfg: Config, r: Runner) -> tuple[str, str]:
+    """Per-app database + user on the shared Cloud SQL instance. Returns (connection_name, DATABASE_URL)."""
+    inst, proj = cfg.cloudsql_instance, str(cfg.project)
+    cp = r.run(
+        "cloudsql instance",
+        [
+            "gcloud",
+            "sql",
+            "instances",
+            "describe",
+            inst,
+            "--project",
+            proj,
+            "--format=value(state,connectionName)",
+        ],
+        check=False,
+        stage="deploy",
+    )
+    if cp.returncode != 0 or not cp.stdout.strip():
+        raise StepError(
+            "deploy",
+            "user_action_required",
+            f"Cloud SQL instance '{inst}' not found in {proj} (create it or set CLOUDSQL_INSTANCE)",
+        )
+    state, conn = cp.stdout.split()
+    if state != "RUNNABLE":
+        raise StepError(
+            "deploy", "user_action_required", f"Cloud SQL instance '{inst}' is {state}, not RUNNABLE yet"
+        )
+    dbname = user = re.sub(r"[^a-z0-9_]", "_", app.lower())[:40] or "app"
+    dbs = r.run(
+        "cloudsql databases",
+        ["gcloud", "sql", "databases", "list", "--instance", inst, "--project", proj, "--format=value(name)"],
+        stage="deploy",
+    )
+    if dbname not in dbs.stdout.split():
+        r.run(
+            "cloudsql create db",
+            [
+                "gcloud",
+                "sql",
+                "databases",
+                "create",
+                dbname,
+                "--instance",
+                inst,
+                "--project",
+                proj,
+                "--quiet",
+            ],
+            stage="deploy",
+        )
+    password = secrets.token_hex(12)
+    users = r.run(
+        "cloudsql users",
+        ["gcloud", "sql", "users", "list", "--instance", inst, "--project", proj, "--format=value(name)"],
+        stage="deploy",
+    )
+    verb = "set-password" if user in users.stdout.split() else "create"
+    cp = subprocess.run(
+        [
+            "gcloud",
+            "sql",
+            "users",
+            verb,
+            user,
+            "--instance",
+            inst,
+            "--project",
+            proj,
+            "--password",
+            password,
+            "--quiet",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )  # not via Runner: keep the password out of logs
+    r.steps.append(
+        Step(
+            f"cloudsql users {verb}",
+            f"gcloud sql users {verb} {user} --instance {inst}",
+            cp.returncode,
+            0.0,
+            "",
+            cp.stderr[-500:] if cp.returncode else "",
+        )
+    )
+    if cp.returncode != 0:
+        raise StepError(
+            "deploy", "deploy_error", f"could not create/update Cloud SQL user {user}: {cp.stderr[-500:]}"
+        )
+    return conn, f"postgresql://{user}:{password}@/{dbname}?host=/cloudsql/{conn}"
+
+
+# --------------------------------------------------------------------------- #
 # build / push
 # --------------------------------------------------------------------------- #
 def build_image(src_dir: Path, image: str, platform: str | None, cfg: Config, r: Runner) -> None:
@@ -489,9 +668,14 @@ def tunnel_registered(log_path: Path, wait: int = 30) -> bool:
     return False
 
 
-def cleanup_local(handles: dict) -> list[str]:
-    """Stop the container and tunnel of a previous local deploy (idempotent)."""
+def cleanup_local(handles: dict, *, drop_database: bool = False) -> list[str]:
+    """Stop the container and tunnel of a previous local deploy (idempotent). The Postgres sidecar survives
+    redeploys (healer retries must keep the data); pass drop_database=True from an explicit cleanup."""
     done: list[str] = []
+    if drop_database and (db := handles.get("db_container")):
+        cp = subprocess.run(["docker", "rm", "-f", db], capture_output=True, text=True, check=False)
+        if cp.returncode == 0:
+            done.append(f"removed database {db}")
     pid = handles.get("tunnel_pid")
     if pid:
         try:
@@ -528,8 +712,23 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         build_image(src_dir, image, None, cfg, r)
 
         out.stage = "deploy"
-        run_cmd = ["docker", "run", "-d", "--name", cname, "-e", f"PORT={cfg.container_port}"]
-        for k, v in cfg.env.items():
+        r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
+        env = dict(cfg.env)
+        if wants_database(src_dir, cfg) == "postgres":
+            env.setdefault("DATABASE_URL", ensure_local_postgres(name, r))
+            out.handles.update(database="postgres", db_container=f"{name}-db")
+        run_cmd = [
+            "docker",
+            "run",
+            "-d",
+            "--name",
+            cname,
+            "--network",
+            nodepool.NETWORK,
+            "-e",
+            f"PORT={cfg.container_port}",
+        ]
+        for k, v in env.items():
             run_cmd += ["-e", f"{k}={v}"]
         run_cmd += ["-p", f"{host_port}:{cfg.container_port}", image]
         cp = r.run("docker run", run_cmd, stage="deploy")
@@ -707,6 +906,17 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     cmd = _gcr(
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
     )
+    env = dict(cfg.env)
+    if wants_database(src_dir, cfg) == "postgres":
+        conn, db_url = ensure_cloudsql_database(name, cfg, r)
+        env.setdefault("DATABASE_URL", db_url)
+        cmd += ["--add-cloudsql-instances", conn]
+        out.handles.update(database="cloudsql", cloudsql_connection=conn)
+    if env:
+        cmd += [
+            "--set-env-vars",
+            "^|^" + "|".join(f"{k}={v}" for k, v in env.items()),
+        ]  # '|' delimiter: URLs contain ','-free but '='-rich values
     if prev:
         cmd.append("--no-traffic")
     if cfg.allow_unauthenticated:
@@ -853,8 +1063,12 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     out.stage = "deploy"
     t0 = time.time()
     try:
+        env = dict(cfg.env)
+        if wants_database(src_dir, cfg) == "postgres":
+            env.setdefault("DATABASE_URL", nodepool.ensure_postgres(node, name))
+            out.handles.update(database="postgres", db_container=f"{name}-db")
         host_port = nodepool.free_port_on(node)
-        cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, cfg.env)
+        cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, env)
     except RuntimeError as e:
         r.steps.append(
             Step("docker run (remote)", f"ssh {node.name} docker run ...", 1, time.time() - t0, "", str(e))
@@ -904,6 +1118,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                 cfg.container_port,
                 fleet.Replica(node=node.name, container=cname, host=node.host, port=host_port),
                 str(src_dir),
+                stateful=out.handles.get("database") is not None,
             )
             r.steps.append(
                 Step("router register", f"caddy route {public} -> {node_url}", 0, time.time() - t0, "", "")
@@ -974,8 +1189,8 @@ def deploy(src_dir: str, dockerfile: str, target: DeployTarget, **overrides) -> 
 
 
 def cleanup(src_dir: str) -> list[str]:
-    """Stop the container/tunnel left by the last local deploy of `src_dir`."""
-    return cleanup_local(_read_handles(Path(src_dir).resolve()))
+    """Stop the container/tunnel (and the Postgres sidecar) left by the last local deploy of `src_dir`."""
+    return cleanup_local(_read_handles(Path(src_dir).resolve()), drop_database=True)
 
 
 # --------------------------------------------------------------------------- #

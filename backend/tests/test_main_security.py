@@ -580,7 +580,15 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
             assert set(status["targets"]) == {"local", "cloudrun"}
             response = await routes["/deploy/{deployment_id}/events"](deployment_id)
             events = [event async for event in response.body_iterator]
-            assert [e["event"] for e in events] == ["stage", "stage", "done", "stage", "done"]
+            # analyzer summary/notes are streamed as "log" events; the stage/done backbone is unchanged
+            assert [e["event"] for e in events if e["event"] != "log"] == [
+                "stage",
+                "stage",
+                "done",
+                "stage",
+                "done",
+            ]
+            assert any(e["event"] == "log" and "analyzer:" in e["data"] for e in events)
             assert all(set(json.loads(e["data"])) == {"type", "stage", "payload", "ts"} for e in events)
 
     asyncio.run(scenario())
@@ -720,9 +728,13 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
         events = [event async for event in events_response.body_iterator]
         return events
 
-    events = asyncio.run(scenario())
+    all_events = asyncio.run(scenario())
     assert len(deploy_attempts) == 2
     assert "pip install --no-cache-dir flask" in deploy_attempts[1]
+    # informational "log" lines (e.g. analyzer summary) may appear anywhere; the dashboard
+    # renders them, so they are part of the contract but not of the stage ordering.
+    assert all(set(json.loads(event["data"])) == {"type", "stage", "payload", "ts"} for event in all_events)
+    events = [event for event in all_events if event["event"] != "log"]
     assert [event["event"] for event in events] == [
         "stage",
         "stage",
