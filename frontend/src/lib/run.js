@@ -72,6 +72,8 @@ export function applyEvent(prev, type, p, raw) {
       } else if (line.startsWith('analyzer: ')) {
         run.notes.push(line.slice('analyzer: '.length))
         push(run, { ts, kind: 'note', stage: 'analyze', text: line.slice('analyzer: '.length) })
+      } else if (line.startsWith('queue: ')) {
+        push(run, { ts, kind: 'push', stage: 'queue', text: `대기 · 같은 앱의 이전 배포가 끝나면 시작합니다 (${line.slice(7)})` })
       } else if (line.startsWith('github push')) {
         run.trigger = 'github-push'
         push(run, { ts, kind: 'push', stage: 'trigger', text: line })
