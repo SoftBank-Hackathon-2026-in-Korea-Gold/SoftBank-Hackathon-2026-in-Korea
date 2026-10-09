@@ -1,6 +1,6 @@
 # sample-apps (owner: 전동훈)
 
-시연용 배포 대상 앱. 앱 퀄리티는 무관 — 배포 플랫폼 시연이 목적. 모두 Flask + gunicorn, `/`와 `/health` 두 경로.
+시연용 배포 대상 앱. 앱 퀄리티는 무관 — 배포 플랫폼 시연이 목적. `healthy-node`(Express, `/`만)와 `healthy-fastapi`(FastAPI, `/api/items`만)를 제외하면 모두 Flask + gunicorn이고 `/`와 `/health` 두 경로를 가진다.
 
 | Dir | 목적 | 의도된 결함 | deployer가 돌려주는 실패 |
 |---|---|---|---|

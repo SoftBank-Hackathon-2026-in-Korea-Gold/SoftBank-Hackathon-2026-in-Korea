@@ -544,24 +544,29 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                 app_logs=logs,
                 diagnosis=diagnose_not_reachable(cfg.container_port, why, logs, exited=status != "running"),
             )
-    except StepError:
-        if public_url:  # don't leave an orphan tunnel behind a failed attempt
-            cleanup_local({"tunnel_pid": out.handles.pop("tunnel_pid", None)})
-        raise
-    out.url = local_url
+        out.url = local_url
 
-    if public_url:
-        out.stage = "verify"
-        ok, why = wait_up(public_url, cfg.health_path, 60, interval=3)
-        if not ok and not tunnel_registered(tunnel_log):
-            raise StepError(
-                "verify", "runtime_error", f"tunnel not registered, public URL unreachable: {why}"
-            )
-        if not ok:  # registered + local healthy: this machine's resolver has not seen the new name yet
-            out.warnings.append(
-                f"public URL not verified from this machine ({why}); local URL {local_url} is healthy"
-            )
-        out.url = public_url
+        if public_url:
+            ok, why = wait_up(public_url, cfg.health_path, 60, interval=3)
+            if not ok and not tunnel_registered(tunnel_log):
+                raise StepError(
+                    "verify", "runtime_error", f"tunnel not registered, public URL unreachable: {why}"
+                )
+            if not ok:  # registered + local healthy: this machine's resolver has not seen the new name yet
+                out.warnings.append(
+                    f"public URL not verified from this machine ({why}); local URL {local_url} is healthy"
+                )
+            out.url = public_url
+    except StepError:
+        # Logs are already in the StepError; don't leave the container or tunnel of a failed attempt running.
+        out.url = None
+        cleanup_local(
+            {
+                "tunnel_pid": out.handles.pop("tunnel_pid", None),
+                "container_name": out.handles.pop("container_name", None),
+            }
+        )
+        raise
 
 
 # --------------------------------------------------------------------------- #
@@ -571,14 +576,27 @@ def _gcr(cfg: Config, *args: str) -> list[str]:
     return ["gcloud", "run", *args, "--region", cfg.region, "--project", str(cfg.project), "--quiet"]
 
 
-def serving_revision(service: str, cfg: Config) -> str | None:
-    cp = subprocess.run(
-        _gcr(cfg, "services", "describe", service, "--format=value(status.traffic[0].revisionName)"),
-        capture_output=True,
-        text=True,
-        check=False,
+def serving_revision(service: str, cfg: Config, r: Runner) -> str | None:
+    """Revision currently serving `service`; None when there is nothing to protect yet (no service, or a
+    service whose first deploy never became ready, e.g. healer retrying a broken first deploy).
+
+    Fails closed: a lookup *error* raises instead of returning None, because None means "deploy without
+    --no-traffic" and the candidate would serve the public URL before verification.
+    `services list --filter` returns rc=0 with empty output for "not found", so no error-text parsing.
+    """
+    found = r.run(
+        "service lookup",
+        _gcr(cfg, "services", "list", f"--filter=metadata.name={service}", "--format=value(metadata.name)"),
+        stage="deploy",
     )
-    return (cp.stdout.strip() or None) if cp.returncode == 0 else None
+    if not found.stdout.strip():
+        return None
+    cp = r.run(
+        "serving revision",
+        _gcr(cfg, "services", "describe", service, "--format=value(status.traffic[0].revisionName)"),
+        stage="deploy",
+    )
+    return cp.stdout.strip() or None
 
 
 def latest_revision(service: str, cfg: Config) -> str | None:
@@ -640,7 +658,7 @@ def rollback_cloudrun(service: str, revision: str, cfg: Config, r: Runner | None
     return subprocess.run(cmd, capture_output=True, text=True, check=False).returncode == 0
 
 
-def tagged_url(service: str, tag: str, revision: str | None, cfg: Config, wait: int = 30) -> str | None:
+def tagged_url(service: str, tag: str, revision: str, cfg: Config, wait: int = 30) -> str | None:
     """URL of `tag` once Cloud Run reports it attached to `revision` (tag URLs are stable strings, but the
     revision behind them switches a few seconds after deploy; checking too early would test the old one)."""
     deadline = time.time() + wait
@@ -653,11 +671,7 @@ def tagged_url(service: str, tag: str, revision: str | None, cfg: Config, wait: 
         )
         if cp.returncode == 0:
             for entry in json.loads(cp.stdout).get("status", {}).get("traffic", []):
-                if (
-                    entry.get("tag") == tag
-                    and entry.get("url")
-                    and (not revision or entry.get("revisionName") == revision)
-                ):
+                if entry.get("tag") == tag and entry.get("url") and entry.get("revisionName") == revision:
                     return entry["url"]
         time.sleep(2)
     return None
@@ -680,7 +694,7 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     push_image(image, cfg, r)
 
     out.stage = "deploy"
-    prev = serving_revision(service, cfg)  # None -> brand-new service (first revision must take traffic)
+    prev = serving_revision(service, cfg, r)  # None -> nothing served yet (first revision takes traffic)
     out.handles["previous_revision"] = prev
     cmd = _gcr(
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
@@ -709,6 +723,12 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         raise StepError("deploy", "deploy_error", cp.stderr[-TAIL:], app_logs=logs, diagnosis=diag)
     revision = latest_revision(service, cfg)
     out.handles["revision"] = revision
+    if not revision:
+        # Without it, tagged_url could accept a stale `candidate` tag and --to-latest would promote
+        # a revision nobody verified. Fail closed.
+        raise StepError(
+            "expose", "deploy_error", f"could not read the revision created by this deploy of {service}"
+        )
 
     out.stage = "expose"
     cp = r.run(
@@ -738,7 +758,13 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         )
     if prev:
         out.stage = "deploy"
-        r.run("promote", _gcr(cfg, "services", "update-traffic", service, "--to-latest"), stage="deploy")
+        # Promote exactly the revision that passed verify; --to-latest could pick a newer, unverified one.
+        # Every later deploy uses --no-traffic + explicit promotion, so pinning traffic here is safe.
+        r.run(
+            "promote",
+            _gcr(cfg, "services", "update-traffic", service, f"--to-revisions={revision}=100"),
+            stage="deploy",
+        )
         out.handles["promoted"] = revision
         out.stage = "verify"
         ok, why = wait_up(url, cfg.health_path, 60)
