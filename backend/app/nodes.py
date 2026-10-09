@@ -213,6 +213,9 @@ def free_port_on(node: Node) -> int:
     raise RuntimeError(f"no free port on {node.name} in {lo}-{hi}")
 
 
+NETWORK = "cloudmorph"  # app <-> sidecar (postgres) traffic stays on this docker network
+
+
 def run_container(
     node: Node, image: str, name: str, host_port: int, container_port: int, env: dict[str, str] | None = None
 ) -> str:
@@ -220,11 +223,28 @@ def run_container(
         f"-e {shlex.quote(f'{k}={v}')}" for k, v in {**(env or {}), "PORT": str(container_port)}.items()
     )
     cmd = (
+        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
         f"docker rm -f {shlex.quote(name)} >/dev/null 2>&1; "
-        f"docker run -d --restart unless-stopped --name {shlex.quote(name)} {env_flags} "
+        f"docker run -d --restart unless-stopped --name {shlex.quote(name)} --network {NETWORK} {env_flags} "
         f"-p {host_port}:{container_port} {shlex.quote(image)}"
     )
     return ssh_text(node, cmd, timeout=60).strip()
+
+
+def ensure_postgres(node: Node, app: str, *, timeout: int = 120) -> str:
+    """Start (or reuse) a Postgres sidecar `<app>-db` on the node's cloudmorph network; return DATABASE_URL.
+    Data lives in a named volume `<app>-dbdata`, so redeploys of the app keep their rows."""
+    db = f"{app}-db"
+    cmd = (
+        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
+        f"docker ps -q -f name=^{db}$ | grep -q . || docker run -d --restart unless-stopped --name {db} --network {NETWORK} "
+        f"-e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app -v {app}-dbdata:/var/lib/postgresql/data "
+        f"postgres:16-alpine >/dev/null; "
+        f"for i in $(seq 1 60); do docker exec {db} pg_isready -U app -q && exit 0; sleep 1; done; "
+        f"echo 'postgres not ready' >&2; exit 1"
+    )
+    ssh_text(node, cmd, timeout=timeout)
+    return f"postgresql://app:app@{db}:5432/app"
 
 
 def container_status(node: Node, name: str) -> tuple[str, int]:

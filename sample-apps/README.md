@@ -7,6 +7,7 @@
 | `healthy/` | 정상 배포 경로 시연 | 없음 | — (local ≈ 35초, cloudrun ≈ 30초) |
 | `healthy-node/` | `/health` 없는 Express 앱 (`/`만) | 없음 | 성공: `/`가 200이면 정상으로 판정 |
 | `healthy-fastapi/` | `/health`도 `/`도 없는 FastAPI (`/api/items`만) | 없음 | 성공: 404도 "서버 살아 있음"으로 판정 (5xx만 실패) |
+| `guestbook/` | **DB가 있는 앱** (방명록). `DATABASE_URL` 있으면 Postgres, 없으면 SQLite | 없음 | local/node: Postgres 사이드카 자동, cloudrun: Cloud SQL 앱별 DB 자동 |
 | `broken/` | 자가치유 2단계 시연 | flask가 requirements에 없음 + `127.0.0.1:5000` 하드코딩 | 1차 `ModuleNotFoundError` → 패치 후 2차 포트 바인딩 → 패치 후 성공 |
 | `broken-requirements/` | 빌드 실패 | `flask==99.99.99` | stage=build, pip 오류 원문 |
 | `broken-import/` | 기동 크래시 | `from flask import` 삭제 | stage=verify, 컨테이너 exited(3), `NameError` |

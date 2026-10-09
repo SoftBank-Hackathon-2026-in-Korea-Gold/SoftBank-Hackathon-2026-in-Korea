@@ -52,3 +52,19 @@ uv run python -m app.fleet status
 - scale-in은 최신 복제본이 2분 이상 살아 있고 CPU < 10%일 때만. 보수적.
 - 라우터가 단일 장애점. 도메인이 생기면 Cloudflare DNS 뒤에 두고, 라우터를 2대로.
 - 노드 장애 감지·재배치는 미구현(설계: probe 실패 N회 → 해당 노드 복제본을 다른 노드로).
+
+---
+
+## 데이터베이스 프로비저닝 (10/10 추가) — "SQLite → 관리형 Postgres"
+
+앱이 `DATABASE_URL`을 읽거나 Postgres 드라이버를 쓰면(`detect_database`) deployer가 타깃에 맞는 DB를 만들어 주입한다.
+SQLite 경로를 하드코딩한 앱은 대상이 아니다(읽지도 않는 URL을 넣는 것은 눈속임이므로). 그런 앱은 analyzer/healer가 코드를 고칠 영역.
+
+| 타깃 | DB | 방법 | 데이터 보존 |
+|---|---|---|---|
+| local | `postgres:16-alpine` 사이드카 `<app>-db` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
+| node | 같은 방식을 노드에서 SSH로 | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
+| cloudrun | Cloud SQL 인스턴스 `cloudmorph-pg`(공유) | `gcloud sql databases/users create` → `--add-cloudsql-instances` + `DATABASE_URL=postgresql://u:p@/db?host=/cloudsql/<conn>` | 관리형 |
+
+실측(sample-apps/guestbook): local 9.7초, cloudrun 44초(앱별 DB·계정 생성 포함), node 20초. 세 곳 모두 글 쓰기 → 읽기 확인, local은 재배포 후 데이터 유지 확인.
+Cloud SQL 생성 시 `--edition=ENTERPRISE`를 줘야 `db-f1-micro`를 쓸 수 있고, Cloud Run 서비스 계정에 `roles/cloudsql.client`가 필요하다.

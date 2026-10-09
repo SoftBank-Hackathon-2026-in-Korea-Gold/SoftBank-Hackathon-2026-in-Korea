@@ -392,7 +392,15 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
             assert set(status["targets"]) == {"local", "cloudrun"}
             response = await routes["/deploy/{deployment_id}/events"](deployment_id)
             events = [event async for event in response.body_iterator]
-            assert [e["event"] for e in events] == ["stage", "stage", "done", "stage", "done"]
+            # analyzer summary/notes are streamed as "log" events; the stage/done backbone is unchanged
+            assert [e["event"] for e in events if e["event"] != "log"] == [
+                "stage",
+                "stage",
+                "done",
+                "stage",
+                "done",
+            ]
+            assert any(e["event"] == "log" and "analyzer:" in e["data"] for e in events)
             assert all(set(json.loads(e["data"])) == {"type", "stage", "payload", "ts"} for e in events)
 
     asyncio.run(scenario())
