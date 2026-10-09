@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -30,11 +32,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer
+from app import analyzer, deployer, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
@@ -69,6 +71,8 @@ class Job:
 
 
 _jobs: dict[str, Job] = {}
+# name -> last deployment of that app (what a GitHub push updates). In-memory, like _jobs.
+_projects: dict[str, dict] = {}
 
 
 def _validate_https_git_url(source: str) -> str:
@@ -178,7 +182,7 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
 
 
 @contextmanager
-def prepare_source(source: str) -> Iterator[str]:
+def prepare_source(source: str, ref: str | None = None) -> Iterator[str]:
     """Prepare a local directory, local ZIP, or allowlisted public Git URL.
 
     Source is treated as trusted input: this is a hackathon demo API and must
@@ -211,6 +215,7 @@ def prepare_source(source: str) -> Iterator[str]:
                             "clone",
                             "--depth",
                             "1",
+                            *(["--branch", ref] if ref else []),
                             "--",
                             url,
                             str(dest),
@@ -359,10 +364,21 @@ def create_app() -> FastAPI:
         result = await asyncio.to_thread(fleetmod.scale, app_name, n)
         return {"app": app_name, "replicas": [r.upstream for r in result.replicas]}
 
-    @app.post("/deploy")
-    async def start_deploy(req: DeployRequest) -> dict[str, str]:
-        if not req.targets or len(req.targets) != len(set(req.targets)):
+    def _launch(
+        source: str,
+        targets: list[str],
+        *,
+        name: str | None = None,
+        ref: str | None = None,
+        intro: list[str] | None = None,
+        trigger: str = "api",
+    ) -> str:
+        """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
+        Shared by POST /deploy (user click) and POST /webhook/github (push)."""
+        if not targets or len(targets) != len(set(targets)):
             raise HTTPException(status_code=422, detail="targets must be non-empty and unique")
+        if name is not None and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+            raise HTTPException(status_code=422, detail="name must match [a-z0-9][a-z0-9-]{0,39}")
         if len(_jobs) >= MAX_JOBS:
             # Retire oldest *completed* job; never evict a running job.
             finished = [key for key, val in _jobs.items() if val.completed]
@@ -371,15 +387,31 @@ def create_app() -> FastAPI:
             _jobs.pop(min(finished, key=lambda key: _jobs[key].created_at))
 
         deployment_id = uuid.uuid4().hex[:12]
-        job = Job(targets={t: {"success": None, "url": None} for t in req.targets})
+        app_name = name or f"cloudmorph-{deployment_id}"
+        job = Job(targets={t: {"success": None, "url": None} for t in targets})
         _jobs[deployment_id] = job
+        project = _projects.setdefault(
+            app_name, {"name": app_name, "source": source, "ref": ref, "history": []}
+        )
+        project.update(
+            source=source,
+            ref=ref,
+            targets=targets,
+            last_deployment_id=deployment_id,
+            last_status="running",
+            trigger=trigger,
+            updated_at=time.time(),
+        )
+        project["history"] = [*project["history"][-19:], deployment_id]
         loop = asyncio.get_running_loop()
 
         def emit(event: PipelineEvent) -> None:
             loop.call_soon_threadsafe(_publish, job, event)
 
         def execute() -> None:
-            with prepare_source(req.source) as source_dir:
+            for line in intro or []:
+                emit(PipelineEvent(type="log", payload={"line": line}))
+            with prepare_source(source, ref) as source_dir:
                 emit(PipelineEvent(type="stage", stage="analyze"))
                 analysis = analyzer.analyze(source_dir)
                 emit(
@@ -394,25 +426,19 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                # Separate target workspaces because deployer writes Dockerfile
-                # and may leave background local container/tunnel artifacts.
-                # Keep workspaces while deployments are running; they can be
-                # removed by the operator after the demo.
+                # Separate target workspaces because deployer writes Dockerfile and may leave background
+                # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
+                # so a stable `name` means "update the same service" (CD) instead of "create another one".
                 work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
-                for target in req.targets:
+                for target in targets:
                     try:
-                        target_dir = _copy_for_target(
-                            source_dir, work_root / f"cloudmorph-{deployment_id}-{target}"
-                        )
+                        target_dir = _copy_for_target(source_dir, work_root / f"{app_name}-{target}")
                         run_pipeline(target_dir, target, emit, analysis=analysis)
                     except Exception as exc:  # noqa: BLE001 — isolate target failures
                         emit(
                             PipelineEvent(
                                 type="error",
-                                payload={
-                                    "target": target,
-                                    "message": f"{type(exc).__name__}: {exc}",
-                                },
+                                payload={"target": target, "message": f"{type(exc).__name__}: {exc}"},
                             )
                         )
 
@@ -433,10 +459,61 @@ def create_app() -> FastAPI:
                 job.error = f"{type(exc).__name__}: {exc}"
                 _publish(job, PipelineEvent(type="error", payload={"message": job.error}))
             finally:
+                project.update(
+                    last_status=job.state,
+                    urls={t: v.get("url") for t, v in job.targets.items()},
+                    updated_at=time.time(),
+                )
                 _publish(job, None)
 
         asyncio.create_task(worker())
-        return {"deployment_id": deployment_id}
+        return deployment_id
+
+    app.state.launch = _launch  # tests swap this for a fake
+
+    @app.post("/deploy")
+    async def start_deploy(req: DeployRequest) -> dict[str, str]:
+        return {"deployment_id": app.state.launch(req.source, req.targets, name=req.name, ref=req.ref)}
+
+    @app.get("/projects")
+    async def projects() -> dict:
+        """Apps known to this server (by stable name) with their last deployment — what CD updates."""
+        return {"projects": sorted(_projects.values(), key=lambda p: -p.get("updated_at", 0))}
+
+    @app.post("/webhook/github")
+    async def github_webhook(request: Request) -> dict:
+        """GitHub push -> redeploy the repository under its own name (CD). Secret-signed; default branch only."""
+        secret = os.getenv("CLOUDMORPH_WEBHOOK_SECRET", "")
+        if not secret:
+            raise HTTPException(status_code=503, detail="CLOUDMORPH_WEBHOOK_SECRET not configured")
+        body = await request.body()
+        if not webhooks.verify_signature(secret, body, request.headers.get("x-hub-signature-256")):
+            raise HTTPException(status_code=401, detail="bad signature")
+        event = request.headers.get("x-github-event", "")
+        if event == "ping":
+            return {"ok": True, "event": "ping"}
+        if event != "push":
+            return {"ok": True, "ignored": event}
+        info = webhooks.parse_push(json.loads(body))
+        if info is None or info.deleted:
+            return {"ok": True, "ignored": "not a branch push"}
+        if not webhooks.branch_allowed(info):
+            return {"ok": True, "ignored": f"branch {info.branch} (not in CD branches)"}
+        targets = webhooks.cd_targets()
+        intro = [
+            f"github push by {info.pusher}: {info.repo_full_name}@{info.branch} {info.sha} — {info.message}"
+        ]
+        deployment_id = app.state.launch(
+            info.clone_url, targets, name=info.app_name, ref=info.branch, intro=intro, trigger="github-push"
+        )
+        return {
+            "ok": True,
+            "deployment_id": deployment_id,
+            "name": info.app_name,
+            "targets": targets,
+            "branch": info.branch,
+            "sha": info.sha,
+        }
 
     @app.get("/deploy/{deployment_id}")
     async def deploy_status(deployment_id: str) -> dict:
