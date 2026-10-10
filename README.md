@@ -4,6 +4,12 @@
 
 SoftBank Hackathon 2026 in Korea · Term 2 · Team Gold
 
+## 접속 (상시 호스팅)
+
+- 대시보드: https://cloudmorph.34-64-253-41.sslip.io (API 토큰 필요) · 운영 문서: [`docs/server-hosting.md`](docs/server-hosting.md)
+- 서비스 전체 흐름(인터랙티브): [`docs/overview.html`](docs/overview.html) · 아키텍처: [`docs/architecture.png`](docs/architecture.png)
+- 배포 타깃: `local`(서버 Docker) · `cloudrun` · `node`(GCP·AWS VM 노드 풀) · `function`(Cloud Run functions)
+
 ## Pipeline
 
 ```

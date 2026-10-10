@@ -11,7 +11,7 @@ import { FleetPanel, ProjectsPanel } from './components/OpsPanels';
 import { Dot } from './components/ui';
 
 export default function App() {
-  const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false } });
+  const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false, function: false } });
   const [run, setRun] = useState(() => emptyRun());
   const [projects, setProjects] = useState(null);
   const [fleet, setFleet] = useState(null);

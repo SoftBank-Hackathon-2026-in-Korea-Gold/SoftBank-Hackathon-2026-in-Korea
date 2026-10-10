@@ -5,6 +5,7 @@ export const TARGET_META = {
   local: { label: 'Local Docker', sub: '온프레미스 · cloudflared 터널', tone: 'emerald' },
   cloudrun: { label: 'Cloud Run', sub: '서버리스 컨테이너 · 블루그린', tone: 'indigo' },
   node: { label: 'Node Pool', sub: '멀티 클라우드 VM · 자동 확장', tone: 'sky' },
+  function: { label: 'Cloud Run functions', sub: '서버리스 함수 · 소스만 업로드', tone: 'amber' },
 }
 
 export function emptyRun(id = null, meta = {}) {
