@@ -1199,7 +1199,13 @@ def preflight_function(src_dir: Path, cfg: Config, r: Runner) -> None:
             ],
             check=False,
         )
-        for api in ("cloudfunctions.googleapis.com", "cloudbuild.googleapis.com", "run.googleapis.com"):
+        # cloudresourcemanager: gcloud functions deploy reads the project through it when run as a service account
+        for api in (
+            "cloudfunctions.googleapis.com",
+            "cloudbuild.googleapis.com",
+            "run.googleapis.com",
+            "cloudresourcemanager.googleapis.com",
+        ):
             if api not in apis.stdout.split():
                 problems.append(f"API not enabled: {api} (gcloud services enable {api})")
     if problems:
