@@ -1,0 +1,15 @@
+# CloudMorph control plane: HTTPS (automatic certificate) + dashboard + API/webhook reverse proxy.
+{$CLOUDMORPH_DOMAIN} {
+	encode zstd gzip
+	@api path /deploy /deploy/* /health /fleet /fleet/* /projects /projects/* /webhook/*
+	handle @api {
+		reverse_proxy 127.0.0.1:8000 {
+			flush_interval -1
+		}
+	}
+	handle {
+		root * /srv
+		try_files {path} /index.html
+		file_server
+	}
+}

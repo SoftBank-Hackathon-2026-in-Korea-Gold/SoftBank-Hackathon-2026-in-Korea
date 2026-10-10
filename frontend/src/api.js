@@ -11,10 +11,24 @@ const headers = () => ({
 })
 
 export async function startDeploy({ source, targets, name, ref }) {
-  const body = { source, targets, ...(name ? { name } : {}), ...(ref ? { ref } : {}) }
+  // ask_env: pause after analysis and ask for the values the code needs (EnvRequestCard answers)
+  const body = { source, targets, ask_env: true, ...(name ? { name } : {}), ...(ref ? { ref } : {}) }
   const res = await fetch('/deploy', { method: 'POST', headers: headers(), body: JSON.stringify(body) })
   if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
   return (await res.json()).deployment_id
+}
+
+/** Answer the healer's question after it opened a source-fix PR: 'stop' or 'continue'. */
+export async function answerQuestion(id, questionId, choice) {
+  const res = await fetch(`/deploy/${id}/answer`, { method: 'POST', headers: headers(), body: JSON.stringify({ question_id: questionId, choice }) })
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
+}
+
+/** Answer an `input_required` event. Values only travel in this request; the backend never echoes them. */
+export async function submitEnv(id, values) {
+  const res = await fetch(`/deploy/${id}/env`, { method: 'POST', headers: headers(), body: JSON.stringify({ values }) })
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
+  return res.json()
 }
 
 export async function getDeployment(id) {
@@ -62,7 +76,7 @@ export async function stopProject(name) {
 export function subscribe(id, onEvent, onFail) {
   const q = getToken() ? `?token=${encodeURIComponent(getToken())}` : ''
   const es = new EventSource(`/deploy/${id}/events${q}`)
-  for (const type of ['stage', 'log', 'heal_diff', 'done', 'error']) {
+  for (const type of ['stage', 'log', 'heal_diff', 'input_required', 'done', 'error']) {
     es.addEventListener(type, (ev) => {
       try {
         const raw = JSON.parse(ev.data)

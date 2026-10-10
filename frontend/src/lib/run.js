@@ -5,6 +5,7 @@ export const TARGET_META = {
   local: { label: 'Local Docker', sub: '온프레미스 · cloudflared 터널', tone: 'emerald' },
   cloudrun: { label: 'Cloud Run', sub: '서버리스 컨테이너 · 블루그린', tone: 'indigo' },
   node: { label: 'Node Pool', sub: '멀티 클라우드 VM · 자동 확장', tone: 'sky' },
+  function: { label: 'Cloud Run functions', sub: '서버리스 함수 · 소스만 업로드', tone: 'amber' },
 }
 
 export function emptyRun(id = null, meta = {}) {
@@ -24,8 +25,10 @@ export function emptyRun(id = null, meta = {}) {
     targetState: Object.fromEntries(targets.map((t) => [t, freshTarget()])),
     logs: [],
     patches: [],
+    envRequest: null, // { items, timeoutSec } while the backend waits for POST /deploy/{id}/env
     seen: new Set(),
     error: null,
+    question: null, // healer fixed the source: { question_id, ask, pr_url, pr_error, rationale, diff, choice, reason }
   }
 }
 
@@ -65,13 +68,24 @@ export function applyEvent(prev, type, p, raw) {
   switch (type) {
     case 'log': {
       const line = p.line || ''
-      if (line.startsWith('analyzer: target=')) {
+      if (p.kind === 'question') {
+        run.question = { ...p, choice: null, reason: null }
+        const pr = p.pr_url ? `PR을 올렸어요 · ${p.pr_url}` : '소스를 고쳤어요 (PR 없음)'
+        push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `${pr} — ${p.rationale}` })
+      } else if (p.kind === 'answer') {
+        run.question = run.question && { ...run.question, choice: p.choice, reason: p.reason }
+        const why = { user: '사용자 선택', timeout: '응답 없음', 'github-push': 'push 배포' }[p.reason] || p.reason
+        push(run, { ts, kind: 'info', stage: 'heal', text: `${p.choice === 'continue' ? '고친 소스로 계속 배포' : '이번 배포는 여기서 중단'} (${why})` })
+      } else if (line.startsWith('analyzer: target=')) {
         run.analysis = parseSummary(line)
         const a = run.analysis
         push(run, { ts, kind: 'analyze', stage: 'analyze', text: `분석 완료 · 권장 타깃 ${a.target} · ${a.language}/${a.framework} · port ${a.port}` })
       } else if (line.startsWith('analyzer: ')) {
         run.notes.push(line.slice('analyzer: '.length))
         push(run, { ts, kind: 'note', stage: 'analyze', text: line.slice('analyzer: '.length) })
+      } else if (line.startsWith('env: ')) {
+        run.envRequest = null
+        push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 · ${line.slice(5)} → 배포를 이어갑니다` })
       } else if (line.startsWith('queue: ')) {
         push(run, { ts, kind: 'push', stage: 'queue', text: `대기 · 같은 앱의 이전 배포가 끝나면 시작합니다 (${line.slice(7)})` })
       } else if (line.startsWith('cancel: ')) {
@@ -104,6 +118,12 @@ export function applyEvent(prev, type, p, raw) {
         if (t) run.targetState[t] = { ...run.targetState[t], attempts: p.attempt }
         push(run, { ts, kind: 'heal', stage: 'redeploy', target: t, text: `패치 #${p.attempt} 적용 → 재배포` })
       }
+      break
+    }
+    case 'input_required': {
+      const items = p.items || []
+      run.envRequest = { items, timeoutSec: p.timeout_sec }
+      push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 ${new Set(items.map((i) => i.name)).size}개를 기다리는 중 · ${[...new Set(items.map((i) => i.name))].join(', ')}` })
       break
     }
     case 'heal_diff': {
@@ -143,6 +163,7 @@ export function applyEvent(prev, type, p, raw) {
         push(run, { ts, kind: 'error', stage: 'failed', target: t, text: msg })
       } else {
         run.error = msg
+        run.envRequest = null
         run.status = 'failed'
         run.finishedAt = Date.now()
         push(run, { ts, kind: 'error', stage: 'failed', text: msg })

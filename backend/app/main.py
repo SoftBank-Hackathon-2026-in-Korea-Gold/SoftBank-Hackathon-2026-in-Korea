@@ -18,12 +18,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import hmac
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -37,18 +39,21 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, SimpleQueue
+from typing import Literal
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer, webhooks
+from app import analyzer, deployer, env_store, fixpr, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
-from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
+from app.schemas import AnalysisResult, DeployRequest, DeployTarget, EnvInput, EnvRequirement, PipelineEvent
 
 load_dotenv()
 
@@ -66,6 +71,7 @@ except ValueError as exc:
 if MAX_CONCURRENT_GIT_CLONES < 1:
     raise ValueError("CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES must be a positive integer")
 GIT_CLONE_WAIT_SECONDS = 5
+ENV_INPUT_TIMEOUT_SECONDS = 15 * 60  # how long an `ask_env` job waits for POST /deploy/{id}/env
 _git_clone_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_GIT_CLONES)
 SOURCE_IGNORE = {".git", ".venv", "node_modules", ".deployer", "__pycache__"}
 SENSITIVE_DIRS = {".aws", ".azure", ".gnupg", ".kube", ".ssh"}
@@ -128,6 +134,11 @@ class Job:
     completed: bool = False
     cancel: threading.Event = field(default_factory=threading.Event)
     work_root: Path | None = None  # every build command of this job runs on a path under it
+    questions: dict[str, SimpleQueue[str]] = field(default_factory=dict)  # open question_id -> answer
+    # ask_env: what the job is waiting for, and the user's answer (memory only, never put in events)
+    required_env: list[EnvRequirement] = field(default_factory=list)
+    env_values: dict[str, str] | None = None
+    env_ready: threading.Event = field(default_factory=threading.Event)
 
 
 _jobs: dict[str, Job] = {}
@@ -318,6 +329,20 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
         os.close(root_fd)
 
 
+def _source_identity(source: str) -> str:
+    """Stable id of where an app's code comes from, so saved env values only go back to the same source.
+    Spellings of one repo agree ('https://GitHub.com/Octo/App.git/' == 'https://github.com/octo/app');
+    the branch is left out so every branch of a repo shares its values."""
+    if source.startswith("https://"):
+        parsed = urlparse(source)
+        path = parsed.path.strip("/").removesuffix(".git").lower()
+        return f"git:{(parsed.hostname or '').lower()}/{path}"
+    path = Path(source).expanduser()
+    if not path.is_absolute() and not path.exists() and (REPO_ROOT / source).exists():
+        path = REPO_ROOT / source  # same preset rule as prepare_source
+    return f"path:{path.resolve()}"
+
+
 @contextmanager
 def prepare_source(source: str, ref: str | None = None) -> Iterator[str]:
     """Prepare a local directory, local ZIP, or allowlisted public Git URL.
@@ -395,19 +420,130 @@ def _remove_workspace(path: Path) -> None:
         _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
+ANSWER_TIMEOUT_S = 300  # no answer by then -> stop; the PR stays open
+
+
+class AnswerRequest(BaseModel):
+    """POST /deploy/{deployment_id}/answer body."""
+
+    question_id: str
+    choice: Literal["stop", "continue"]
+
+
+PR_MERGE_HINT = (
+    "Merge it, then deploy again (if the repo's GitHub webhook points here, the merge redeploys by itself)."
+)
+
+
+def source_fix_confirm(
+    job: Job, emit: Callable[[PipelineEvent], None], source: str, ref: str | None, trigger: str
+) -> healer.ConfirmFn:
+    """healer's confirm_fn for one job: open a PR with the source fix, then ask the user whether to stop
+    or deploy the edited copy now. Asked once per job; later targets reuse the answer.
+    A GitHub-push deployment has nobody watching, so it stops without asking."""
+    decided: dict = {}
+
+    def confirm(src_dir: str, fix: healer.RepoFix) -> str | None:
+        if not decided:
+            pr_url = pr_error = None
+            if source.startswith("https://"):
+                try:
+                    pr_url = fixpr.open_pr(
+                        source, ref, src_dir, list(fix.changed), fix.rationale, fix.source_diff
+                    )
+                except Exception as exc:  # no PR still leaves the question
+                    _logger.warning("could not open the fix PR", exc_info=True)
+                    pr_error = f"{type(exc).__name__}: {exc}"
+            question_id = uuid.uuid4().hex[:12]
+            answers: SimpleQueue[str] = SimpleQueue()
+            ask = trigger != "github-push"
+            if ask:
+                job.questions[question_id] = answers
+            emit(
+                PipelineEvent(
+                    type="log",
+                    stage="heal",
+                    payload={
+                        "kind": "question",
+                        "question_id": question_id,
+                        "ask": ask,
+                        "pr_url": pr_url,
+                        "pr_error": pr_error,
+                        "rationale": fix.rationale,
+                        "diff": fix.source_diff,
+                        "choices": ["stop", "continue"],
+                        "timeout_s": ANSWER_TIMEOUT_S,
+                    },
+                )
+            )
+            choice, reason = "stop", "github-push"
+            if ask:
+                try:
+                    choice, reason = answers.get(timeout=ANSWER_TIMEOUT_S), "user"
+                except Empty:
+                    reason = "timeout"
+                finally:
+                    job.questions.pop(question_id, None)
+            decided.update(choice=choice, pr_url=pr_url)
+            emit(
+                PipelineEvent(
+                    type="log",
+                    stage="heal",
+                    payload={
+                        "kind": "answer",
+                        "question_id": question_id,
+                        "choice": choice,
+                        "reason": reason,
+                    },
+                )
+            )
+        if decided["choice"] == "continue":
+            return None
+        if decided["pr_url"]:
+            return f"Stopped: the source fix is up as a PR ({decided['pr_url']}). {PR_MERGE_HINT}"
+        return (
+            "Stopped: the source fix was not deployed. Apply the diff to your repository, then deploy again."
+        )
+
+    return confirm
+
+
+def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
+    """deployer.deploy options for the user's values (blank ones are left out)."""
+    env: dict[str, str] = {}
+    build_args: dict[str, str] = {}
+    build_secrets: dict[str, str] = {}
+    for item in required:
+        value = values.get(item.name)
+        if not value:
+            continue
+        if item.scope == "runtime":
+            env[item.name] = value
+        elif item.secret:
+            build_secrets[item.name] = value
+        else:
+            build_args[item.name] = value
+    options = {"env": env, "build_args": build_args, "build_secrets": build_secrets}
+    return {k: v for k, v in options.items() if v}
+
+
 def run_pipeline(
     source: str,
     target: DeployTarget,
     emit: Callable[[PipelineEvent], None],
     analysis: AnalysisResult | None = None,
+    confirm: healer.ConfirmFn | None = None,
+    overrides: dict | None = None,
 ) -> bool:
-    """Run one target synchronously; healer owns all retry attempts."""
+    """Run one target synchronously; healer owns all retry attempts.
+    `overrides` (deployer options such as env/build_secrets) apply to the healer's redeploys too."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
         analysis = analyzer.analyze(source)
 
+    deploy_fn = functools.partial(deployer.deploy, **overrides) if overrides else deployer.deploy
     emit(PipelineEvent(type="stage", stage="deploy", payload={"target": target}))
-    result = deployer.deploy(source, analysis.dockerfile, target)
+    result = deploy_fn(source, analysis.dockerfile, target)
     if result.success:
         emit(PipelineEvent(type="done", payload={"target": target, "url": result.url}))
         return True
@@ -422,7 +558,9 @@ def run_pipeline(
             },
         )
     )
-    report = healer.heal(source, target, result, analysis.dockerfile, deployer.deploy, emit=emit)
+    report = healer.heal(
+        source, target, result, analysis.dockerfile, deploy_fn, emit=emit, confirm_fn=confirm
+    )
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
     return report.success
@@ -544,6 +682,7 @@ def create_app() -> FastAPI:
         ref: str | None = None,
         intro: list[str] | None = None,
         trigger: str = "api",
+        ask_env: bool = False,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
         Shared by POST /deploy (user click) and POST /webhook/github (push)."""
@@ -628,17 +767,26 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
+                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis, source_dir))
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
                 # the default name is per-deployment unique. Local state is retained for container/tunnel cleanup.
                 work_root = job.work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
+                confirm = source_fix_confirm(job, emit, source, ref, trigger)
                 try:
                     for target in targets:
                         target_dir = work_root / f"{app_name}-{target}"
                         try:
                             target_dir = Path(_copy_for_target(source_dir, target_dir))
-                            if run_pipeline(target_dir, target, emit, analysis=analysis):
+                            if run_pipeline(
+                                target_dir,
+                                target,
+                                emit,
+                                analysis=analysis,
+                                overrides=overrides,
+                                confirm=confirm,
+                            ):
                                 live[target] = deployer.last_handles(target_dir)
                         except DeployCancelled:
                             raise
@@ -655,6 +803,80 @@ def create_app() -> FastAPI:
                 finally:
                     if "local" not in targets:
                         _remove_workspace(work_root)
+
+        def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
+            """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
+            A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
+            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are kept per
+            name *and* source: another repo deployed under the same name is asked afresh, never handed these."""
+            if not analysis.required_env:
+                return {}
+            owner = _source_identity(source)
+            values = env_store.load(app_name, owner) if name else {}
+            saved = dict(values)
+            if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
+                emit(
+                    PipelineEvent(
+                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
+                    )
+                )
+            missing = [e for e in analysis.required_env if not values.get(e.name)]
+            if not missing:
+                return values
+            if not ask_env:  # scripts and GitHub push: nobody to ask
+                lacking = ", ".join(sorted({e.name for e in missing}))
+                emit(
+                    PipelineEvent(
+                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
+                    )
+                )
+                return values
+            values |= _ask_env(missing, source_dir)
+            for e in missing:
+                if e.scope == "runtime" and e.generate and not values.get(e.name):
+                    values[e.name] = secrets.token_urlsafe(32)
+            if name and values != saved:
+                try:
+                    env_store.save(app_name, owner, values)
+                except env_store.EnvStoreError as exc:
+                    line = f"env: 값을 저장하지 못해 다음 배포에서 다시 묻습니다 ({exc})"
+                    emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
+            return values
+
+        def _ask_env(items: list[EnvRequirement], source_dir: str) -> dict[str, str]:
+            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
+            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
+            job.required_env = [
+                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
+                for e in items
+            ]
+            job.state = "waiting_input"
+            emit(
+                PipelineEvent(
+                    type="input_required",
+                    stage="analyze",
+                    payload={
+                        "items": [e.model_dump() for e in job.required_env],
+                        "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
+                    },
+                )
+            )
+            if not job.env_ready.wait(ENV_INPUT_TIMEOUT_SECONDS):
+                raise TimeoutError(
+                    f"배포에 필요한 값을 {ENV_INPUT_TIMEOUT_SECONDS // 60}분 안에 받지 못해 배포를 멈췄습니다"
+                )
+            job.state = "running"
+            values, job.env_values = job.env_values or {}, None
+            given = sorted(values)
+            emit(
+                PipelineEvent(
+                    type="log",
+                    stage="analyze",
+                    payload={"line": f"env: 입력받은 값 {', '.join(given) if given else '없음'}"},
+                )
+            )
+            return values
 
         async def worker() -> None:
             job.state = "running"
@@ -692,7 +914,24 @@ def create_app() -> FastAPI:
 
     @app.post("/deploy")
     async def start_deploy(req: DeployRequest) -> dict[str, str]:
-        return {"deployment_id": app.state.launch(req.source, req.targets, name=req.name, ref=req.ref)}
+        return {
+            "deployment_id": app.state.launch(
+                req.source, req.targets, name=req.name, ref=req.ref, ask_env=req.ask_env
+            )
+        }
+
+    @app.post("/deploy/{deployment_id}/env")
+    async def submit_env(deployment_id: str, body: EnvInput) -> dict:
+        """Answer an `input_required` event. Blank values are skipped; the job resumes right away."""
+        job = _jobs.get(deployment_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deployment_id")
+        if job.state != "waiting_input" or job.env_ready.is_set():
+            raise HTTPException(status_code=409, detail="deployment is not waiting for input")
+        wanted = {e.name for e in job.required_env}
+        job.env_values = {k: v for k, v in body.values.items() if k in wanted and v}
+        job.env_ready.set()
+        return {"accepted": sorted(job.env_values)}
 
     @app.get("/projects")
     async def projects() -> dict:
@@ -798,6 +1037,18 @@ def create_app() -> FastAPI:
                 except (OSError, subprocess.SubprocessError):
                     pass  # the next stage boundary still stops the job
         return {"deployment_id": deployment_id, "cancelled": True}
+
+    @app.post("/deploy/{deployment_id}/answer")
+    async def answer(deployment_id: str, req: AnswerRequest) -> dict[str, str]:
+        """Answer a healer question (see source_fix_confirm): stop here, or continue with the edited source."""
+        job = _jobs.get(deployment_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deployment_id")
+        answers = job.questions.pop(req.question_id, None)
+        if answers is None:
+            raise HTTPException(status_code=409, detail="question is not open (answered or timed out)")
+        answers.put(req.choice)
+        return {"choice": req.choice}
 
     @app.get("/deploy/{deployment_id}/events")
     async def events(deployment_id: str) -> EventSourceResponse:

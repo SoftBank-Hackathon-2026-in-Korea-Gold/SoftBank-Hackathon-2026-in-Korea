@@ -1,0 +1,19 @@
+[Unit]
+Description=CloudMorph backend (FastAPI)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+User=cloudmorph
+SupplementaryGroups=docker
+WorkingDirectory=/home/cloudmorph/cloudmorph/backend
+# .env: API keys (Anthropic, Cloud SQL root, webhook secret). server.env: token, fleet watcher, project.
+EnvironmentFile=/home/cloudmorph/cloudmorph/.env
+EnvironmentFile=/home/cloudmorph/cloudmorph-server.env
+Environment=PATH=/home/cloudmorph/.local/bin:/usr/local/bin:/usr/bin:/bin:/snap/bin
+ExecStart=/home/cloudmorph/.local/bin/uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 1
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

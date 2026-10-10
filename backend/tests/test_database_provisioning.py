@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
-from app import deployer, fleet
+import pytest
+
+from app import deployer, fleet, nodes
 from app.deployer import Config, detect_database, wants_database
 
 
@@ -43,6 +46,29 @@ def test_wants_database_respects_explicit_config(tmp_path):
     assert wants_database(src, Config(database="auto")) is None
     assert wants_database(src, Config(database="postgres")) == "postgres"
     assert wants_database(_app(tmp_path / "f", **{"app.py": "DATABASE_URL"}), Config(database=None)) is None
+
+
+@pytest.mark.parametrize("listed, restarted", [("3f2a9c1b\n", True), ("", False)])
+def test_local_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch, listed, restarted):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, listed if cmd[:2] == ["docker", "ps"] else "", "")
+
+    monkeypatch.setattr(deployer.subprocess, "run", fake_run)
+    url = deployer.ensure_local_postgres("todo", deployer.Runner())
+    assert url == "postgresql://app:app@todo-db:5432/app"
+    assert ["docker", "ps", "-aq", "-f", "name=^todo-db$"] in calls  # stopped containers count as existing
+    assert (["docker", "start", "todo-db"] in calls) is restarted
+    assert any(c[:2] == ["docker", "run"] for c in calls) is not restarted  # same name again -> Conflict
+
+
+def test_node_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch):
+    sent: list[str] = []
+    monkeypatch.setattr(nodes, "ssh_text", lambda node, cmd, timeout=60: sent.append(cmd) or "")
+    nodes.ensure_postgres(nodes.Node(name="a", host="10.0.0.2"), "todo")
+    assert "docker start todo-db >/dev/null 2>&1 || docker run -d" in sent[0]
 
 
 def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
@@ -109,3 +135,46 @@ def test_stateful_apps_never_scale_out(monkeypatch, tmp_path):
     for _ in range(3):
         row = fleet.tick()[0]
     assert "stateful" in (row["action"] or "") and len(row["replicas"]) == 1
+
+
+def test_stateful_app_redeploys_to_the_node_that_holds_its_database(monkeypatch, tmp_path):
+    """Regression: a push redeploy used to pick the least-loaded node and leave the DB sidecar (data) behind."""
+    from app import deployer, nodes
+    from app.nodes import Metrics, Node, Registry, Router
+
+    monkeypatch.setattr(fleet, "STATE_FILE", tmp_path / "fleet.json")
+    reg = Registry(
+        nodes=[Node(name="gcp-1", host="1"), Node(name="aws-1", host="2")], router=Router(name="r", host="3")
+    )
+    fleet.save_state(
+        fleet.State(
+            apps={
+                "gb-node": fleet.App(
+                    name="gb-node",
+                    image="i",
+                    container_port=8080,
+                    hostname="h",
+                    stateful=True,
+                    replicas=[fleet.Replica("gcp-1", "c", "1", 8000)],
+                )
+            }
+        )
+    )
+    assert deployer._pinned_node(reg, "gb-node").name == "gcp-1"
+    assert deployer._pinned_node(reg, "other") is None
+    # a stateless app is not pinned
+    fleet.save_state(
+        fleet.State(
+            apps={
+                "web-node": fleet.App(
+                    name="web-node",
+                    image="i",
+                    container_port=8080,
+                    hostname="h",
+                    replicas=[fleet.Replica("gcp-1", "c", "1", 8000)],
+                )
+            }
+        )
+    )
+    assert deployer._pinned_node(reg, "web-node") is None
+    del nodes, Metrics

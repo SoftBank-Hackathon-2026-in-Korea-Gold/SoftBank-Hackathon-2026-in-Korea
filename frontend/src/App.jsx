@@ -1,16 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, KeyRound } from 'lucide-react';
-import { cancelDeploy, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, stopProject, subscribe } from './api';
+import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
+import EnvRequestCard from './components/EnvRequestCard';
 import Stepper from './components/Stepper';
 import LogConsole from './components/LogConsole';
-import { AnalysisCard, Endpoints, PatchList } from './components/ResultPanels';
+import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
 import { FleetPanel, ProjectsPanel } from './components/OpsPanels';
 import { Dot } from './components/ui';
 
 export default function App() {
-  const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false } });
+  const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false, function: false } });
   const [run, setRun] = useState(() => emptyRun());
   const [projects, setProjects] = useState(null);
   const [fleet, setFleet] = useState(null);
@@ -21,6 +22,7 @@ export default function App() {
   const [notice, setNotice] = useState(null);
   const [stopping, setStopping] = useState(null);
   const [cancelling, setCancelling] = useState(null);
+  const [starting, setStarting] = useState(false);
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
   const [now, setNow] = useState(() => Date.now());
@@ -83,11 +85,15 @@ export default function App() {
 
   const onDeploy = async () => {
     const targets = Object.keys(form.targets).filter((t) => form.targets[t]);
+    // lock the button before the request returns, otherwise a double click starts two deployments
+    setStarting(true);
     try {
       const id = await startDeploy({ source: form.source.trim(), targets, name: form.name.trim() || undefined, ref: form.ref.trim() || undefined });
       attach(id, { source: form.source, targets, name: form.name || null, trigger: 'api' });
     } catch (e) {
       setRun({ ...emptyRun(), status: 'failed', error: e.message, logs: [{ id: 0, at: new Date(), kind: 'error', stage: 'failed', text: `배포 요청 실패: ${e.message}` }] });
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -159,11 +165,13 @@ export default function App() {
 
         <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
           <div className="space-y-5">
-            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={run.status === 'running'} fleetAvailable={!!fleet} />
+            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || run.status === 'running'} fleetAvailable={!!fleet} />
             <AnalysisCard run={run} />
           </div>
           <div className="min-w-0 space-y-5">
+            {run.envRequest && <EnvRequestCard key={run.id} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
             <Stepper run={run} now={now} onCancel={onCancel} cancelling={cancelling === run.id} />
+            <QuestionCard question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
             <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
               <LogConsole logs={run.logs} running={run.status === 'running'} />
               <div className="min-w-0 space-y-5">

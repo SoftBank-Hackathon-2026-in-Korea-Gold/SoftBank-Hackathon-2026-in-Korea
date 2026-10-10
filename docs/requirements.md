@@ -190,7 +190,7 @@ cd one-action-cloudmorph
 
 # 2. 환경변수 파일 준비
 cp .env.example .env
-# .env 파일을 열어 ANTHROPIC_API_KEY / OPENAI_API_KEY / OPENAI_BASE_URL 중 하나 이상과, 필요 시 GCP_PROJECT_ID 설정
+# .env 파일을 열어 ANTHROPIC_API_KEY(analyzer 필수)와, 필요 시 OPENAI_API_KEY / OPENAI_BASE_URL(healer), GCP_PROJECT_ID 설정
 
 # 3. 백엔드 디렉토리 이동 및 의존성 설치
 cd backend

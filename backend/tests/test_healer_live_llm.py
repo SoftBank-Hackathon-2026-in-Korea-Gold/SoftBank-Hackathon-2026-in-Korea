@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 from dotenv import load_dotenv
 
-from app.healer import _llm_context, default_llm_patch, default_source_suggestion
+from app.healer import _llm_context, default_llm_patch, default_repo_repair, default_source_suggestion
 from app.schemas import ErrorCategory
 
 pytestmark = pytest.mark.skipif(
@@ -67,3 +67,19 @@ def test_source_suggestion_for_import_crash():
     )
     print("\n--- LLM source suggestion diff ---\n" + diff)
     assert "Flask" in diff
+
+
+def test_repo_agent_fixes_import_crash(tmp_path):
+    if not os.environ.get("ANTHROPIC_API_KEY"):
+        pytest.skip("the repo agent needs ANTHROPIC_API_KEY (tool use)")
+    app = ROOT / "sample-apps" / "broken-import"
+    for name in ("app.py", "requirements.txt"):
+        (tmp_path / name).write_text((app / name).read_text())
+    dockerfile = (app / "Dockerfile").read_text()
+    stderr = (FIXTURES / "broken-import.local.stderr.txt").read_text()
+
+    fix = default_repo_repair(str(tmp_path), dockerfile, stderr, ErrorCategory.UNKNOWN)
+
+    print("\n--- repo agent ---\n" + (f"{fix.rationale}\n{fix.source_diff}" if fix else "<None>"))
+    assert fix and "app.py" in fix.source_diff
+    assert "Flask" in (tmp_path / "app.py").read_text().split("app = Flask", 1)[0]
