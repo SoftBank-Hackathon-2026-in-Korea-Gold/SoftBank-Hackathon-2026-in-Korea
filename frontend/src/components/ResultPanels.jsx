@@ -1,5 +1,5 @@
-import React from 'react';
-import { Zap, Cloud, Cpu, ExternalLink, Globe, Network, Server, Wrench } from 'lucide-react';
+import React, { useState } from 'react';
+import { Zap, Cloud, Cpu, ExternalLink, GitPullRequest, Globe, Network, Server, Wrench } from 'lucide-react';
 import { TARGET_META } from '../lib/run';
 import { Badge, Card, CopyButton, Dot } from './ui';
 import { TONE } from '../lib/style';
@@ -44,6 +44,63 @@ function DiffBlock({ diff }) {
         </div>
       ))}
     </pre>
+  );
+}
+
+function afterAnswer(q) {
+  const lead = { timeout: '답이 없어서 이번 배포는 멈췄어요. ', 'github-push': 'GitHub push 배포라 묻지 않고 멈췄어요. ' }[q.reason] || '';
+  if (q.choice === 'continue') return q.pr_url ? '고친 소스로 배포를 이어갑니다. 저장소에도 남도록 PR을 머지해 주세요.' : '고친 소스로 배포를 이어갑니다. 같은 수정을 저장소에도 반영해 주세요.';
+  if (q.pr_url) return `${lead}PR을 머지한 뒤 다시 배포해 주세요. 저장소의 GitHub webhook이 여기로 연결돼 있으면 머지하는 순간 자동으로 다시 배포됩니다.`;
+  return `${lead}위 diff를 저장소에 반영한 뒤 다시 배포해 주세요.`;
+}
+
+/** The healer fixed the app's source: PR link + diff, and "stop here, or continue with the fix?" */
+export function QuestionCard({ question: q, onAnswer }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(null);
+  if (!q) return null;
+  const open = q.ask && !q.choice;
+  const answer = async (choice) => {
+    setBusy(true);
+    setErr(null);
+    try {
+      await onAnswer(q.question_id, choice);
+    } catch (e) {
+      setErr(e.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card title={q.pr_url ? 'PR을 올렸어요!' : '소스를 고쳤어요'} icon={GitPullRequest} className={open ? 'border-amber-500/40' : ''}
+      right={open ? <Badge tone="amber">답변 대기</Badge> : q.choice && <Badge tone={q.choice === 'continue' ? 'emerald' : 'slate'}>{q.choice === 'continue' ? '계속' : '중단'}</Badge>}>
+      <div className="space-y-3">
+        <p className="text-[13px] leading-5 text-slate-300">{q.rationale}</p>
+        {q.pr_url && (
+          <a href={q.pr_url} target="_blank" rel="noreferrer" className="inline-flex items-center gap-1.5 font-mono text-[12px] text-sky-300 hover:text-sky-200">
+            {q.pr_url} <ExternalLink className="h-3.5 w-3.5" />
+          </a>
+        )}
+        {q.pr_error && <p className="text-xs text-amber-300">PR을 올리지 못했어요 · {q.pr_error}</p>}
+        <DiffBlock diff={q.diff} />
+        {open && (
+          <div className="space-y-2 rounded-xl border border-amber-500/30 bg-amber-500/5 p-3">
+            <p className="text-sm font-medium text-slate-100">이번 배포는 그만 둘까요? 아니면 바꾸고 계속 할까요?</p>
+            <div className="flex flex-wrap gap-2">
+              <button type="button" disabled={busy} onClick={() => answer('stop')} className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-[13px] text-slate-200 hover:bg-white/10 disabled:opacity-50">
+                그만 두기 (PR 머지 후 다시 배포)
+              </button>
+              <button type="button" disabled={busy} onClick={() => answer('continue')} className="rounded-lg bg-violet-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-violet-500 disabled:opacity-50">
+                고친 채로 계속
+              </button>
+            </div>
+            <p className="text-[11px] text-slate-500">{Math.round((q.timeout_s || 300) / 60)}분 안에 답이 없으면 이번 배포는 멈춥니다. PR은 그대로 남아요.</p>
+            {err && <p className="text-xs text-rose-300">답변을 보내지 못했어요 · {err}</p>}
+          </div>
+        )}
+        {q.choice && <p className="text-[13px] leading-5 text-slate-200">{afterAnswer(q)}</p>}
+      </div>
+    </Card>
   );
 }
 

@@ -13,6 +13,9 @@ Design notes
   and it keeps cost inside the team budget.
 - The deployer is injected (`deploy_fn`) so healer owns the retry loop
   without importing deployer.py, and tests can use a fake deployer.
+- With ANTHROPIC_API_KEY the fallback is a repo agent: it reads the whole source tree, may edit
+  source files in `src_dir` (main.py's per-target copy, never the user's checkout), and returns
+  the Dockerfile. App-code crashes are then repaired instead of stopping.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
 from app.schemas import (
     MAX_RETRIES,
@@ -47,6 +51,10 @@ LlmPatchFn = Callable[
 ]  # (dockerfile, error_log, category) -> new dockerfile
 EmitFn = Callable[[PipelineEvent], None]
 SourceSuggestFn = Callable[[str, str, str], "str | None"]  # (path, source, traceback) -> fixed source
+RepairFn = Callable[
+    [str, str, str, ErrorCategory], "RepoFix | None"
+]  # (src_dir, dockerfile, error_log, category) -> fix; may edit files under src_dir
+ConfirmFn = Callable[[str, "RepoFix"], "str | None"]  # (src_dir, fix) -> None = redeploy, str = stop summary
 
 DEFAULT_PORT = 8080  # Cloud Run injects PORT=8080 by default
 
@@ -464,6 +472,117 @@ def default_source_suggestion(path: str, source: str, traceback: str) -> str | N
 
 
 # --------------------------------------------------------------------------- #
+# 3b. Repo agent (Claude only: needs tool use). Reads the source tree with analyzer's read tools
+#     plus edit_file, so it can fix the code itself instead of guessing from stderr + Dockerfile.
+# --------------------------------------------------------------------------- #
+REPAIR_SYSTEM_PROMPT = (
+    "You are a container deployment repair agent with the app's repository open. A deploy failed. "
+    "Read the files you need to find the root cause. If the bug is in the source, fix it with edit_file; "
+    "if it is in the Dockerfile, change the Dockerfile you return. The container must listen on 0.0.0.0 "
+    f"and the port from $PORT (default {DEFAULT_PORT}). Traceback paths are inside the container's WORKDIR. "
+    "Make the smallest change that fixes the error; do not touch tests or unrelated files."
+)
+REPAIR_TIMEOUT_S = 120  # per model call; the agent takes several turns, so LLM_TIMEOUT_S is too short
+
+
+class RepoFix(NamedTuple):
+    dockerfile: str
+    source_diff: str  # unified diff of files the agent edited ("" if none)
+    rationale: str
+    changed: tuple[str, ...] = ()  # paths (relative to src_dir) of the files behind source_diff
+
+
+class _RepairAnswer(BaseModel):
+    dockerfile: str = Field(
+        description="The full Dockerfile to deploy with (unchanged if the fix is in the source)"
+    )
+    rationale: str = Field(description="One sentence: the root cause and what you changed")
+
+
+def repo_edit_tool(root: Path):
+    """edit_file for the repo agent, plus the original text of every file it touched (for the diff)."""
+    from langchain_core.tools import tool
+
+    from app.analyzer import SECRET_FILE, SKIP_DIRS, _inside, read_text
+
+    root = root.resolve()
+    originals: dict[str, str] = {}
+
+    @tool
+    def edit_file(path: str, old: str, new: str) -> str:
+        """Replace `old` with `new` in a repo file; `old` must appear exactly once. Empty `old` creates a new file.
+        The Dockerfile is not edited here: return it instead."""
+        p = root / path
+        if not _inside(root, p):
+            return f"cannot edit outside the repository: {path}"
+        rel = p.resolve().relative_to(root)
+        if (
+            any(part in SKIP_DIRS or part.startswith(".") for part in rel.parts)
+            or SECRET_FILE.fullmatch(rel.name)
+            or rel.name == "Dockerfile"
+        ):
+            return f"cannot edit this file: {path}"
+        key = rel.as_posix()
+        text = read_text(p) if p.is_file() else ""
+        if old:
+            if text.count(old) != 1:
+                return f"`old` must appear exactly once in {key} (found {text.count(old)})"
+            updated = text.replace(old, new)
+        elif p.exists():
+            return f"{key} already exists; pass the text to replace as `old`"
+        else:
+            updated = new
+        originals.setdefault(key, text)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(updated)
+        return f"edited {key}"
+
+    return edit_file, originals
+
+
+def default_repo_repair(
+    src_dir: str, dockerfile: str, error_log: str, category: ErrorCategory
+) -> RepoFix | None:
+    import anthropic
+
+    from app.analyzer import RepoReader, read_text
+
+    root = Path(src_dir).resolve()
+    edit_file, originals = repo_edit_tool(root)
+    reader = RepoReader(
+        anthropic.Anthropic(timeout=REPAIR_TIMEOUT_S, max_retries=0), _model_for("anthropic"), str(root)
+    )
+    reader.tools.append(edit_file)
+    reader.specs.append(
+        {
+            "name": edit_file.name,
+            "description": edit_file.description,
+            "input_schema": edit_file.tool_call_schema.model_json_schema(),
+        }
+    )
+    user = (
+        f"Error category: {category.value}\n\nstderr:\n{_llm_context(error_log)}\n\nDockerfile:\n{dockerfile}"
+    )
+    try:
+        answer = reader.ask(_RepairAnswer, [("system", REPAIR_SYSTEM_PROMPT), ("user", user)])
+    except Exception:  # network / quota / turn limit must not crash the pipeline
+        logger.exception("repo repair failed")
+        return None
+    source_diff = "".join(
+        "".join(
+            difflib.unified_diff(
+                before.splitlines(keepends=True),
+                read_text(root / path).splitlines(keepends=True),
+                f"{path} (before)",
+                f"{path} (after)",
+            )
+        )
+        for path, before in originals.items()
+    )
+    return RepoFix(answer.dockerfile.strip() + "\n", source_diff, answer.rationale, tuple(originals))
+
+
+# --------------------------------------------------------------------------- #
 # 4. Graph
 # --------------------------------------------------------------------------- #
 def _unified_diff(before: str, after: str) -> str:
@@ -477,7 +596,13 @@ def _unified_diff(before: str, after: str) -> str:
     )
 
 
-def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emit: EmitFn | None = None):
+def build_graph(
+    deploy_fn: DeployFn,
+    llm_patch_fn: LlmPatchFn | None = None,
+    emit: EmitFn | None = None,
+    repair_fn: RepairFn | None = None,
+    confirm_fn: ConfirmFn | None = None,
+):
     llm_patch = llm_patch_fn or default_llm_patch
 
     def _emit(event: PipelineEvent) -> None:
@@ -487,7 +612,7 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
     def classify(state: HealState) -> HealState:
         error_log = state.get("error_log", "")
         update: HealState = {"error_category": classify_error(error_log)}
-        if _unhealable(error_log) or _stops_on_app_code(error_log):
+        if _unhealable(error_log) or (not repair_fn and _stops_on_app_code(error_log)):
             update["status"] = "gave_up"  # no Dockerfile patch can fix it: skip LLM + redeploy
         return update
 
@@ -500,7 +625,14 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
         rule = RULE_PATCHES.get(category)
         result = rule(before, error_log) if rule else None
         source = "rule"
-        if result is None:
+        source_diff = ""
+        fix = None
+        if result is None and repair_fn:
+            fix = repair_fn(state["src_dir"], before, error_log, category)
+            if fix and (fix.dockerfile != before or fix.source_diff):
+                result, source_diff = (fix.dockerfile, fix.rationale), fix.source_diff
+            source = "llm"
+        elif result is None:
             after = llm_patch(before, error_log, category)
             result = (after, "LLM-proposed fix") if after and after != before else None
             source = "llm"
@@ -508,7 +640,7 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
             return {"status": "gave_up"}  # no patch applied -> attempt not counted
 
         after, rationale = result
-        diff = _unified_diff(before, after)
+        diff = _unified_diff(before, after) + source_diff
         record = PatchRecord(
             attempt=attempt,
             category=category,
@@ -520,12 +652,14 @@ def build_graph(deploy_fn: DeployFn, llm_patch_fn: LlmPatchFn | None = None, emi
             source=source,
         )
         _emit(PipelineEvent(type="heal_diff", stage="heal", payload=record.model_dump(mode="json")))
+        # A source edit goes out only after confirm_fn (main.py: PR + ask the user) says so.
+        stop = confirm_fn(state["src_dir"], fix) if (confirm_fn and source_diff) else None
         return {
             "current_dockerfile": after,
             "diff": diff,
             "history": [*state.get("history", []), record],
             "retry_count": attempt,
-            "status": "healing",
+            "status": "gave_up" if stop else "healing",
         }
 
     def redeploy(state: HealState) -> HealState:
@@ -628,13 +762,28 @@ def heal(
     llm_patch_fn: LlmPatchFn | None = None,
     emit: EmitFn | None = None,
     suggest_fn: SourceSuggestFn | None = None,
+    repair_fn: RepairFn | None = None,
+    confirm_fn: ConfirmFn | None = None,
 ) -> HealReport:
     """Entry point for main.py: call after the first deploy failed.
 
-    Policy: only the Dockerfile is patched automatically. A crash in the app's own code stops at
-    once; for import-time crashes a source fix is suggested as a diff in the summary, never applied.
+    Policy: with the repo agent (default when ANTHROPIC_API_KEY is set and no `llm_patch_fn` is
+    injected) the Dockerfile and the source in `src_dir` are both patched; a source edit is
+    redeployed only if `confirm_fn` (when given) does not stop it. Without the agent only the
+    Dockerfile is patched; a crash in the app's own code stops at once, and for import-time crashes
+    a source fix is suggested as a diff in the summary, never applied.
     """
-    app = build_graph(deploy_fn, llm_patch_fn, emit)
+    if repair_fn is None and llm_patch_fn is None and os.environ.get("ANTHROPIC_API_KEY"):
+        repair_fn = default_repo_repair
+    stopped: list[str] = []
+
+    def confirm(src: str, fix: RepoFix) -> str | None:
+        stop = confirm_fn(src, fix)
+        if stop:
+            stopped.append(stop)
+        return stop
+
+    app = build_graph(deploy_fn, llm_patch_fn, emit, repair_fn, confirm if confirm_fn else None)
     initial: HealState = {
         "src_dir": src_dir,
         "target": target,
@@ -651,9 +800,11 @@ def heal(
     last = final.get("last_result")
     error_log = final.get("error_log", "")
     blocked = None if success else _unhealable(error_log)
-    app_error = None if (success or blocked) else _stops_on_app_code(error_log)
+    app_error = None if (success or blocked or repair_fn) else _stops_on_app_code(error_log)
     if success:
         summary = f"Healed after {len(records)} patch(es): " + "; ".join(r.rationale for r in records)
+    elif stopped:
+        summary = stopped[-1]
     elif app_error:
         suggestion = None
         # Import-time crash = a code bug worth a fix suggestion; a request-time 5xx may be runtime state.

@@ -28,6 +28,7 @@ export function emptyRun(id = null, meta = {}) {
     envRequest: null, // { items, timeoutSec } while the backend waits for POST /deploy/{id}/env
     seen: new Set(),
     error: null,
+    question: null, // healer fixed the source: { question_id, ask, pr_url, pr_error, rationale, diff, choice, reason }
   }
 }
 
@@ -67,7 +68,15 @@ export function applyEvent(prev, type, p, raw) {
   switch (type) {
     case 'log': {
       const line = p.line || ''
-      if (line.startsWith('analyzer: target=')) {
+      if (p.kind === 'question') {
+        run.question = { ...p, choice: null, reason: null }
+        const pr = p.pr_url ? `PR을 올렸어요 · ${p.pr_url}` : '소스를 고쳤어요 (PR 없음)'
+        push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `${pr} — ${p.rationale}` })
+      } else if (p.kind === 'answer') {
+        run.question = run.question && { ...run.question, choice: p.choice, reason: p.reason }
+        const why = { user: '사용자 선택', timeout: '응답 없음', 'github-push': 'push 배포' }[p.reason] || p.reason
+        push(run, { ts, kind: 'info', stage: 'heal', text: `${p.choice === 'continue' ? '고친 소스로 계속 배포' : '이번 배포는 여기서 중단'} (${why})` })
+      } else if (line.startsWith('analyzer: target=')) {
         run.analysis = parseSummary(line)
         const a = run.analysis
         push(run, { ts, kind: 'analyze', stage: 'analyze', text: `분석 완료 · 권장 타깃 ${a.target} · ${a.language}/${a.framework} · port ${a.port}` })

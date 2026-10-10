@@ -10,8 +10,10 @@ from pathlib import Path
 
 import pytest
 
+from app import healer
 from app.healer import (
     APP_CODE_STOP,
+    RepoFix,
     _llm_context,
     _patch_unresolvable_pin,
     _source_file,
@@ -21,6 +23,7 @@ from app.healer import (
     classify_error,
     deployer_header,
     heal,
+    repo_edit_tool,
 )
 from app.schemas import DeployResult, ErrorCategory
 
@@ -304,3 +307,134 @@ def test_suggester_exception_does_not_break_the_stop(tmp_path):
         suggest_fn=broken_suggester,
     )
     assert report.summary.startswith(APP_CODE_STOP) and report.attempts == 0
+
+
+# --------------------------------------------------------------------------- #
+# Repo agent: reads the source tree and may edit source files in src_dir (main.py's per-target copy).
+# --------------------------------------------------------------------------- #
+def test_repo_agent_fixes_import_crash_in_source_and_redeploys(tmp_path):
+    app_py = tmp_path / "app.py"
+    app_py.write_text((SAMPLE_APPS / "broken-import" / "app.py").read_text())
+    dockerfile = _dockerfile("broken-import.local")
+
+    def repair(src_dir, before, error_log, category):
+        assert src_dir == str(tmp_path) and "NameError" in error_log
+        edit_file, originals = repo_edit_tool(Path(src_dir))
+        fixed = "import os\n\nfrom flask import Flask, jsonify\n"
+        assert edit_file.invoke({"path": "app.py", "old": "import os\n", "new": fixed}) == "edited app.py"
+        diff = "".join(f"--- {k}\n" for k in originals)  # healer only concatenates it
+        return RepoFix(before, diff, "Flask was used without importing it")
+
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        dockerfile,
+        _succeed("local"),
+        repair_fn=repair,
+    )
+
+    assert report.success and report.attempts == 1
+    assert report.records[0].source == "llm" and "--- app.py" in report.records[0].diff
+    assert "from flask import Flask, jsonify" in app_py.read_text()
+
+
+def test_repo_agent_that_changes_nothing_gives_up_without_redeploy(tmp_path):
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-health.local"),
+        _dockerfile("broken-health.local"),
+        _forbidden("redeploy"),
+        repair_fn=lambda src_dir, dockerfile, *_: RepoFix(dockerfile, "", "nothing to fix"),
+    )
+    assert not report.success and report.attempts == 0
+    assert not report.summary.startswith(APP_CODE_STOP)  # the agent tried; this is not the policy stop
+
+
+def test_repo_agent_is_the_default_with_a_claude_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    calls = []
+    monkeypatch.setattr(healer, "default_repo_repair", lambda *a: calls.append(a) or None)
+    heal(str(tmp_path), "local", _failed("broken-import.local"), "FROM x\n", _forbidden("redeploy"))
+    assert len(calls) == 1
+
+
+def test_repo_edit_tool_edits_and_creates_inside_src_dir(tmp_path):
+    (tmp_path / "app.py").write_text("a = 1\na = 1\nb = 2\n")
+    edit_file, originals = repo_edit_tool(tmp_path)
+
+    assert "exactly once" in edit_file.invoke({"path": "app.py", "old": "a = 1", "new": "a = 3"})
+    assert edit_file.invoke({"path": "app.py", "old": "b = 2", "new": "b = 3"}) == "edited app.py"
+    assert edit_file.invoke({"path": "pkg/new.py", "old": "", "new": "x = 1\n"}) == "edited pkg/new.py"
+    assert "already exists" in edit_file.invoke({"path": "app.py", "old": "", "new": "x"})
+
+    assert (tmp_path / "app.py").read_text() == "a = 1\na = 1\nb = 3\n"
+    assert (tmp_path / "pkg" / "new.py").read_text() == "x = 1\n"
+    assert originals == {"app.py": "a = 1\na = 1\nb = 2\n", "pkg/new.py": ""}
+
+
+@pytest.mark.parametrize(
+    "path", ["../outside.py", "/etc/passwd", ".env", "Dockerfile", ".deployer/state.json"]
+)
+def test_repo_edit_tool_refuses_paths_it_must_not_write(tmp_path, path):
+    (tmp_path / "src").mkdir()
+    edit_file, originals = repo_edit_tool(tmp_path / "src")
+    assert edit_file.invoke({"path": path, "old": "", "new": "x"}).startswith("cannot edit")
+    assert originals == {} and not (tmp_path / "outside.py").exists()
+
+
+def _agent_fix(tmp_path):
+    (tmp_path / "app.py").write_text((SAMPLE_APPS / "broken-import" / "app.py").read_text())
+
+    def repair(src_dir, before, *_):
+        edit_file, originals = repo_edit_tool(Path(src_dir))
+        edit_file.invoke(
+            {"path": "app.py", "old": "import os\n", "new": "import os\nfrom flask import Flask\n"}
+        )
+        return RepoFix(before, "--- app.py\n", "Flask was not imported", tuple(originals))
+
+    return repair
+
+
+def test_confirm_stop_ends_before_redeploy_with_its_summary(tmp_path):
+    seen = []
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _forbidden("redeploy"),
+        repair_fn=_agent_fix(tmp_path),
+        confirm_fn=lambda src, fix: seen.append((src, fix.changed)) or "Stopped: PR is up",
+    )
+    assert seen == [(str(tmp_path), ("app.py",))]
+    assert not report.success and report.summary == "Stopped: PR is up"
+    assert report.attempts == 1 and "--- app.py" in report.records[0].diff  # the diff is still reported
+
+
+def test_confirm_continue_redeploys_the_edited_source(tmp_path):
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _succeed("local"),
+        repair_fn=_agent_fix(tmp_path),
+        confirm_fn=lambda *_: None,
+    )
+    assert report.success and "from flask import Flask" in (tmp_path / "app.py").read_text()
+
+
+def test_rule_patches_never_ask(tmp_path):
+    failed = _failed("broken-port.local")
+    report = heal(
+        str(tmp_path),
+        "local",
+        failed,
+        _dockerfile("broken-port.local"),
+        _succeed("local"),
+        repair_fn=_forbidden("repo agent"),
+        confirm_fn=_forbidden("confirm"),
+    )
+    assert report.success

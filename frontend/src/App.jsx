@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, KeyRound } from 'lucide-react';
-import { getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, submitEnv, subscribe } from './api';
+import { answerQuestion, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, submitEnv, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import EnvRequestCard from './components/EnvRequestCard';
 import Stepper from './components/Stepper';
 import LogConsole from './components/LogConsole';
-import { AnalysisCard, Endpoints, PatchList } from './components/ResultPanels';
+import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
 import { FleetPanel, ProjectsPanel } from './components/OpsPanels';
 import { Dot } from './components/ui';
 
@@ -141,6 +141,7 @@ export default function App() {
           <div className="min-w-0 space-y-5">
             {run.envRequest && <EnvRequestCard key={run.id} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
             <Stepper run={run} now={now} />
+            <QuestionCard question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
             <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
               <LogConsole logs={run.logs} running={run.status === 'running'} />
               <div className="min-w-0 space-y-5">
