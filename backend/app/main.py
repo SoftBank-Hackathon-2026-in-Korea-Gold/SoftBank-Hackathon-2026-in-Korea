@@ -7,6 +7,10 @@ Existing API contracts are preserved:
 Optional read-only endpoint:
  GET /deploy/{deployment_id} -> job status and target results.
 
+Dashboard controls:
+ POST /deploy/{deployment_id}/cancel -> stop a running deployment at its next step.
+ POST /projects/{name}/stop -> take down every target the app is serving.
+
 This module orchestrates the team's analyzer, deployer, and healer unchanged.
 """
 
@@ -109,6 +113,10 @@ def _is_direct_local_request(request: Request) -> bool:
     return not any(h in request.headers for h in _PROXY_HEADERS)
 
 
+class DeployCancelled(Exception):
+    """Raised at the next stage boundary once POST /deploy/{id}/cancel was called."""
+
+
 @dataclass
 class Job:
     created_at: float = field(default_factory=time.time)
@@ -118,6 +126,8 @@ class Job:
     targets: dict[str, dict] = field(default_factory=dict)
     error: str | None = None
     completed: bool = False
+    cancel: threading.Event = field(default_factory=threading.Event)
+    work_root: Path | None = None  # every build command of this job runs on a path under it
 
 
 _jobs: dict[str, Job] = {}
@@ -566,29 +576,41 @@ def create_app() -> FastAPI:
         )
         project["history"] = [*project["history"][-19:], deployment_id]
         _save_projects()
+        live: dict[str, dict] = {}  # target -> deployer handles of what this job left serving (for stop)
         loop = asyncio.get_running_loop()
 
         def emit(event: PipelineEvent) -> None:
+            # every stage boundary (analyze, deploy, heal, redeploy — healer's too) is a cancellation point
+            if event.type == "stage" and job.cancel.is_set():
+                raise DeployCancelled
             loop.call_soon_threadsafe(_publish, job, event)
 
         def execute() -> None:
-            for line in intro or []:
-                emit(PipelineEvent(type="log", payload={"line": line}))
-            lock = _app_locks.setdefault(app_name, threading.Lock())
-            if not lock.acquire(blocking=False):
-                emit(
-                    PipelineEvent(
-                        type="log",
-                        payload={
-                            "line": f"queue: waiting for the previous deployment of {app_name} to finish"
-                        },
-                    )
-                )
-                lock.acquire()
             try:
-                _run_locked()
-            finally:
-                lock.release()
+                for line in intro or []:
+                    emit(PipelineEvent(type="log", payload={"line": line}))
+                lock = _app_locks.setdefault(app_name, threading.Lock())
+                if not lock.acquire(blocking=False):
+                    emit(
+                        PipelineEvent(
+                            type="log",
+                            payload={
+                                "line": f"queue: waiting for the previous deployment of {app_name} to finish"
+                            },
+                        )
+                    )
+                    while not lock.acquire(timeout=1):
+                        if job.cancel.is_set():
+                            raise DeployCancelled
+                try:
+                    _run_locked()
+                finally:
+                    lock.release()
+            except DeployCancelled:
+                event = PipelineEvent(
+                    type="error", payload={"message": "cancelled by user", "cancelled": True}
+                )
+                loop.call_soon_threadsafe(_publish, job, event)
 
         def _run_locked() -> None:
             with prepare_source(source, ref) as source_dir:
@@ -610,24 +632,29 @@ def create_app() -> FastAPI:
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
                 # the default name is per-deployment unique. Local state is retained for container/tunnel cleanup.
-                work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
-                for target in targets:
-                    target_dir = work_root / f"{app_name}-{target}"
-                    try:
-                        target_dir = Path(_copy_for_target(source_dir, target_dir))
-                        run_pipeline(target_dir, target, emit, analysis=analysis)
-                    except Exception as exc:  # noqa: BLE001 — isolate target failures
-                        emit(
-                            PipelineEvent(
-                                type="error",
-                                payload={"target": target, "message": f"{type(exc).__name__}: {exc}"},
+                work_root = job.work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
+                try:
+                    for target in targets:
+                        target_dir = work_root / f"{app_name}-{target}"
+                        try:
+                            target_dir = Path(_copy_for_target(source_dir, target_dir))
+                            if run_pipeline(target_dir, target, emit, analysis=analysis):
+                                live[target] = deployer.last_handles(target_dir)
+                        except DeployCancelled:
+                            raise
+                        except Exception as exc:  # noqa: BLE001 — isolate target failures
+                            emit(
+                                PipelineEvent(
+                                    type="error",
+                                    payload={"target": target, "message": f"{type(exc).__name__}: {exc}"},
+                                )
                             )
-                        )
-                    finally:
-                        if target == "cloudrun":
-                            _remove_workspace(target_dir)
-                if "local" not in targets:
-                    _remove_workspace(work_root)
+                        finally:
+                            if target == "cloudrun":
+                                _remove_workspace(target_dir)
+                finally:
+                    if "local" not in targets:
+                        _remove_workspace(work_root)
 
         async def worker() -> None:
             job.state = "running"
@@ -637,6 +664,8 @@ def create_app() -> FastAPI:
                 await asyncio.sleep(0)
                 if all(v.get("success") is True for v in job.targets.values()):
                     job.state = "completed"
+                elif job.cancel.is_set():
+                    job.state = "cancelled"
                 elif any(v.get("success") is True for v in job.targets.values()):
                     job.state = "partial_failure"
                 else:
@@ -649,6 +678,8 @@ def create_app() -> FastAPI:
                 project.update(
                     last_status=job.state,
                     urls={t: v.get("url") for t, v in job.targets.items()},
+                    # a target that failed this time may still serve the previous deployment
+                    live={**project.get("live", {}), **live},
                     updated_at=time.time(),
                 )
                 _save_projects()
@@ -667,6 +698,34 @@ def create_app() -> FastAPI:
     async def projects() -> dict:
         """Apps known to this server (by stable name) with their last deployment — what CD updates."""
         return {"projects": sorted(_projects.values(), key=lambda p: -p.get("updated_at", 0))}
+
+    @app.post("/projects/{name}/stop")
+    async def stop_project(name: str) -> dict:
+        """Take down every target this app is serving (container + tunnel, Cloud Run service, node replicas)."""
+        project = _projects.get(name)
+        if project is None:
+            raise HTTPException(status_code=404, detail="unknown project")
+        lock = _app_locks.setdefault(name, threading.Lock())
+        if not lock.acquire(blocking=False):
+            raise HTTPException(status_code=409, detail="a deployment of this app is in progress")
+        try:
+            stopped: dict[str, list[str]] = {}
+            failed: dict[str, str] = {}
+            serving = project.get("live") or {}
+            for target, handles in serving.items():
+                try:
+                    stopped[target] = await asyncio.to_thread(deployer.teardown, target, handles)
+                except Exception as exc:  # noqa: BLE001 — report per target, keep the others going
+                    failed[target] = f"{type(exc).__name__}: {exc}"
+            project["live"] = {t: h for t, h in serving.items() if t in failed}
+            project["urls"] = {t: u for t, u in (project.get("urls") or {}).items() if t in failed}
+            if not failed:
+                project["last_status"] = "stopped"
+            project["updated_at"] = time.time()
+            _save_projects()
+        finally:
+            lock.release()
+        return {"name": name, "stopped": stopped, "failed": failed}
 
     @app.post("/webhook/github")
     async def github_webhook(request: Request) -> dict:
@@ -715,6 +774,30 @@ def create_app() -> FastAPI:
             "error": job.error,
             "completed": job.completed,
         }
+
+    @app.post("/deploy/{deployment_id}/cancel")
+    async def cancel_deploy(deployment_id: str) -> dict:
+        """Stop a running deployment at its next step; an in-flight docker build is killed right away.
+        Targets that already came up stay up (and stay stoppable via /projects/{name}/stop)."""
+        job = _jobs.get(deployment_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deployment_id")
+        if job.completed:
+            raise HTTPException(status_code=409, detail="deployment already finished")
+        if not job.cancel.is_set():
+            job.cancel.set()
+            _publish(job, PipelineEvent(type="log", payload={"line": "cancel: stopping at the next step"}))
+            if job.work_root is not None:
+                try:
+                    await asyncio.to_thread(
+                        subprocess.run,
+                        ["pkill", "-f", str(job.work_root)],
+                        check=False,
+                        timeout=10,
+                    )
+                except (OSError, subprocess.SubprocessError):
+                    pass  # the next stage boundary still stops the job
+        return {"deployment_id": deployment_id, "cancelled": True}
 
     @app.get("/deploy/{deployment_id}/events")
     async def events(deployment_id: str) -> EventSourceResponse:

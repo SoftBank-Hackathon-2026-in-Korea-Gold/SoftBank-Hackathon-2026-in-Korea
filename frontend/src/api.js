@@ -44,6 +44,20 @@ export async function getProjects() {
   return (await res.json()).projects
 }
 
+/** Stop a running deployment at its next step (an in-flight docker build is killed right away). */
+export async function cancelDeploy(id) {
+  const res = await fetch(`/deploy/${id}/cancel`, { method: 'POST', headers: headers() })
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
+  return res.json()
+}
+
+/** Take down everything the app is serving (local container + tunnel, Cloud Run service, node replicas). */
+export async function stopProject(name) {
+  const res = await fetch(`/projects/${encodeURIComponent(name)}/stop`, { method: 'POST', headers: headers() })
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
+  return res.json()
+}
+
 /** Subscribe to the SSE stream. `onEvent(type, payload, raw)`; returns a close() function. */
 export function subscribe(id, onEvent, onFail) {
   const q = getToken() ? `?token=${encodeURIComponent(getToken())}` : ''

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -112,3 +113,30 @@ def test_local_broken_sample_reports_missing_dependency():
         assert classify_error(res.stderr) == ErrorCategory.MISSING_DEPENDENCY
     finally:
         deployer.cleanup(str(SAMPLE_APPS / "broken"))
+
+
+def test_teardown_cloudrun_deletes_service_and_tolerates_missing(monkeypatch):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        stderr = "" if len(calls) == 1 else "ERROR: Service [demo] could not be found."
+        return subprocess.CompletedProcess(cmd, 0 if len(calls) == 1 else 1, "", stderr)
+
+    monkeypatch.setattr(deployer.subprocess, "run", fake_run)
+    handles = {"service": "demo", "project": "p1", "region": "asia-northeast3"}
+    assert deployer.teardown("cloudrun", handles) == ["deleted Cloud Run service demo"]
+    assert calls[0][:5] == ["gcloud", "run", "services", "delete", "demo"]
+    assert "p1" in calls[0]
+    assert deployer.teardown("cloudrun", handles) == []  # already gone -> idempotent
+
+
+def test_teardown_local_keeps_database(monkeypatch):
+    removed = []
+    monkeypatch.setattr(
+        deployer.subprocess,
+        "run",
+        lambda cmd, **kw: removed.append(cmd[-1]) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+    deployer.teardown("local", {"container_name": "app-local-1", "db_container": "app-db"})
+    assert removed == ["app-local-1"]

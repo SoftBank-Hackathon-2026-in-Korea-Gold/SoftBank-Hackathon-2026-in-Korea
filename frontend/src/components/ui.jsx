@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, Square } from 'lucide-react';
 import { TONE } from '../lib/style';
 
 
@@ -52,6 +52,19 @@ export function CopyButton({ text, className = '' }) {
       className={`rounded-md p-1 text-slate-500 hover:bg-white/5 hover:text-slate-200 ${className}`}
     >
       {done ? <Check className="h-3.5 w-3.5 text-emerald-400" /> : <Copy className="h-3.5 w-3.5" />}
+    </button>
+  );
+}
+
+export function StopButton({ onClick, busy }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      className="flex items-center gap-1 rounded-lg border border-rose-500/30 px-2 py-1 text-[11px] text-rose-300 hover:border-rose-400/60 hover:bg-rose-500/10 hover:text-rose-200 disabled:opacity-60"
+    >
+      <Square className="h-3.5 w-3.5" /> {busy ? '중지 중…' : '중지'}
     </button>
   );
 }

@@ -1,7 +1,7 @@
 import React from 'react';
 import { Cloud, Cpu, ExternalLink, Globe, Network, Server, Wrench } from 'lucide-react';
-import { TARGET_META } from '../lib/run';
-import { Badge, Card, CopyButton, Dot } from './ui';
+import { TARGET_META, canStop } from '../lib/run';
+import { Badge, Card, CopyButton, Dot, StopButton } from './ui';
 import { TONE } from '../lib/style';
 
 const ICONS = { local: Server, cloudrun: Cloud, node: Network };
@@ -71,10 +71,13 @@ export function PatchList({ patches }) {
   );
 }
 
-export function Endpoints({ run }) {
+export function Endpoints({ run, project, onStop, stopping }) {
   const targets = run.targets.length ? run.targets : [];
+  const right = canStop(project)
+    ? <StopButton onClick={() => onStop(project.name)} busy={stopping === project.name} />
+    : project?.last_status === 'stopped' && <Badge>중지됨</Badge>;
   return (
-    <Card title="공개 엔드포인트" icon={Globe}>
+    <Card title="공개 엔드포인트" icon={Globe} right={right}>
       {targets.length === 0 ? (
         <p className="text-xs text-slate-500">배포가 끝나면 타깃별 공개 URL이 표시됩니다.</p>
       ) : (
@@ -83,7 +86,9 @@ export function Endpoints({ run }) {
             const s = run.targetState[t] || {};
             const m = TARGET_META[t];
             const Icon = ICONS[t];
-            const ok = s.phase === 'done' && s.url;
+            // project.live is what the backend can still take down; a done target missing from it was stopped
+            const down = s.phase === 'done' && !!project?.live && project.last_status !== 'running' && !project.live[t];
+            const ok = s.phase === 'done' && s.url && !down;
             return (
               <div key={t} className={`flex items-center gap-3 rounded-xl border px-3 py-2.5 ${ok ? `${TONE[m.tone].border} bg-white/[0.03]` : s.phase === 'failed' ? 'border-rose-500/30 bg-rose-500/5' : 'border-white/5'}`}>
                 <span className={`grid h-8 w-8 shrink-0 place-items-center rounded-lg ring-1 ring-inset ring-white/5 ${TONE[m.tone].soft}`}><Icon className="h-4 w-4" /></span>
@@ -93,7 +98,7 @@ export function Endpoints({ run }) {
                     {s.healed && <Badge tone="amber">자가치유됨</Badge>}
                   </div>
                   <div className={`truncate font-mono text-[11.5px] ${ok ? 'text-slate-300' : s.phase === 'failed' ? 'text-rose-300' : 'text-slate-500'}`}>
-                    {ok ? s.url : s.phase === 'failed' ? s.message : s.phase === 'pending' ? '대기' : <span className="flex items-center gap-1.5"><Dot tone="violet" pulse /> 진행 중</span>}
+                    {ok ? s.url : down ? '중지됨' : s.phase === 'cancelled' ? '중단됨' : s.phase === 'failed' ? s.message : s.phase === 'pending' ? '대기' : <span className="flex items-center gap-1.5"><Dot tone="violet" pulse /> 진행 중</span>}
                   </div>
                 </div>
                 {ok && (
