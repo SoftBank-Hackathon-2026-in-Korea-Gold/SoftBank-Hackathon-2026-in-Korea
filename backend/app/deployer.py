@@ -322,6 +322,8 @@ def _read_handles(src_dir: Path) -> dict:
 # preflight
 # --------------------------------------------------------------------------- #
 def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
+    if target == "function":
+        return preflight_function(src_dir, cfg, r)
     problems: list[str] = []
     if not (src_dir / "Dockerfile").exists():
         problems.append(f"Dockerfile not found in {src_dir}")
@@ -1138,14 +1140,189 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# function target: Cloud Run functions (gen2). Source-based — Google builds it with buildpacks, so the
+# Dockerfile is ignored and the source must be function-shaped (functions-framework + an HTTP entry point).
+# --------------------------------------------------------------------------- #
+_PY_DECORATED = re.compile(r"@functions_framework\.http\s*\n\s*def\s+(\w+)\s*\(")
+_PY_REQUEST_FN = re.compile(r"^def\s+(\w+)\s*\(\s*request\b", re.MULTILINE)
+_JS_HTTP = re.compile(r"functions\.http\(\s*['\"]([\w-]+)['\"]")
+_FN_NAME = re.compile(r"[^a-z0-9-]+")
+
+
+def detect_function(src_dir: Path) -> tuple[str, str] | None:
+    """Return (runtime, entry_point) when `src_dir` is shaped like a Cloud Run function, else None."""
+    main_py = src_dir / "main.py"
+    req = src_dir / "requirements.txt"
+    if main_py.exists():
+        text = main_py.read_text(errors="ignore")
+        if m := _PY_DECORATED.search(text):
+            return "python312", m.group(1)
+        has_ff = req.exists() and "functions-framework" in req.read_text(errors="ignore").lower()
+        if has_ff and (m := _PY_REQUEST_FN.search(text)):
+            return "python312", m.group(1)
+    pkg = src_dir / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text())
+        except ValueError:
+            data = {}
+        if "@google-cloud/functions-framework" in (data.get("dependencies") or {}):
+            index = src_dir / (data.get("main") or "index.js")
+            if index.exists() and (m := _JS_HTTP.search(index.read_text(errors="ignore"))):
+                return "nodejs20", m.group(1)
+    return None
+
+
+def preflight_function(src_dir: Path, cfg: Config, r: Runner) -> None:
+    problems: list[str] = []
+    if detect_function(src_dir) is None:
+        problems.append(
+            "source is not function-shaped: needs functions-framework and an HTTP entry point "
+            "(Python: @functions_framework.http def handler(request) in main.py; "
+            "Node: functions.http('name', ...) with @google-cloud/functions-framework). See sample-apps/function-hello"
+        )
+    if shutil.which("gcloud") is None:
+        problems.append("gcloud CLI not installed")
+    elif not cfg.project:
+        problems.append("GCP project not set (GCP_PROJECT_ID or gcloud config set project <ID>)")
+    else:
+        apis = r.run(
+            "apis",
+            [
+                "gcloud",
+                "services",
+                "list",
+                "--enabled",
+                "--project",
+                cfg.project,
+                "--format=value(config.name)",
+            ],
+            check=False,
+        )
+        for api in ("cloudfunctions.googleapis.com", "cloudbuild.googleapis.com", "run.googleapis.com"):
+            if api not in apis.stdout.split():
+                problems.append(f"API not enabled: {api} (gcloud services enable {api})")
+    if problems:
+        raise StepError("preflight", "user_action_required", "\n".join(f"- {p}" for p in problems))
+
+
+def function_logs(name: str, cfg: Config, r: Runner) -> str:
+    """Gen2 functions run as a Cloud Run service with the same name; read its ERROR logs."""
+    flt = f'resource.type="cloud_run_revision" AND resource.labels.service_name="{name}" AND severity>=ERROR'
+    cp = r.run(
+        "gcloud logging read",
+        [
+            "gcloud",
+            "logging",
+            "read",
+            flt,
+            "--project",
+            str(cfg.project),
+            "--limit",
+            "40",
+            "--freshness",
+            "20m",
+            "--order",
+            "asc",
+            "--format=value(timestamp,textPayload)",
+        ],
+        check=False,
+    )
+    return cp.stdout[-TAIL:] or "(no ERROR-level runtime logs; see the build log URL in the error above)"
+
+
+def deploy_function(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
+    detected = detect_function(src_dir)
+    if detected is None:  # preflight normally catches this; kept for skip_preflight
+        raise StepError(
+            "preflight",
+            "user_action_required",
+            "source is not function-shaped (see sample-apps/function-hello)",
+        )
+    runtime, entry = detected
+    name = _FN_NAME.sub("-", (cfg.service or slug(src_dir.name)).lower()).strip("-")[:62] or "fn"
+    if not name[0].isalpha():
+        name = f"fn-{name}"[:62]
+    out.handles.update(
+        function=name, runtime=runtime, entry_point=entry, project=cfg.project, region=cfg.region
+    )
+    # The source upload must not carry our state or the (ignored) Dockerfile
+    (src_dir / ".gcloudignore").write_text(
+        ".deployer/\n.gcloudignore\nDockerfile\n__pycache__/\nnode_modules/\n.git/\n"
+    )
+
+    out.stage = "deploy"
+    cmd = [
+        "gcloud",
+        "functions",
+        "deploy",
+        name,
+        "--gen2",
+        "--runtime",
+        runtime,
+        "--region",
+        cfg.region,
+        "--project",
+        str(cfg.project),
+        "--source",
+        str(src_dir),
+        "--entry-point",
+        entry,
+        "--trigger-http",
+        "--quiet",
+    ]
+    if cfg.allow_unauthenticated:
+        cmd.append("--allow-unauthenticated")
+    if cfg.env:
+        cmd += ["--set-env-vars", "^|^" + "|".join(f"{k}={v}" for k, v in cfg.env.items())]
+    cp = r.run("gcloud functions deploy", cmd, timeout=cfg.deploy_timeout, check=False, stage="deploy")
+    if cp.returncode != 0:
+        raise StepError(
+            "deploy", "function_error", (cp.stderr or cp.stdout)[-TAIL:], app_logs=function_logs(name, cfg, r)
+        )
+
+    out.stage = "expose"
+    cp = r.run(
+        "function url",
+        [
+            "gcloud",
+            "functions",
+            "describe",
+            name,
+            "--gen2",
+            "--region",
+            cfg.region,
+            "--project",
+            str(cfg.project),
+            "--format=value(serviceConfig.uri)",
+        ],
+        stage="expose",
+    )
+    url = cp.stdout.strip()
+    if not url:
+        raise StepError("expose", "deploy_error", f"function {name} deployed but has no URL")
+
+    out.stage = "verify"
+    ok, why = wait_up(url, cfg.health_path, cfg.verify_timeout)
+    if not ok:
+        raise StepError(
+            "verify",
+            "function_error",
+            f"function {name} not healthy: {why}",
+            app_logs=function_logs(name, cfg, r),
+        )
+    out.url = url
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 def run_pipeline(src_dir: str | os.PathLike, target: str, cfg: Config | None = None) -> Outcome:
     """Full-detail variant of deploy(): stages, handles, warnings. Does not raise."""
     cfg = cfg or Config.from_env()
-    if target not in ("local", "cloudrun", "node"):
-        raise ValueError("target must be 'local', 'cloudrun' or 'node'")
-    if target == "cloudrun" and not cfg.project:
+    if target not in ("local", "cloudrun", "node", "function"):
+        raise ValueError("target must be 'local', 'cloudrun', 'node' or 'function'")
+    if target in ("cloudrun", "function") and not cfg.project:
         cfg.project = gcloud_default_project()
 
     pdir = Path(src_dir).resolve()
@@ -1154,7 +1331,12 @@ def run_pipeline(src_dir: str | os.PathLike, target: str, cfg: Config | None = N
     try:
         if not cfg.skip_preflight:
             preflight(target, pdir, cfg, r)
-        {"local": deploy_local, "cloudrun": deploy_cloudrun, "node": deploy_node}[target](pdir, cfg, r, out)
+        {
+            "local": deploy_local,
+            "cloudrun": deploy_cloudrun,
+            "node": deploy_node,
+            "function": deploy_function,
+        }[target](pdir, cfg, r, out)
         out.ok = True
     except StepError as e:
         out.ok, out.stage, out.kind, out.error, out.app_logs, out.diagnosis = (
@@ -1207,7 +1389,7 @@ def _main(argv: list[str]) -> int:
         prog="python -m app.deployer", description="CloudMorph deployer (manual run)"
     )
     ap.add_argument("src_dir")
-    ap.add_argument("target", choices=["local", "cloudrun", "node"])
+    ap.add_argument("target", choices=["local", "cloudrun", "node", "function"])
     ap.add_argument("--dockerfile", help="Dockerfile to write into src_dir (default: reuse existing)")
     ap.add_argument("--service")
     ap.add_argument("--tag")

@@ -1,10 +1,10 @@
 import React from 'react';
-import { Cloud, Cpu, ExternalLink, Globe, Network, Server, Wrench } from 'lucide-react';
+import { Zap, Cloud, Cpu, ExternalLink, Globe, Network, Server, Wrench } from 'lucide-react';
 import { TARGET_META } from '../lib/run';
 import { Badge, Card, CopyButton, Dot } from './ui';
 import { TONE } from '../lib/style';
 
-const ICONS = { local: Server, cloudrun: Cloud, node: Network };
+const ICONS = { local: Server, cloudrun: Cloud, node: Network, function: Zap };
 
 export function AnalysisCard({ run }) {
   const a = run.analysis;
