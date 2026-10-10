@@ -382,3 +382,59 @@ def test_repo_edit_tool_refuses_paths_it_must_not_write(tmp_path, path):
     edit_file, originals = repo_edit_tool(tmp_path / "src")
     assert edit_file.invoke({"path": path, "old": "", "new": "x"}).startswith("cannot edit")
     assert originals == {} and not (tmp_path / "outside.py").exists()
+
+
+def _agent_fix(tmp_path):
+    (tmp_path / "app.py").write_text((SAMPLE_APPS / "broken-import" / "app.py").read_text())
+
+    def repair(src_dir, before, *_):
+        edit_file, originals = repo_edit_tool(Path(src_dir))
+        edit_file.invoke(
+            {"path": "app.py", "old": "import os\n", "new": "import os\nfrom flask import Flask\n"}
+        )
+        return RepoFix(before, "--- app.py\n", "Flask was not imported", tuple(originals))
+
+    return repair
+
+
+def test_confirm_stop_ends_before_redeploy_with_its_summary(tmp_path):
+    seen = []
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _forbidden("redeploy"),
+        repair_fn=_agent_fix(tmp_path),
+        confirm_fn=lambda src, fix: seen.append((src, fix.changed)) or "Stopped: PR is up",
+    )
+    assert seen == [(str(tmp_path), ("app.py",))]
+    assert not report.success and report.summary == "Stopped: PR is up"
+    assert report.attempts == 1 and "--- app.py" in report.records[0].diff  # the diff is still reported
+
+
+def test_confirm_continue_redeploys_the_edited_source(tmp_path):
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-import.local"),
+        _dockerfile("broken-import.local"),
+        _succeed("local"),
+        repair_fn=_agent_fix(tmp_path),
+        confirm_fn=lambda *_: None,
+    )
+    assert report.success and "from flask import Flask" in (tmp_path / "app.py").read_text()
+
+
+def test_rule_patches_never_ask(tmp_path):
+    failed = _failed("broken-port.local")
+    report = heal(
+        str(tmp_path),
+        "local",
+        failed,
+        _dockerfile("broken-port.local"),
+        _succeed("local"),
+        repair_fn=_forbidden("repo agent"),
+        confirm_fn=_forbidden("confirm"),
+    )
+    assert report.success

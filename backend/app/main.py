@@ -33,15 +33,18 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
+from queue import Empty, SimpleQueue
+from typing import Literal
 from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer, webhooks
+from app import analyzer, deployer, fixpr, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
@@ -118,6 +121,7 @@ class Job:
     targets: dict[str, dict] = field(default_factory=dict)
     error: str | None = None
     completed: bool = False
+    questions: dict[str, SimpleQueue[str]] = field(default_factory=dict)  # open question_id -> answer
 
 
 _jobs: dict[str, Job] = {}
@@ -385,11 +389,100 @@ def _remove_workspace(path: Path) -> None:
         _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
+ANSWER_TIMEOUT_S = 300  # no answer by then -> stop; the PR stays open
+
+
+class AnswerRequest(BaseModel):
+    """POST /deploy/{deployment_id}/answer body."""
+
+    question_id: str
+    choice: Literal["stop", "continue"]
+
+
+PR_MERGE_HINT = (
+    "Merge it, then deploy again (if the repo's GitHub webhook points here, the merge redeploys by itself)."
+)
+
+
+def source_fix_confirm(
+    job: Job, emit: Callable[[PipelineEvent], None], source: str, ref: str | None, trigger: str
+) -> healer.ConfirmFn:
+    """healer's confirm_fn for one job: open a PR with the source fix, then ask the user whether to stop
+    or deploy the edited copy now. Asked once per job; later targets reuse the answer.
+    A GitHub-push deployment has nobody watching, so it stops without asking."""
+    decided: dict = {}
+
+    def confirm(src_dir: str, fix: healer.RepoFix) -> str | None:
+        if not decided:
+            pr_url = pr_error = None
+            if source.startswith("https://"):
+                try:
+                    pr_url = fixpr.open_pr(
+                        source, ref, src_dir, list(fix.changed), fix.rationale, fix.source_diff
+                    )
+                except Exception as exc:  # no PR still leaves the question
+                    _logger.warning("could not open the fix PR", exc_info=True)
+                    pr_error = f"{type(exc).__name__}: {exc}"
+            question_id = uuid.uuid4().hex[:12]
+            answers: SimpleQueue[str] = SimpleQueue()
+            ask = trigger != "github-push"
+            if ask:
+                job.questions[question_id] = answers
+            emit(
+                PipelineEvent(
+                    type="log",
+                    stage="heal",
+                    payload={
+                        "kind": "question",
+                        "question_id": question_id,
+                        "ask": ask,
+                        "pr_url": pr_url,
+                        "pr_error": pr_error,
+                        "rationale": fix.rationale,
+                        "diff": fix.source_diff,
+                        "choices": ["stop", "continue"],
+                        "timeout_s": ANSWER_TIMEOUT_S,
+                    },
+                )
+            )
+            choice, reason = "stop", "github-push"
+            if ask:
+                try:
+                    choice, reason = answers.get(timeout=ANSWER_TIMEOUT_S), "user"
+                except Empty:
+                    reason = "timeout"
+                finally:
+                    job.questions.pop(question_id, None)
+            decided.update(choice=choice, pr_url=pr_url)
+            emit(
+                PipelineEvent(
+                    type="log",
+                    stage="heal",
+                    payload={
+                        "kind": "answer",
+                        "question_id": question_id,
+                        "choice": choice,
+                        "reason": reason,
+                    },
+                )
+            )
+        if decided["choice"] == "continue":
+            return None
+        if decided["pr_url"]:
+            return f"Stopped: the source fix is up as a PR ({decided['pr_url']}). {PR_MERGE_HINT}"
+        return (
+            "Stopped: the source fix was not deployed. Apply the diff to your repository, then deploy again."
+        )
+
+    return confirm
+
+
 def run_pipeline(
     source: str,
     target: DeployTarget,
     emit: Callable[[PipelineEvent], None],
     analysis: AnalysisResult | None = None,
+    confirm: healer.ConfirmFn | None = None,
 ) -> bool:
     """Run one target synchronously; healer owns all retry attempts."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
@@ -412,7 +505,9 @@ def run_pipeline(
             },
         )
     )
-    report = healer.heal(source, target, result, analysis.dockerfile, deployer.deploy, emit=emit)
+    report = healer.heal(
+        source, target, result, analysis.dockerfile, deployer.deploy, emit=emit, confirm_fn=confirm
+    )
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
     return report.success
@@ -611,11 +706,12 @@ def create_app() -> FastAPI:
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
                 # the default name is per-deployment unique. Local state is retained for container/tunnel cleanup.
                 work_root = Path(tempfile.mkdtemp(prefix="cloudmorph-deploy-"))
+                confirm = source_fix_confirm(job, emit, source, ref, trigger)
                 for target in targets:
                     target_dir = work_root / f"{app_name}-{target}"
                     try:
                         target_dir = Path(_copy_for_target(source_dir, target_dir))
-                        run_pipeline(target_dir, target, emit, analysis=analysis)
+                        run_pipeline(target_dir, target, emit, analysis=analysis, confirm=confirm)
                     except Exception as exc:  # noqa: BLE001 — isolate target failures
                         emit(
                             PipelineEvent(
@@ -715,6 +811,18 @@ def create_app() -> FastAPI:
             "error": job.error,
             "completed": job.completed,
         }
+
+    @app.post("/deploy/{deployment_id}/answer")
+    async def answer(deployment_id: str, req: AnswerRequest) -> dict[str, str]:
+        """Answer a healer question (see source_fix_confirm): stop here, or continue with the edited source."""
+        job = _jobs.get(deployment_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deployment_id")
+        answers = job.questions.pop(req.question_id, None)
+        if answers is None:
+            raise HTTPException(status_code=409, detail="question is not open (answered or timed out)")
+        answers.put(req.choice)
+        return {"choice": req.choice}
 
     @app.get("/deploy/{deployment_id}/events")
     async def events(deployment_id: str) -> EventSourceResponse:

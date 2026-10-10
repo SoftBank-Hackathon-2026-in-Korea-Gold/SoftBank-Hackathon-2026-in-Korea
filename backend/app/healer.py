@@ -54,6 +54,7 @@ SourceSuggestFn = Callable[[str, str, str], "str | None"]  # (path, source, trac
 RepairFn = Callable[
     [str, str, str, ErrorCategory], "RepoFix | None"
 ]  # (src_dir, dockerfile, error_log, category) -> fix; may edit files under src_dir
+ConfirmFn = Callable[[str, "RepoFix"], "str | None"]  # (src_dir, fix) -> None = redeploy, str = stop summary
 
 DEFAULT_PORT = 8080  # Cloud Run injects PORT=8080 by default
 
@@ -485,6 +486,7 @@ class RepoFix(NamedTuple):
     dockerfile: str
     source_diff: str  # unified diff of files the agent edited ("" if none)
     rationale: str
+    changed: tuple[str, ...] = ()  # paths (relative to src_dir) of the files behind source_diff
 
 
 class _RepairAnswer(BaseModel):
@@ -574,7 +576,7 @@ def default_repo_repair(
         )
         for path, before in originals.items()
     )
-    return RepoFix(answer.dockerfile.strip() + "\n", source_diff, answer.rationale)
+    return RepoFix(answer.dockerfile.strip() + "\n", source_diff, answer.rationale, tuple(originals))
 
 
 # --------------------------------------------------------------------------- #
@@ -596,6 +598,7 @@ def build_graph(
     llm_patch_fn: LlmPatchFn | None = None,
     emit: EmitFn | None = None,
     repair_fn: RepairFn | None = None,
+    confirm_fn: ConfirmFn | None = None,
 ):
     llm_patch = llm_patch_fn or default_llm_patch
 
@@ -620,6 +623,7 @@ def build_graph(
         result = rule(before, error_log) if rule else None
         source = "rule"
         source_diff = ""
+        fix = None
         if result is None and repair_fn:
             fix = repair_fn(state["src_dir"], before, error_log, category)
             if fix and (fix.dockerfile != before or fix.source_diff):
@@ -645,12 +649,14 @@ def build_graph(
             source=source,
         )
         _emit(PipelineEvent(type="heal_diff", stage="heal", payload=record.model_dump(mode="json")))
+        # A source edit goes out only after confirm_fn (main.py: PR + ask the user) says so.
+        stop = confirm_fn(state["src_dir"], fix) if (confirm_fn and source_diff) else None
         return {
             "current_dockerfile": after,
             "diff": diff,
             "history": [*state.get("history", []), record],
             "retry_count": attempt,
-            "status": "healing",
+            "status": "gave_up" if stop else "healing",
         }
 
     def redeploy(state: HealState) -> HealState:
@@ -754,17 +760,27 @@ def heal(
     emit: EmitFn | None = None,
     suggest_fn: SourceSuggestFn | None = None,
     repair_fn: RepairFn | None = None,
+    confirm_fn: ConfirmFn | None = None,
 ) -> HealReport:
     """Entry point for main.py: call after the first deploy failed.
 
     Policy: with the repo agent (default when ANTHROPIC_API_KEY is set and no `llm_patch_fn` is
-    injected) the Dockerfile and the source in `src_dir` are both patched. Without it only the
+    injected) the Dockerfile and the source in `src_dir` are both patched; a source edit is
+    redeployed only if `confirm_fn` (when given) does not stop it. Without the agent only the
     Dockerfile is patched; a crash in the app's own code stops at once, and for import-time crashes
     a source fix is suggested as a diff in the summary, never applied.
     """
     if repair_fn is None and llm_patch_fn is None and os.environ.get("ANTHROPIC_API_KEY"):
         repair_fn = default_repo_repair
-    app = build_graph(deploy_fn, llm_patch_fn, emit, repair_fn)
+    stopped: list[str] = []
+
+    def confirm(src: str, fix: RepoFix) -> str | None:
+        stop = confirm_fn(src, fix)
+        if stop:
+            stopped.append(stop)
+        return stop
+
+    app = build_graph(deploy_fn, llm_patch_fn, emit, repair_fn, confirm if confirm_fn else None)
     initial: HealState = {
         "src_dir": src_dir,
         "target": target,
@@ -784,6 +800,8 @@ def heal(
     app_error = None if (success or blocked or repair_fn) else _stops_on_app_code(error_log)
     if success:
         summary = f"Healed after {len(records)} patch(es): " + "; ".join(r.rationale for r in records)
+    elif stopped:
+        summary = stopped[-1]
     elif app_error:
         suggestion = None
         # Import-time crash = a code bug worth a fix suggestion; a request-time 5xx may be runtime state.

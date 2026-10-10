@@ -159,7 +159,7 @@ def test_project_status_is_persisted_when_the_job_finishes(monkeypatch, tmp_path
     )
     monkeypatch.setattr(main, "_copy_for_target", lambda src, dst: str(dst))
 
-    def fake_pipeline(target_dir, target, emit, analysis=None):
+    def fake_pipeline(target_dir, target, emit, analysis=None, confirm=None):
         emit(main.PipelineEvent(type="done", payload={"target": target, "url": "http://x"}))
         return True
 
@@ -206,7 +206,7 @@ def test_deployments_of_the_same_app_are_serialised(monkeypatch, tmp_path):
     monkeypatch.setattr(main, "_copy_for_target", lambda src, dst: str(dst))
     active, peak, lock = [0], [0], threading.Lock()
 
-    def slow_pipeline(target_dir, target, emit, analysis=None):
+    def slow_pipeline(target_dir, target, emit, analysis=None, confirm=None):
         with lock:
             active[0] += 1
             peak[0] = max(peak[0], active[0])
