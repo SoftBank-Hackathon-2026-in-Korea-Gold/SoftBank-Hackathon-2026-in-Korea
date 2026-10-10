@@ -79,6 +79,57 @@ def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
     )  # db did not exist -> created
 
 
+def test_cloudsql_keeps_the_password_the_serving_revision_uses(monkeypatch):
+    """Regression: every deploy reset the password before the candidate passed verify, so the revision
+    still serving traffic (and any rollback target) lost its database connection."""
+
+    class R:
+        def __init__(self):
+            self.steps = []
+
+        def run(self, name, cmd, **kw):
+            class CP:
+                returncode = 0
+                stdout = {
+                    "cloudsql instance": "RUNNABLE p:r:inst\n",
+                    "cloudsql databases": "my_app\n",
+                    "cloudsql users": "my_app\n",
+                }.get(name, "")
+                stderr = ""
+
+            return CP()
+
+    direct: list[list[str]] = []
+    monkeypatch.setattr(
+        deployer.subprocess,
+        "run",
+        lambda cmd, **k: (
+            direct.append(cmd) or type("CP", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+        ),
+    )
+    serving = "postgresql://my_app:oldpw@/my_app?host=/cloudsql/p:r:inst"
+    assert deployer.ensure_cloudsql_database("My App", Config(project="p"), R(), serving) == (
+        "p:r:inst",
+        serving,
+    )
+    assert not direct  # no set-password
+
+    # a URL for another database/instance is not reused
+    _, url = deployer.ensure_cloudsql_database(
+        "My App", Config(project="p"), R(), "postgresql://my_app:x@/my_app?host=/cloudsql/p:r:other"
+    )
+    assert "x@" not in url and direct[0][:4] == ["gcloud", "sql", "users", "set-password"]
+
+
+def test_revision_env_reads_database_url_without_runner(monkeypatch):
+    out = '{"spec": {"containers": [{"env": [{"name": "A", "value": "1"}, {"name": "DATABASE_URL", "value": "u"}]}]}}'
+    monkeypatch.setattr(
+        deployer.subprocess, "run", lambda cmd, **k: type("CP", (), {"returncode": 0, "stdout": out})()
+    )
+    assert deployer._revision_env("svc-00002-abc", "DATABASE_URL", Config(project="p")) == "u"
+    assert deployer._revision_env("svc-00002-abc", "MISSING", Config(project="p")) is None
+
+
 def test_stateful_apps_never_scale_out(monkeypatch, tmp_path):
     monkeypatch.setattr(fleet, "STATE_FILE", tmp_path / "fleet.json")
     from app import nodes

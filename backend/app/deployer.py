@@ -498,8 +498,11 @@ def ensure_local_postgres(app: str, r: Runner) -> str:
     raise StepError("deploy", "deploy_error", f"postgres sidecar {db} did not become ready")
 
 
-def ensure_cloudsql_database(app: str, cfg: Config, r: Runner) -> tuple[str, str]:
-    """Per-app database + user on the shared Cloud SQL instance. Returns (connection_name, DATABASE_URL)."""
+def ensure_cloudsql_database(
+    app: str, cfg: Config, r: Runner, serving_url: str | None = None
+) -> tuple[str, str]:
+    """Per-app database + user on the shared Cloud SQL instance. Returns (connection_name, DATABASE_URL).
+    `serving_url`: DATABASE_URL of the revision serving traffic; reused so its password stays valid."""
     inst, proj = cfg.cloudsql_instance, str(cfg.project)
     cp = r.run(
         "cloudsql instance",
@@ -556,7 +559,17 @@ def ensure_cloudsql_database(app: str, cfg: Config, r: Runner) -> tuple[str, str
         ["gcloud", "sql", "users", "list", "--instance", inst, "--project", proj, "--format=value(name)"],
         stage="deploy",
     )
-    verb = "set-password" if user in users.stdout.split() else "create"
+    exists = user in users.stdout.split()
+    # Resetting the password would cut off the live revision (and any rollback to it) before the
+    # candidate has passed verify, so keep the one it already uses.
+    if (
+        exists
+        and serving_url
+        and serving_url.startswith(f"postgresql://{user}:")
+        and serving_url.endswith(f"@/{dbname}?host=/cloudsql/{conn}")
+    ):
+        return conn, serving_url
+    verb = "set-password" if exists else "create"
     cp = subprocess.run(
         [
             "gcloud",
@@ -827,6 +840,27 @@ def latest_revision(service: str, cfg: Config) -> str | None:
     return cp.stdout.strip() or None
 
 
+def _revision_env(revision: str, key: str, cfg: Config) -> str | None:
+    """Env var `key` of a Cloud Run revision. Not via Runner: the value may hold a password."""
+    cp = subprocess.run(
+        _gcr(cfg, "revisions", "describe", revision, "--format=json"),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if cp.returncode != 0:
+        return None
+    try:
+        containers = json.loads(cp.stdout).get("spec", {}).get("containers", [])
+    except ValueError:
+        return None
+    for container in containers:
+        for e in container.get("env", []):
+            if e.get("name") == key:
+                return e.get("value")
+    return None
+
+
 def cloudrun_logs(service: str, revision: str | None, cfg: Config, r: Runner) -> str:
     flt = f'resource.type="cloud_run_revision" AND resource.labels.service_name="{service}"'
     if revision:
@@ -908,7 +942,8 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     )
     env = dict(cfg.env)
     if wants_database(src_dir, cfg) == "postgres":
-        conn, db_url = ensure_cloudsql_database(name, cfg, r)
+        serving_url = _revision_env(prev, "DATABASE_URL", cfg) if prev else None
+        conn, db_url = ensure_cloudsql_database(name, cfg, r, serving_url)
         env.setdefault("DATABASE_URL", db_url)
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
