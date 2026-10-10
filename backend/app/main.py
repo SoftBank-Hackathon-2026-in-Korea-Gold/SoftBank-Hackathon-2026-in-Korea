@@ -636,7 +636,7 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis))
+                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis, source_dir))
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -660,7 +660,7 @@ def create_app() -> FastAPI:
                 if "local" not in targets:
                     _remove_workspace(work_root)
 
-        def _resolve_env(analysis: AnalysisResult) -> dict[str, str]:
+        def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
             """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
             A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
             so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same."""
@@ -685,7 +685,7 @@ def create_app() -> FastAPI:
                     )
                 )
                 return values
-            values |= _ask_env(missing)
+            values |= _ask_env(missing, source_dir)
             for e in missing:
                 if e.scope == "runtime" and e.generate and not values.get(e.name):
                     values[e.name] = secrets.token_urlsafe(32)
@@ -697,16 +697,21 @@ def create_app() -> FastAPI:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
             return values
 
-        def _ask_env(items: list[EnvRequirement]) -> dict[str, str]:
-            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values."""
-            job.required_env = items
+        def _ask_env(items: list[EnvRequirement], source_dir: str) -> dict[str, str]:
+            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
+            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
+            job.required_env = [
+                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
+                for e in items
+            ]
             job.state = "waiting_input"
             emit(
                 PipelineEvent(
                     type="input_required",
                     stage="analyze",
                     payload={
-                        "items": [e.model_dump() for e in items],
+                        "items": [e.model_dump() for e in job.required_env],
                         "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
                     },
                 )

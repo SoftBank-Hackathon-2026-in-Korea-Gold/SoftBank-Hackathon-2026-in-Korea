@@ -935,3 +935,34 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
 
     assert asyncio.run(scenario())["status"] == "completed"
     assert calls == [{}]
+
+
+def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, lambda *a, **k: None)
+    (source / "app.py").write_text('import os\nDB = os.environ["DATABASE_URL"]\n')
+    required = [
+        EnvRequirement(name="DATABASE_URL", scope="runtime", secret=True, resource="postgres"),
+        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis"),
+    ]
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local", language="python", dockerfile="FROM scratch\n", required_env=required
+        ),
+    )
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        async for event in response.body_iterator:
+            if event["event"] == "input_required":
+                job.env_ready.set()  # let the worker finish
+                return json.loads(event["data"])["payload"]["items"]
+
+    items = asyncio.run(scenario())
+    # only Postgres is provisioned when left blank; Redis is not, so the card must not promise it
+    assert [(i["name"], i["auto"]) for i in items] == [("DATABASE_URL", True), ("REDIS_URL", False)]

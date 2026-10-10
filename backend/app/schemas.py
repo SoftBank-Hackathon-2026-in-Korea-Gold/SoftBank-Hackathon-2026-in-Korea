@@ -40,7 +40,13 @@ class EnvRequirement(BaseModel):
     )
     secret: bool = Field(description="Token/password. Never echoed in events or logs")
     generate: bool = Field(default=False, description="Runtime secret that may be random: blank -> generated")
-    reason: str = Field(default="", description="What the value is for (build inputs only)")
+    reason: str = Field(default="", description="What the value is for")
+    resource: str | None = Field(
+        default=None,
+        description="postgres|mysql|redis|s3 when this is a connection setting of an external store "
+        "(the user may point it at their own server)",
+    )
+    auto: bool = Field(default=False, description="Left blank, the deployer provisions it (set by main.py)")
     evidence: list[str] = Field(default_factory=list, description="'path:line' where the code reads it")
 
 

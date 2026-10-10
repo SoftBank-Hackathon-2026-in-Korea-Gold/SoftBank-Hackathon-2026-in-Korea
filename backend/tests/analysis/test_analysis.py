@@ -310,10 +310,13 @@ def test_required_env_lists_build_inputs_and_runtime_values(flask_app):
     assert [(e.scope, e.name, e.secret, e.generate) for e in r.required_env] == [
         ("build", "GITHUB_TOKEN", True, False),
         ("build", "GITHUB_USERNAME", False, False),
-        ("runtime", "SECRET_KEY", True, True),  # DATABASE_URL은 외부 저장소 접속 정보라 deployer가 맡는다
+        # 외부 저장소 접속 정보도 묻는다 (사용자가 자기 DB를 쓸 수 있다). 비우면 어떻게 할지는 main·deployer가 정한다
+        ("runtime", "DATABASE_URL", True, False),
+        ("runtime", "SECRET_KEY", True, True),
     ]
+    assert r.required_env[2].resource == "postgres" and r.required_env[2].reason == "postgres 접속 정보 (url)"
     assert r.required_env[0].evidence == ["build.gradle:3"]
-    assert r.required_env[2].evidence == ["settings.py:3"]
+    assert r.required_env[3].evidence == ["settings.py:3"]
     assert (
         "빌드할 때 넣어야 하는 값: GITHUB_TOKEN (GitHub Packages 의존성 받기), "
         "GITHUB_USERNAME (GitHub Packages 사용자)" in r.notes

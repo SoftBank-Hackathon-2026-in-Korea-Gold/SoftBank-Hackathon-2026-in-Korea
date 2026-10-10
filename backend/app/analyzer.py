@@ -92,13 +92,36 @@ def analyze_with(src_dir: str, inspect, write) -> AnalysisResult:
     )
 
 
+# 외부 저장소 접속 정보 중 비밀값인 역할 (URL에는 비밀번호가 들어가곤 한다)
+SECRET_ROLES = {"url", "password", "access_key", "secret_key"}
+
+
 def _required_env(reports: dict) -> list[EnvRequirement]:
-    """사용자에게 받아야 하는 값: 빌드 입력 전부와, 실행에 꼭 필요한 환경변수 (PORT와 외부 저장소 접속 정보는 뺀다)."""
+    """사용자에게 물을 값: 빌드 입력 전부, 외부 저장소 접속 정보 전부 (사용자가 자기 서버를 쓸 수 있다),
+    실행에 꼭 필요한 나머지 환경변수. PORT는 뺀다. 비워 두면 무엇을 할지는 main.py·deployer가 정한다."""
 
     def items(name):
         return (reports[name] or {}).get("items", [])
 
-    used = {"PORT"} | {n for r in items("resources") for n in r["env"].values()}
+    env = {e["name"]: e for e in items("env")}
+
+    def evidence(name):
+        return [h["evidence"] for h in env.get(name, {}).get("hits", [])]
+
+    stores = {
+        name: EnvRequirement(
+            name=name,
+            scope="runtime",
+            secret=role in SECRET_ROLES,
+            reason=f"{r['kind']} 접속 정보 ({role})",
+            resource=r["kind"],
+            evidence=evidence(name),
+        )
+        for r in items("resources")
+        for role, name in r["env"].items()
+        if name != "PORT"
+    }
+    used = {"PORT", *stores}
     build = [
         EnvRequirement(
             name=e["name"],
@@ -120,7 +143,7 @@ def _required_env(reports: dict) -> list[EnvRequirement]:
         for e in items("env")
         if e["required"] and e["name"] not in used
     ]
-    return build + runtime
+    return build + list(stores.values()) + runtime
 
 
 def _signals(reports: dict) -> tuple[dict, list[str]]:
