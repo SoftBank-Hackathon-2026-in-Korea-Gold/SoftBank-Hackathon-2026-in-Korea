@@ -3,7 +3,11 @@
 The user types an API key once. Redeploys and GitHub-push deploys read it back instead of asking again
 (or shipping without it), and generated secrets (SECRET_KEY ...) stay the same from one deploy to the next.
 
-    one secret per app: cloudmorph-env-<app>, payload = JSON {NAME: value}, each change = a new version
+    one secret per app and source: cloudmorph-env-<app>-<hash of source>, payload = JSON {NAME: value},
+    each change = a new version
+
+The source is part of the key so that another repo deployed under the same name starts empty instead of
+receiving this app's keys (names are free-form and two repos can share a short name).
 
 Env:
     GCP_PROJECT_ID   project that holds the secrets (unset -> nothing is stored; values last one deploy)
@@ -13,6 +17,7 @@ Values only travel through gcloud's stdin/stdout, never on a command line or int
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -29,8 +34,10 @@ def enabled() -> bool:
     return bool(os.getenv("GCP_PROJECT_ID"))
 
 
-def secret_id(app: str) -> str:
-    return PREFIX + (re.sub(r"[^a-zA-Z0-9_-]", "-", app)[:200] or "app")
+def secret_id(app: str, owner: str) -> str:
+    """`owner` identifies the source the values belong to (see main._source_identity)."""
+    digest = hashlib.sha256(owner.encode()).hexdigest()[:12]
+    return PREFIX + (re.sub(r"[^a-zA-Z0-9_-]", "-", app)[:200] or "app") + "-" + digest
 
 
 def _gcloud(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess:
@@ -49,11 +56,11 @@ def _exists(sid: str) -> bool:
     return any(line.rsplit("/", 1)[-1] == sid for line in cp.stdout.split())
 
 
-def load(app: str) -> dict[str, str]:
-    """Values saved for `app`; {} on the first deploy or when GCP_PROJECT_ID is unset."""
+def load(app: str, owner: str) -> dict[str, str]:
+    """Values saved for `app` deployed from `owner`; {} on the first deploy or when GCP_PROJECT_ID is unset."""
     if not enabled():
         return {}
-    sid = secret_id(app)
+    sid = secret_id(app, owner)
     if not _exists(sid):
         return {}
     cp = _gcloud("versions", "access", "latest", f"--secret={sid}")
@@ -68,11 +75,11 @@ def load(app: str) -> dict[str, str]:
     return {str(k): str(v) for k, v in values.items()}
 
 
-def save(app: str, values: dict[str, str]) -> None:
-    """Store `values` as the latest version for `app` (creates the secret on first use)."""
+def save(app: str, owner: str, values: dict[str, str]) -> None:
+    """Store `values` as the latest version for `app` deployed from `owner` (creates the secret on first use)."""
     if not enabled():
         return
-    sid = secret_id(app)
+    sid = secret_id(app, owner)
     payload = json.dumps(values, sort_keys=True)
     if _exists(sid):
         cp = _gcloud("versions", "add", sid, "--data-file=-", stdin=payload)

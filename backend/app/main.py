@@ -315,6 +315,20 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
         os.close(root_fd)
 
 
+def _source_identity(source: str) -> str:
+    """Stable id of where an app's code comes from, so saved env values only go back to the same source.
+    Spellings of one repo agree ('https://GitHub.com/Octo/App.git/' == 'https://github.com/octo/app');
+    the branch is left out so every branch of a repo shares its values."""
+    if source.startswith("https://"):
+        parsed = urlparse(source)
+        path = parsed.path.strip("/").removesuffix(".git").lower()
+        return f"git:{(parsed.hostname or '').lower()}/{path}"
+    path = Path(source).expanduser()
+    if not path.is_absolute() and not path.exists() and (REPO_ROOT / source).exists():
+        path = REPO_ROOT / source  # same preset rule as prepare_source
+    return f"path:{path.resolve()}"
+
+
 @contextmanager
 def prepare_source(source: str, ref: str | None = None) -> Iterator[str]:
     """Prepare a local directory, local ZIP, or allowlisted public Git URL.
@@ -663,10 +677,12 @@ def create_app() -> FastAPI:
         def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
             """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
             A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
-            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same."""
+            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are kept per
+            name *and* source: another repo deployed under the same name is asked afresh, never handed these."""
             if not analysis.required_env:
                 return {}
-            values = env_store.load(app_name) if name else {}
+            owner = _source_identity(source)
+            values = env_store.load(app_name, owner) if name else {}
             saved = dict(values)
             if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
                 emit(
@@ -691,7 +707,7 @@ def create_app() -> FastAPI:
                     values[e.name] = secrets.token_urlsafe(32)
             if name and values != saved:
                 try:
-                    env_store.save(app_name, values)
+                    env_store.save(app_name, owner, values)
                 except env_store.EnvStoreError as exc:
                     line = f"env: 값을 저장하지 못해 다음 배포에서 다시 묻습니다 ({exc})"
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))

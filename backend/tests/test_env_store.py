@@ -8,6 +8,8 @@ import pytest
 
 from app import env_store
 
+GB = "git:github.com/octo/guestbook"
+
 
 class FakeGcloud:
     """Just enough of `gcloud secrets` to round-trip values; records every call."""
@@ -38,10 +40,10 @@ def test_round_trip_creates_once_then_adds_versions(monkeypatch):
     gc = FakeGcloud()
     monkeypatch.setattr(env_store.subprocess, "run", gc)
 
-    assert env_store.load("guestbook") == {}
-    env_store.save("guestbook", {"OPENAI_API_KEY": "sk-1"})
-    env_store.save("guestbook", {"OPENAI_API_KEY": "sk-1", "SECRET_KEY": "s"})
-    assert env_store.load("guestbook") == {"OPENAI_API_KEY": "sk-1", "SECRET_KEY": "s"}
+    assert env_store.load("guestbook", GB) == {}
+    env_store.save("guestbook", GB, {"OPENAI_API_KEY": "sk-1"})
+    env_store.save("guestbook", GB, {"OPENAI_API_KEY": "sk-1", "SECRET_KEY": "s"})
+    assert env_store.load("guestbook", GB) == {"OPENAI_API_KEY": "sk-1", "SECRET_KEY": "s"}
 
     verbs = [c[2] if c[2] != "versions" else f"versions {c[3]}" for c, _ in gc.calls]
     assert verbs.count("create") == 1 and verbs.count("versions add") == 1
@@ -51,16 +53,16 @@ def test_round_trip_creates_once_then_adds_versions(monkeypatch):
 
 def test_prefix_match_is_not_mistaken_for_the_app(monkeypatch):
     monkeypatch.setenv("GCP_PROJECT_ID", "p")
-    gc = FakeGcloud({"cloudmorph-env-guestbook-v2": json.dumps({"A": "1"})})
+    gc = FakeGcloud({env_store.secret_id("guestbook-v2", GB): json.dumps({"A": "1"})})
     monkeypatch.setattr(env_store.subprocess, "run", gc)
-    assert env_store.load("guestbook") == {}
+    assert env_store.load("guestbook", GB) == {}
 
 
 def test_unset_project_stores_nothing(monkeypatch):
     monkeypatch.delenv("GCP_PROJECT_ID", raising=False)
     monkeypatch.setattr(env_store.subprocess, "run", lambda *a, **k: pytest.fail("gcloud called"))
-    assert env_store.load("guestbook") == {}
-    env_store.save("guestbook", {"A": "1"})
+    assert env_store.load("guestbook", GB) == {}
+    env_store.save("guestbook", GB, {"A": "1"})
 
 
 def test_lookup_errors_raise_instead_of_looking_like_a_first_deploy(monkeypatch):
@@ -68,4 +70,14 @@ def test_lookup_errors_raise_instead_of_looking_like_a_first_deploy(monkeypatch)
     monkeypatch.setenv("GCP_PROJECT_ID", "p")
     monkeypatch.setattr(env_store.subprocess, "run", FakeGcloud(fail="list"))
     with pytest.raises(env_store.EnvStoreError):
-        env_store.load("guestbook")
+        env_store.load("guestbook", GB)
+
+
+def test_same_name_from_another_source_starts_empty(monkeypatch):
+    # a different repo deployed under the same name must not receive this app's keys
+    monkeypatch.setenv("GCP_PROJECT_ID", "p")
+    monkeypatch.setattr(env_store.subprocess, "run", FakeGcloud())
+    env_store.save("guestbook", GB, {"OPENAI_API_KEY": "sk-1"})
+    assert env_store.load("guestbook", "git:github.com/mallory/guestbook") == {}
+    assert env_store.load("guestbook", GB) == {"OPENAI_API_KEY": "sk-1"}
+    assert env_store.secret_id("guestbook", GB).startswith(env_store.PREFIX + "guestbook-")
