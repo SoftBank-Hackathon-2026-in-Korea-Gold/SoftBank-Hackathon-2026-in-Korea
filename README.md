@@ -49,7 +49,7 @@ uv run uvicorn app.main:app --reload
 ## Demo runbook (발표 노트북에서 띄우고 터널로 공개)
 
 ```bash
-cp .env.example .env            # GCP_PROJECT_ID, OPENAI_API_KEY 채우기 (최초 1회)
+cp .env.example .env            # GCP_PROJECT_ID, ANTHROPIC_API_KEY 채우기 (최초 1회, analyzer는 이 키가 없으면 분석하지 않음)
 scripts/demo-up.sh              # 백엔드 :8000 + 대시보드 :5173 (대시보드가 /deploy, /health 를 백엔드로 프록시)
 scripts/demo-up.sh --public     # + Cloudflare quick tunnel 1개로 대시보드·API 공개, API 토큰 자동 생성
 scripts/demo-down.sh            # 전부 종료 (deployer가 띄운 로컬 컨테이너·터널 포함)
