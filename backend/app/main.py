@@ -638,7 +638,9 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = _env_overrides(analysis.required_env, _ask_env(analysis)) if ask_env else {}
+                overrides = (
+                    _env_overrides(analysis.required_env, _ask_env(analysis, source_dir)) if ask_env else {}
+                )
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -662,18 +664,23 @@ def create_app() -> FastAPI:
                 if "local" not in targets:
                     _remove_workspace(work_root)
 
-        def _ask_env(analysis: AnalysisResult) -> dict[str, str]:
-            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values."""
+        def _ask_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
+            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
             if not analysis.required_env:
                 return {}
-            job.required_env = analysis.required_env
+            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
+            job.required_env = [
+                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
+                for e in analysis.required_env
+            ]
             job.state = "waiting_input"
             emit(
                 PipelineEvent(
                     type="input_required",
                     stage="analyze",
                     payload={
-                        "items": [e.model_dump() for e in analysis.required_env],
+                        "items": [e.model_dump() for e in job.required_env],
                         "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
                     },
                 )

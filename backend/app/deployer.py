@@ -746,8 +746,8 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.stage = "deploy"
         r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
         env = dict(cfg.env)
-        if wants_database(src_dir, cfg) == "postgres":
-            env.setdefault("DATABASE_URL", ensure_local_postgres(name, r))
+        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+            env["DATABASE_URL"] = ensure_local_postgres(name, r)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         run_cmd = [
             "docker",
@@ -939,9 +939,9 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
     )
     env = dict(cfg.env)
-    if wants_database(src_dir, cfg) == "postgres":
+    if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
         conn, db_url = ensure_cloudsql_database(name, cfg, r)
-        env.setdefault("DATABASE_URL", db_url)
+        env["DATABASE_URL"] = db_url
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
     if env:
@@ -1096,8 +1096,8 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     t0 = time.time()
     try:
         env = dict(cfg.env)
-        if wants_database(src_dir, cfg) == "postgres":
-            env.setdefault("DATABASE_URL", nodepool.ensure_postgres(node, name))
+        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+            env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         host_port = nodepool.free_port_on(node)
         cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, env)

@@ -158,3 +158,24 @@ def test_local_broken_sample_reports_missing_dependency():
         assert classify_error(res.stderr) == ErrorCategory.MISSING_DEPENDENCY
     finally:
         deployer.cleanup(str(SAMPLE_APPS / "broken"))
+
+
+@pytest.mark.parametrize(
+    "given, provisioned", [({}, True), ({"DATABASE_URL": "postgresql://my-own-db/app"}, False)]
+)
+def test_users_own_database_url_skips_provisioning(tmp_path, monkeypatch, given, provisioned):
+    (tmp_path / "app.py").write_text('import os\nDB = os.environ["DATABASE_URL"]\n')
+    runs = _record_runs(monkeypatch)
+    made = []
+    monkeypatch.setattr(
+        deployer, "ensure_local_postgres", lambda app, r: made.append(app) or "postgresql://sidecar/app"
+    )
+    monkeypatch.setattr(deployer, "build_image", lambda *args: None)
+    monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])
+    monkeypatch.setattr(deployer, "wait_up", lambda *args, **kw: (True, ""))
+    cfg = deployer.Config(tunnel=False, env=dict(given))
+    deployer.deploy_local(tmp_path, cfg, deployer.Runner(), deployer.Outcome(target="local"))
+    run_cmd = next(cmd for cmd, _ in runs if cmd[:2] == ["docker", "run"])
+    expected = "postgresql://sidecar/app" if provisioned else given["DATABASE_URL"]
+    assert f"DATABASE_URL={expected}" in run_cmd
+    assert bool(made) is provisioned
