@@ -60,11 +60,21 @@ export function instanceCapacity(count) {
 
 const CAMERA_BASE = 4
 const CAMERA_PER_SQRT = 1.6
+export const FLEET_CAMERA_FOV = 45
+export const RACK_SIZE = [0.8, 1.2, 0.8]
 
-// Distance that keeps a sqrt(count)-wide grid in frame.
-export function cameraDistance(count, spacing = 1) {
-  const n = Math.max(1, toNumber(count, 1))
-  return CAMERA_BASE + CAMERA_PER_SQRT * Math.sqrt(n) * spacing
+// Fit a sphere around the racks using the narrower field of view. The sphere also fits while orbiting.
+export function cameraDistance(count, spacing = 1, aspect = 1) {
+  const n = Math.max(1, Math.floor(toNumber(count, 1)))
+  const cols = Math.ceil(Math.sqrt(n))
+  const rows = Math.ceil(n / cols)
+  const halfWidth = ((cols - 1) * spacing + RACK_SIZE[0]) / 2
+  const halfDepth = ((rows - 1) * spacing + RACK_SIZE[2]) / 2
+  const radius = Math.hypot(halfWidth, halfDepth, RACK_SIZE[1] * 1.1)
+  const halfV = (FLEET_CAMERA_FOV * Math.PI) / 360
+  const safeAspect = toNumber(aspect, 1) > 0 ? toNumber(aspect, 1) : 1
+  const halfFov = Math.min(halfV, Math.atan(Math.tan(halfV) * safeAspect))
+  return Math.max(CAMERA_BASE + CAMERA_PER_SQRT * Math.sqrt(n) * spacing, radius / Math.sin(halfFov) * 1.1)
 }
 
 // Per-instance pulse at time t (seconds). Returns a vertical scale factor and a signed colour mix:

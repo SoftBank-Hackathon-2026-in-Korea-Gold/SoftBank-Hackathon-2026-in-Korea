@@ -8,8 +8,8 @@ const healedTargets = (run) => Object.values(run.targetState || {}).filter((s) =
  * True when a finished deployment succeeded only because the healer patched it, and the user has not
  * dismissed the celebration for this run yet.
  */
-export function shouldCelebrate(run, dismissedId) {
-  if (!run?.id || run.id === dismissedId) return false
+export function shouldCelebrate(run, dismissedIds) {
+  if (!run?.id || dismissedIds?.has(run.id)) return false
   // Re-attaching to (replaying) an already finished, healed deployment also passes this check.
   if (run.status !== 'completed') return false
   return (run.patches?.length ?? 0) > 0 || healedTargets(run).length > 0

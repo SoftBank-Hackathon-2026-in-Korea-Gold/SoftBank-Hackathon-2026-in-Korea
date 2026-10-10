@@ -17,7 +17,7 @@ const patch = (attempt, category) => ({ attempt, category, source: 'rule', ratio
 describe('shouldCelebrate', () => {
   it('returns false for a null or undefined run', () => {
     expect(shouldCelebrate(null, null)).toBe(false)
-    expect(shouldCelebrate(undefined, 'x')).toBe(false)
+    expect(shouldCelebrate(undefined, new Set(['x']))).toBe(false)
   })
 
   it('returns false for an idle run without an id', () => {
@@ -76,13 +76,22 @@ describe('shouldCelebrate', () => {
   it('returns false when the run id matches the dismissed id', () => {
     const run = makeRun({ patches: [patch(1, 'port')] })
 
-    expect(shouldCelebrate(run, 'abc123')).toBe(false)
+    expect(shouldCelebrate(run, new Set(['abc123']))).toBe(false)
   })
 
   it('returns true when a different run was dismissed earlier', () => {
     const run = makeRun({ patches: [patch(1, 'port')] })
 
-    expect(shouldCelebrate(run, 'older-run')).toBe(true)
+    expect(shouldCelebrate(run, new Set(['older-run']))).toBe(true)
+  })
+
+  it('keeps earlier runs dismissed after another celebration closes', () => {
+    const first = makeRun({ patches: [patch(1, 'port')] })
+    const second = makeRun({ id: 'second', patches: [patch(1, 'deps')] })
+    const dismissed = new Set([first.id, second.id])
+    expect(shouldCelebrate(first, dismissed)).toBe(false)
+    expect(shouldCelebrate(second, dismissed)).toBe(false)
+    expect(shouldCelebrate({ ...first, id: 'third' }, dismissed)).toBe(true)
   })
 
   it('tolerates a run missing patches and targetState', () => {

@@ -21,6 +21,7 @@
 - `run`: `lib/run.js`의 run 객체(Stepper와 같은 것). SSE를 다시 파싱하지 않고 `stepStatus(run)`에서 파생합니다.
 - 큐브 위치: `idle → analyze → deploy → (heal) → live`. `heal`은 deploy와 live 사이에서 갈라지는 우회 트랙이며, 패치가 하나라도 있으면 live로 갈 때 이 우회로를 거칩니다.
 - 실행 중에는 live에 도달하지 않고, 실패하면 실패한 지점에서 붉게 흔들린 뒤 멈춥니다.
+- 배포 ID가 바뀌면 이동 큐브를 다시 마운트해 이전 배포의 위치·경유지·실패 흔들림을 초기화합니다. Canvas와 트랙은 유지합니다.
 - 이동은 `THREE.MathUtils.damp`(프레임레이트와 무관한 지수 감쇠)로 처리하고, `useFrame` 안에서는 setState를 호출하지 않습니다.
 - `prefers-reduced-motion`이면 큐브가 최종 위치로 바로 이동하고 흔들림·펄스·벨트 애니메이션이 꺼집니다.
 
@@ -36,6 +37,7 @@
 - 펄스: 정상은 느린 호흡, 과부하는 빠르고 큰 호흡, 장애는 어둡게 깜빡임. 노드마다 위상을 달리해 동시에 깜빡이지 않습니다.
 - 모든 큐브는 하나의 `InstancedMesh`(형상 1개 + 흰색 머티리얼 1개, 색은 인스턴스별)로 그려집니다. 바닥 Grid는 별도 드로우콜입니다.
 - `<Instances limit>`는 2의 거듭제곱 버킷(최소 16)입니다. drei가 버퍼를 첫 `limit` 기준으로 한 번만 잡기 때문에, 폴링 사이에 노드가 늘어도 잘리지 않도록 버킷을 넘을 때만 다시 마운트합니다.
+- 카메라는 노드 그리드 전체를 감싸는 구와 Canvas의 가로·세로 비율로 거리를 계산합니다. 화면 크기가 바뀌거나 시점이 회전해도 가장자리 노드가 잘리지 않습니다.
 
 ### VictoryCelebration
 
@@ -45,6 +47,8 @@
 ```
 
 - `fixed inset-0 z-50` 오버레이입니다. 바깥 래퍼는 `pointer-events-none`이라 뒤의 2D UI를 계속 쓸 수 있고, 무대 카드와 우측 상단 닫기 버튼만 `pointer-events-auto`입니다. Esc로도 닫힙니다.
+- 카드 높이는 `100dvh - 2rem`으로 제한하고 내부 스크롤을 허용합니다. 닫을 때 이전에 포커스했던 요소가 남아 있으면 포커스를 돌려줍니다.
+- Canvas에 별도 `SceneBoundary`를 두어 WebGL 초기화가 실패해도 성공 요약, 공개 URL, 닫기 버튼은 유지합니다.
 - 무대: 원형 스테이지, 키·필 `spotLight` 2개, 림 `pointLight` 2개, `<Sparkles />` 4겹(보라·에메랄드·호박·별가루), `ContactShadows`.
 - 댄서: `modelUrl`이 있으면 `useGLTF` + `useAnimations`로 `clip` 애니메이션을 재생하고, 그 이름의 클립이 없으면 첫 번째 클립을 재생합니다. `modelUrl`이 없거나, 로딩 중이거나, 로딩에 실패하면 기본형 도형으로 만든 마스코트(CloudBot)가 대신 춤춥니다.
 - 하단에는 패치 개수, 패치 카테고리, 공개 URL(http/https만 링크)을 요약합니다.
@@ -99,13 +103,13 @@ http://localhost:5173/?fleetDemo=200
 
 ## 축하 세레머니 발동 규칙
 
-`lib/victory.js`의 `shouldCelebrate(run, dismissedId)`가 참일 때만 열립니다.
+`lib/victory.js`의 `shouldCelebrate(run, dismissedIds)`가 참일 때만 열립니다. `dismissedIds`는 닫은 배포 ID를 담은 `Set`입니다.
 
-- `run.id`가 있고 `dismissedId`와 다름
+- `run.id`가 있고 `dismissedIds`에 포함되지 않음
 - `run.status === 'completed'` (전체 성공. `partial_failure`, `failed`, `cancelled`, `running`, `idle`은 제외)
 - 자가치유 흔적이 있음: `run.patches.length > 0` 또는 어떤 타깃의 `targetState[t].healed`가 참
 
-닫으면 그 `run.id`를 `dismissedId`로 기억해 같은 배포에서는 다시 뜨지 않습니다. 이미 끝난 자가치유 배포를 프로젝트 목록에서 다시 열람(재연결)하면 한 번 더 뜹니다.
+닫으면 그 `run.id`를 `dismissedIds`에 추가합니다. 다른 배포를 닫은 뒤 이전 배포를 다시 열람해도 재등장하지 않습니다. 아직 닫지 않은 자가치유 배포는 다시 열람할 때 축하 화면을 표시합니다. 이 기록은 현재 페이지에만 유지되고 새로고침하면 초기화됩니다.
 
 ## App.jsx 연동 예시
 
@@ -124,8 +128,8 @@ const VictoryCelebration = lazy(() => import('./components/3d/VictoryCelebration
 export default function App() {
   // ... run, fleet 등 기존 상태
   const [fleetDemo] = useState(() => parseFleetDemo(window.location.search));
-  const [dismissedVictoryId, setDismissedVictoryId] = useState(null);
-  const celebrate = shouldCelebrate(run, dismissedVictoryId);
+  const [dismissedVictoryIds, setDismissedVictoryIds] = useState(() => new Set());
+  const celebrate = shouldCelebrate(run, dismissedVictoryIds);
 
   return (
     <>
@@ -151,7 +155,7 @@ export default function App() {
       {celebrate && (
         <SceneBoundary key={run.id}>
           <Suspense fallback={null}>
-            <VictoryCelebration open run={run} onClose={() => setDismissedVictoryId(run.id)} />
+            <VictoryCelebration open run={run} onClose={() => setDismissedVictoryIds((ids) => new Set(ids).add(run.id))} />
           </Suspense>
         </SceneBoundary>
       )}
@@ -164,7 +168,7 @@ export default function App() {
 
 - `React.lazy`는 요소가 렌더되는 순간 청크를 가져옵니다. `VictoryCelebration`은 닫혀 있을 때 `null`을 반환하지만, 그래도 렌더 트리에 두면 three 청크를 첫 화면에서 받게 되므로 `celebrate &&`로 감쌉니다.
 - 오버레이는 레이아웃 흐름 밖(`fixed`)이라 `Suspense` fallback은 `null`입니다. 나머지 둘은 컴포넌트와 같은 카드 외형·높이의 스켈레톤을 써서 레이아웃이 밀리지 않게 합니다.
-- `SceneBoundary`의 기본 fallback은 `null`입니다. GPU가 없거나 WebGL 컨텍스트를 잃으면 3D 패널만 사라지고 Stepper, FleetPanel 같은 2D 패널은 그대로 남습니다.
+- `SceneBoundary`의 기본 fallback은 `null`입니다. 렌더링·WebGL 초기화 오류는 3D 영역에 격리됩니다. 축하 화면의 내부 경계는 2D 성공 메시지를 fallback으로 표시합니다. 컨텍스트 유실 이벤트 자체의 복구는 Three.js 렌더러가 담당합니다.
 - 실제 연동 코드는 `frontend/src/App.jsx`에 있습니다.
 
 ## 검증
@@ -175,5 +179,7 @@ npm test        # vitest: lib/pipelineJourney, lib/fleetStatus, lib/victory
 npm run lint    # oxlint
 npm run build   # three 계열은 별도 청크로 분리, 엔트리 청크에는 포함되지 않음
 ```
+
+GitHub CI도 `npm ci` 뒤 위 세 검사를 실행합니다. 카메라 테스트는 실제 Three.js 카메라에 노드 모서리를 투영하여 좁은 화면·회전 시에도 화면 안에 들어오는지 검증합니다.
 
 빌드 시 three / fiber / drei 공유 청크가 500 kB를 넘는다는 Vite 경고가 나오지만, 지연 로드되는 청크라 첫 화면에는 영향이 없습니다.

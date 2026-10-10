@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest'
+import { PerspectiveCamera, Vector3 } from 'three'
 import {
+  FLEET_CAMERA_FOV,
+  RACK_SIZE,
   NODE_LOAD_HOT,
   STATUS_STYLE,
   cameraDistance,
@@ -135,17 +138,49 @@ describe('instanceCapacity', () => {
 })
 
 describe('cameraDistance', () => {
-  it('grows with the square root of the node count', () => {
+  it('moves farther away as the fleet grows', () => {
     // Arrange / Act
     const [d25, d100, d400] = [25, 100, 400].map((n) => cameraDistance(n))
-    // Assert: sqrt steps 5 -> 10 -> 20, so the second gap is twice the first
     expect(d100).toBeGreaterThan(d25)
-    expect(d400 - d100).toBeCloseTo(2 * (d100 - d25))
+    expect(d400).toBeGreaterThan(d100)
   })
 
   it('clamps empty or invalid counts to a single-node framing', () => {
     expect(cameraDistance(0)).toBe(cameraDistance(1))
     expect(cameraDistance(Number.NaN)).toBe(cameraDistance(1))
+  })
+
+  it('fits every rack corner while orbiting on narrow and wide screens', () => {
+    for (const count of [1, 17, 200, 500]) {
+      const positions = gridLayout(count, 1.4)
+      for (const aspect of [0.45, 0.85, 1, 2.5]) {
+        const distance = cameraDistance(count, 1.4, aspect)
+        const camera = new PerspectiveCamera(FLEET_CAMERA_FOV, aspect, 0.1, Math.max(500, distance * 5))
+        for (const angle of [0, Math.PI / 4, Math.PI / 2]) {
+          camera.position.set(Math.sin(angle), 0.9, Math.cos(angle)).normalize().multiplyScalar(distance)
+          camera.lookAt(0, 0, 0)
+          camera.updateMatrixWorld()
+          for (const [x, , z] of positions) {
+            for (const dx of [-RACK_SIZE[0] / 2, RACK_SIZE[0] / 2]) {
+              for (const dz of [-RACK_SIZE[2] / 2, RACK_SIZE[2] / 2]) {
+                for (const y of [0, RACK_SIZE[1] * 1.1]) {
+                  const projected = new Vector3(x + dx, y, z + dz).project(camera)
+                  expect(Math.abs(projected.x)).toBeLessThan(1)
+                  expect(Math.abs(projected.y)).toBeLessThan(1)
+                  expect(Math.abs(projected.z)).toBeLessThan(1)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  })
+
+  it('uses a safe default for invalid screen ratios', () => {
+    for (const aspect of [0, -1, Number.NaN, Infinity]) {
+      expect(cameraDistance(200, 1.4, aspect)).toBe(cameraDistance(200, 1.4, 1))
+    }
   })
 })
 

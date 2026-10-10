@@ -61,7 +61,7 @@ export default function App() {
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
   const [now, setNow] = useState(() => Date.now());
-  const [dismissedVictoryId, setDismissedVictoryId] = useState(null);
+  const [dismissedVictoryIds, setDismissedVictoryIds] = useState(() => new Set());
   const [fleetDemo] = useState(() => parseFleetDemo(window.location.search));
 
   // re-render once a second while running so elapsed time moves
@@ -164,7 +164,7 @@ export default function App() {
 
   const watchProject = (p) => attach(p.last_deployment_id, { source: p.source, targets: p.targets || [], name: p.name, trigger: p.trigger });
   const saveToken = (v) => { setToken(v); setTokenState(v); };
-  const celebrate = shouldCelebrate(run, dismissedVictoryId);
+  const celebrate = shouldCelebrate(run, dismissedVictoryIds);
 
   return (
     <div className="min-h-screen bg-[#0a0d14] text-slate-100">
@@ -244,7 +244,7 @@ export default function App() {
       {celebrate && (
         <SceneBoundary key={run.id}>
           <Suspense fallback={null}>
-            <VictoryCelebration open run={run} onClose={() => setDismissedVictoryId(run.id)} />
+            <VictoryCelebration open run={run} onClose={() => setDismissedVictoryIds((ids) => new Set(ids).add(run.id))} />
           </Suspense>
         </SceneBoundary>
       )}

@@ -7,6 +7,8 @@ import { Card } from '../ui';
 import {
   STATUSES,
   STATUS_STYLE,
+  FLEET_CAMERA_FOV,
+  RACK_SIZE,
   cameraDistance,
   classifyNode,
   countByStatus,
@@ -19,7 +21,7 @@ import {
 } from '../../lib/fleetStatus';
 
 const SPACING = 1.4;
-const RACK = [0.8, 1.2, 0.8];
+const RACK = RACK_SIZE;
 const RACK_HALF_H = RACK[1] / 2;
 const TOOLTIP_LIFT = 0.45;
 const DEMO_SEED = 7;
@@ -117,16 +119,19 @@ function NodeTooltip({ node, position }) {
 }
 
 function CameraRig({ distance, autoRotate }) {
-  const camera = useThree((s) => s.camera);
+  const get = useThree((s) => s.get);
   const controls = useThree((s) => s.controls);
   useEffect(() => {
+    const { camera } = get();
     camera.position.copy(CAMERA_DIR).multiplyScalar(distance);
+    camera.far = Math.max(500, distance * 5);
     camera.lookAt(0, 0, 0);
+    camera.updateProjectionMatrix();
     if (controls) {
       controls.target.set(0, 0, 0);
       controls.update();
     }
-  }, [camera, controls, distance]);
+  }, [get, controls, distance]);
   return (
     <OrbitControls
       makeDefault
@@ -144,9 +149,10 @@ function CameraRig({ distance, autoRotate }) {
 }
 
 function FleetScene({ nodes, reduced }) {
+  const size = useThree((s) => s.size);
   const [hovered, setHovered] = useState(null);
   const positions = useMemo(() => gridLayout(nodes.length, SPACING), [nodes.length]);
-  const distance = cameraDistance(nodes.length, SPACING);
+  const distance = cameraDistance(nodes.length, SPACING, size.width / Math.max(1, size.height));
   const hoveredNode = hovered != null ? nodes[hovered] : null;
 
   return (
@@ -221,7 +227,7 @@ export default function InstancedFleetGrid({ fleet, demoCount = 0, className = '
           <>
             <Canvas
               dpr={[1, 2]}
-              camera={{ fov: 45, near: 0.1, far: 500, position: CAMERA_DIR.clone().multiplyScalar(cameraDistance(nodes.length, SPACING)).toArray() }}
+              camera={{ fov: FLEET_CAMERA_FOV, near: 0.1, far: 500, position: CAMERA_DIR.clone().multiplyScalar(cameraDistance(nodes.length, SPACING)).toArray() }}
               gl={{ antialias: true, alpha: true }}
               aria-label={`노드 ${nodes.length}개 3D 상태 그리드`}
             >

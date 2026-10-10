@@ -4,6 +4,7 @@ import { ContactShadows, Sparkles, useAnimations, useGLTF } from '@react-three/d
 import * as THREE from 'three';
 import { ExternalLink, Wrench, X } from 'lucide-react';
 import { summarizeHeal } from '../../lib/victory';
+import SceneBoundary from './SceneBoundary';
 
 const REDUCED_MOTION_QUERY = '(prefers-reduced-motion: reduce)';
 const REDUCED_MOTION_SCALE = 0.25;
@@ -332,12 +333,16 @@ function Overlay({ run, onClose, modelUrl, clip, autoCloseMs, className, height 
   });
 
   useEffect(() => {
+    const previousFocus = document.activeElement;
     closeButton.current?.focus();
     const onKey = (e) => {
       if (e.key === 'Escape') onCloseRef.current?.();
     };
     window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      if (previousFocus?.isConnected) previousFocus.focus();
+    };
   }, []);
 
   useEffect(() => {
@@ -350,17 +355,20 @@ function Overlay({ run, onClose, modelUrl, clip, autoCloseMs, className, height 
     <div className={`pointer-events-none fixed inset-0 z-50 flex items-center justify-center p-4 ${className}`}>
       <div aria-hidden="true" className="absolute inset-0 bg-[#0a0d14]/50" />
       <section role="dialog" aria-label="AI 자가치유 성공 축하"
-        className="pointer-events-auto relative w-full max-w-3xl overflow-hidden rounded-2xl border border-white/5 bg-slate-900/80 shadow-2xl shadow-violet-900/40 backdrop-blur">
+        className="pointer-events-auto relative w-full max-w-3xl overflow-y-auto rounded-2xl border border-white/5 bg-slate-900/80 shadow-2xl shadow-violet-900/40 backdrop-blur"
+        style={{ maxHeight: 'calc(100dvh - 2rem)' }}>
         <button ref={closeButton} type="button" aria-label="닫기" onClick={() => onCloseRef.current?.()}
           className="pointer-events-auto absolute right-3 top-3 z-10 rounded-lg border border-white/10 bg-slate-900/70 p-1.5 text-slate-400 transition-colors hover:border-white/25 hover:text-slate-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 active:scale-95">
           <X className="h-4 w-4" />
         </button>
         <div className="relative bg-gradient-to-b from-violet-950/40 via-transparent to-transparent" style={{ height }}>
-          <Canvas shadows="percentage" dpr={[1, 2]} camera={{ position: [0, 2.3, 6.4], fov: 40 }} onCreated={({ camera }) => camera.lookAt(...SPOT_TARGET)}>
-            <Suspense fallback={null}>
-              <VictoryStage modelUrl={modelUrl} clip={clip} reduced={reduced} />
-            </Suspense>
-          </Canvas>
+          <SceneBoundary fallback={<div className="flex h-full items-center justify-center text-sm text-emerald-300">AI 자가치유 성공</div>}>
+            <Canvas shadows="percentage" dpr={[1, 2]} camera={{ position: [0, 2.3, 6.4], fov: 40 }} onCreated={({ camera }) => camera.lookAt(...SPOT_TARGET)}>
+              <Suspense fallback={null}>
+                <VictoryStage modelUrl={modelUrl} clip={clip} reduced={reduced} />
+              </Suspense>
+            </Canvas>
+          </SceneBoundary>
         </div>
         <HealSummary run={run} summary={summary} />
       </section>

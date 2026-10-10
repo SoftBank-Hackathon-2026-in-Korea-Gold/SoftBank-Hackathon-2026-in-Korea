@@ -282,7 +282,7 @@ function CodeCube({ path, mode, station, reduced, portal }) {
   );
 }
 
-function JourneyScene({ steps, journey, path, reduced, portal }) {
+function JourneyScene({ runId, steps, journey, path, reduced, portal }) {
   const running = journey.mode === 'moving';
   const detourLit = journey.healed || journey.station === 'heal';
   return (
@@ -302,7 +302,7 @@ function JourneyScene({ steps, journey, path, reduced, portal }) {
       {STATIONS.map((s) => (
         <StationPad key={s.id} position={s.position} label={s.label} state={steps[s.id]} celebrate={s.id === 'live' && journey.mode === 'done'} reduced={reduced} portal={portal} />
       ))}
-      <CodeCube path={path} mode={journey.mode} station={journey.station} reduced={reduced} portal={portal} />
+      <CodeCube key={runId} path={path} mode={journey.mode} station={journey.station} reduced={reduced} portal={portal} />
     </>
   );
 }
@@ -328,7 +328,7 @@ export default function PipelineJourney({ run, className = '', height = 220 }) {
       <div ref={labelLayer} role="img" aria-label={summary} className="relative isolate overflow-hidden rounded-xl bg-[#0a0d14]/60" style={{ height }}>
         <Canvas dpr={[1, 2]} camera={CAMERA} gl={GL}>
           <Suspense fallback={null}>
-            <JourneyScene steps={steps} journey={journey} path={path} reduced={reduced} portal={labelLayer} />
+            <JourneyScene runId={run?.id} steps={steps} journey={journey} path={path} reduced={reduced} portal={labelLayer} />
           </Suspense>
         </Canvas>
       </div>
