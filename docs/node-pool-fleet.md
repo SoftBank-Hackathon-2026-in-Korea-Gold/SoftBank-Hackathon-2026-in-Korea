@@ -57,14 +57,20 @@ uv run python -m app.fleet status
 
 ## 데이터베이스 프로비저닝 (10/10 추가) — "SQLite → 관리형 Postgres"
 
-앱이 `DATABASE_URL`을 읽거나 Postgres 드라이버를 쓰면(`detect_database`) deployer가 타깃에 맞는 DB를 만들어 주입한다.
+analyzer가 앱이 쓰는 외부 저장소와 접속 정보를 받는 환경변수 이름을 역할별로 찾는다(`EnvRequirement.resource`·`role`·`template`).
+사용자가 다 비워 둔 저장소는 main.py가 `stores`로 넘기고, deployer가 타깃에 맞게 만든 뒤 앱이 읽는 이름에 역할대로 채운다
+(`DB_HOST`/`DB_PASSWORD`처럼 나눠 받든, `SPRING_DATASOURCE_URL`처럼 다른 형식의 URL을 받든).
+분석 없이 deployer만 부를 때(CLI)는 예전처럼 `DATABASE_URL`을 읽거나 Postgres 드라이버를 쓰는 앱에만 Postgres를 넣는다(`detect_database`).
 SQLite 경로를 하드코딩한 앱은 대상이 아니다(읽지도 않는 URL을 넣는 것은 눈속임이므로). 그런 앱은 analyzer/healer가 코드를 고칠 영역.
 
-| 타깃 | DB | 방법 | 데이터 보존 |
+| 타깃 | 저장소 | 방법 | 데이터 보존 |
 |---|---|---|---|
-| local | `postgres:16-alpine` 사이드카 `<app>-db` | docker network `cloudmorph`, 볼륨 `<app>-dbdata` | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
-| node | 같은 방식을 노드에서 SSH로 | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
-| cloudrun | Cloud SQL 인스턴스 `cloudmorph-pg`(공유) | `gcloud sql databases/users create` → `--add-cloudsql-instances` + `DATABASE_URL=postgresql://u:p@/db?host=/cloudsql/<conn>` | 관리형 |
+| local | 사이드카: postgres(`postgres:16-alpine`, `<app>-db`), mysql(`mysql:8.0`), redis(`redis:7-alpine`, AOF), mongodb(`mongo:7`), s3(`chrislusf/seaweedfs`, 버킷 `app`) | docker network `cloudmorph`, 볼륨 `<사이드카>data`. S3는 `AWS_ENDPOINT_URL_S3`도 넣는다 | 재배포(healer 재시도) 후에도 유지. `cleanup`에서만 삭제 |
+| node | 같은 사이드카를 노드에서 SSH로 | 노드마다 사이드카 | 앱이 `stateful`로 표시되어 **자동 확장 제외** |
+| cloudrun | Postgres만: Cloud SQL 인스턴스 `cloudmorph-pg`(공유) | `gcloud sql databases/users create` → `--add-cloudsql-instances` + 유닉스 소켓 URL(`?host=/cloudsql/<conn>`). JDBC URL은 소켓을 못 써서 채우지 않는다 | 관리형 |
+
+cloudrun의 MySQL·Redis·MongoDB·S3는 만들지 않는다(입력 카드에 `auto`가 붙지 않아 사용자가 넣어야 한다).
+관리형으로 하려면 Cloud SQL MySQL, Memorystore(+VPC), GCS(HMAC 키 관리)가 필요하다.
 
 실측(sample-apps/guestbook): local 9.7초, cloudrun 44초(앱별 DB·계정 생성 포함), node 20초. 세 곳 모두 글 쓰기 → 읽기 확인, local은 재배포 후 데이터 유지 확인.
 Cloud SQL 생성 시 `--edition=ENTERPRISE`를 줘야 `db-f1-micro`를 쓸 수 있고, Cloud Run 서비스 계정에 `roles/cloudsql.client`가 필요하다.

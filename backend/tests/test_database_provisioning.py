@@ -2,13 +2,22 @@
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from app import deployer, fleet, nodes
-from app.deployer import Config, detect_database, wants_database
+from app import deployer, fleet
+from app.deployer import (
+    Config,
+    cloudsql_conn,
+    detect_database,
+    fill_store_env,
+    render_url,
+    sidecar_conn,
+    stores_to_provision,
+    wants_database,
+)
+from app.schemas import EnvRequirement
 
 
 def _app(tmp_path: Path, **files: str) -> Path:
@@ -48,27 +57,16 @@ def test_wants_database_respects_explicit_config(tmp_path):
     assert wants_database(_app(tmp_path / "f", **{"app.py": "DATABASE_URL"}), Config(database=None)) is None
 
 
-@pytest.mark.parametrize("listed, restarted", [("3f2a9c1b\n", True), ("", False)])
-def test_local_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch, listed, restarted):
-    calls: list[list[str]] = []
-
-    def fake_run(cmd, **kw):
-        calls.append(cmd)
-        return subprocess.CompletedProcess(cmd, 0, listed if cmd[:2] == ["docker", "ps"] else "", "")
-
-    monkeypatch.setattr(deployer.subprocess, "run", fake_run)
-    url = deployer.ensure_local_postgres("todo", deployer.Runner())
-    assert url == "postgresql://app:app@todo-db:5432/app"
-    assert ["docker", "ps", "-aq", "-f", "name=^todo-db$"] in calls  # stopped containers count as existing
-    assert (["docker", "start", "todo-db"] in calls) is restarted
-    assert any(c[:2] == ["docker", "run"] for c in calls) is not restarted  # same name again -> Conflict
+@pytest.mark.parametrize("kind", sorted(deployer.SIDECARS))
+def test_sidecars_restart_a_stopped_container_instead_of_recreating_it(kind):
+    """One script for local and nodes: a stopped sidecar still holds its name (docker run would Conflict)."""
+    c = f"todo-{deployer.SIDECARS[kind]['container']}"
+    assert f"docker start {c} >/dev/null 2>&1 || docker run -d" in deployer.sidecar_script("todo", kind)
+    assert f"-v {c}data:" in deployer.sidecar_script("todo", kind)  # data survives the container
 
 
-def test_node_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch):
-    sent: list[str] = []
-    monkeypatch.setattr(nodes, "ssh_text", lambda node, cmd, timeout=60: sent.append(cmd) or "")
-    nodes.ensure_postgres(nodes.Node(name="a", host="10.0.0.2"), "todo")
-    assert "docker start todo-db >/dev/null 2>&1 || docker run -d" in sent[0]
+def test_postgres_sidecar_keeps_its_name_and_url():
+    assert sidecar_conn("todo", "postgres")["url"] == "postgresql://app:app@todo-db:5432/app"
 
 
 def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
@@ -178,3 +176,65 @@ def test_stateful_app_redeploys_to_the_node_that_holds_its_database(monkeypatch,
     )
     assert deployer._pinned_node(reg, "web-node") is None
     del nodes, Metrics
+
+
+def _req(name, role, kind="postgres", template=None):
+    return EnvRequirement(
+        name=name, scope="runtime", secret=False, resource=kind, role=role, template=template
+    )
+
+
+def test_mysql_drivers_are_not_guessed_as_postgres(tmp_path):
+    assert detect_database(_app(tmp_path, **{"requirements.txt": "flask\npymysql"})) is None
+
+
+def test_the_analyzers_stores_replace_the_guess(tmp_path):
+    src = _app(tmp_path, **{"app.py": "import os\nos.environ['DATABASE_URL']"})
+    assert stores_to_provision(src, Config(stores=[]), "local") == {}  # analysis found no store
+    redis = [_req("REDIS_HOST", "host", "redis")]
+    assert stores_to_provision(src, Config(stores=redis), "local") == {"redis": redis}
+    assert stores_to_provision(src, Config(stores=redis), "node") == {"redis": redis}
+    assert stores_to_provision(src, Config(stores=redis), "cloudrun") == {}  # Cloud Run: Postgres only
+    assert stores_to_provision(src, Config(stores=redis, database=None), "local") == {}  # turned off
+    guessed = stores_to_provision(src, Config(), "local")  # CLI: no analysis, the old DATABASE_URL guess
+    assert [(e.name, e.resource, e.role) for e in guessed["postgres"]] == [
+        ("DATABASE_URL", "postgres", "url")
+    ]
+
+
+def test_settings_are_filled_by_role_in_the_apps_own_names():
+    mysql = [
+        _req("DB_HOST", "host", "mysql"),
+        _req("DB_PORT", "port", "mysql"),
+        _req("DB_PASS", "password", "mysql"),
+        _req("SPRING_DATASOURCE_URL", "url", "mysql", "jdbc:mysql://{host}:{port}/{database}"),
+    ]
+    assert fill_store_env(mysql, sidecar_conn("shop", "mysql")) == {
+        "DB_HOST": "shop-mysql",
+        "DB_PORT": "3306",
+        "DB_PASS": "app",
+        "SPRING_DATASOURCE_URL": "jdbc:mysql://shop-mysql:3306/app",
+    }
+    s3 = [
+        _req("S3_BUCKET", "bucket", "s3"),
+        _req("S3_KEY", "access_key", "s3"),
+        _req("S3_DB", "database", "s3"),
+    ]
+    assert fill_store_env(s3, sidecar_conn("shop", "s3")) == {
+        "AWS_ENDPOINT_URL_S3": "http://shop-s3:8333",  # SDKs reach MinIO even without an endpoint setting
+        "S3_BUCKET": "app",
+        "S3_KEY": "app",
+    }
+
+
+def test_cloudsql_socket_urls_follow_the_apps_form():
+    conn = cloudsql_conn("p:r:i", "postgresql://u:pw@/d?host=/cloudsql/p:r:i")
+    assert (conn["host"], conn["user"], conn["password"], conn["database"]) == (
+        "/cloudsql/p:r:i",
+        "u",
+        "pw",
+        "d",
+    )
+    asyncpg = "postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}"
+    assert render_url(asyncpg, conn) == "postgresql+asyncpg://u:pw@/d?host=/cloudsql/p:r:i"
+    assert render_url("jdbc:postgresql://{host}:{port}/{database}", conn) is None  # JDBC can't use the socket

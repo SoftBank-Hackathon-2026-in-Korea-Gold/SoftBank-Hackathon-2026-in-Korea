@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import re
+import string
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -130,8 +131,10 @@ def _required_env(reports: dict) -> list[EnvRequirement]:
             name=name,
             scope="runtime",
             secret=role in SECRET_ROLES,
-            reason=f"{r['kind']} 접속 정보 ({role})",
+            reason=f"{r['name'] or r['kind']} 접속 정보 ({role})",
             resource=r["kind"],
+            role=role,
+            template=r["url_template"] if role == "url" else None,
             evidence=evidence(name),
         )
         for r in items("resources")
@@ -233,8 +236,12 @@ def _notes(t: int, values: dict, reports: dict, app: App, root: Path, errors: li
         return (reports[name] or {}).get("items", [])
 
     notes = [
-        f"외부 저장소가 필요합니다: {r['kind']} ({', '.join(r['env'].values()) or '환경변수 못 찾음'}). "
-        "배포 전에 만들어 연결해야 합니다."
+        f"외부 저장소가 필요합니다: {r['name'] or r['kind']} ({', '.join(r['env'].values()) or '환경변수 못 찾음'}). "
+        + (
+            "CloudMorph가 만들 수 없는 종류라 접속 정보를 직접 넣어야 합니다."
+            if r["kind"] == "other"
+            else "접속 정보를 비워 두면 배포할 곳에서 만들 수 있을 때 만들어 붙입니다."
+        )
         for r in items("resources")
     ]
     used = {"PORT"} | {n for r in items("resources") for n in r["env"].values()}
@@ -406,10 +413,17 @@ class EnvRole(BaseModel):
         "secret_key",
     ]
     name: str = Field(description="그 역할의 값을 받는 환경변수 이름")
+    template: str | None = Field(
+        default=None,
+        description="role이 url일 때만: 앱이 기대하는 URL 형식. 값 자리에 {host} {port} {user} {password} {database}만 쓴다 "
+        "(예: jdbc:postgresql://{host}:{port}/{database}, postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}). "
+        "그 종류의 흔한 URL(postgresql://…, mysql://…, redis://…, mongodb://…)을 그대로 받으면 null",
+    )
 
 
 class ResourceItem(BaseModel):
-    kind: Literal["postgres", "mysql", "redis", "s3"]
+    kind: Literal["postgres", "mysql", "redis", "mongodb", "s3", "other"]
+    name: str | None = Field(default=None, description="kind가 other일 때 저장소 이름 (kafka, rabbitmq …)")
     env: list[EnvRole]
     evidence: list[Evidence]
 
@@ -548,8 +562,10 @@ SPEC_INSPECTORS = {
     "resources": (
         "외부 저장소",
         (
-            "앱이 연결하는 외부 저장소(PostgreSQL, MySQL, Redis, S3 호환 저장소 — MinIO 포함)와, 접속 정보를 받는 환경변수 이름. "
+            "앱이 연결하는 외부 저장소(PostgreSQL, MySQL, Redis, MongoDB, S3 호환 저장소 — MinIO 포함)와, 접속 정보를 받는 환경변수 이름. "
+            "그 밖의 저장소·메시지 브로커(Kafka, RabbitMQ, Elasticsearch …)는 kind를 other로 하고 name에 이름을 쓴다. "
             "역할마다 코드·설정이 실제로 읽는 이름을 쓴다. URL 하나로 받으면 url, 나눠 받으면 host·port·user·password·database. "
+            "url은 코드가 그 값을 어떤 형식으로 쓰는지 보고, 흔한 형식이 아니면 template에 적는다 (JDBC, SQLAlchemy 드라이버 접두어 등). "
             "설정 파일에 자리표시자가 없어 프레임워크 규칙으로 덮어써야 하면 그 이름을 쓴다 (Spring: SPRING_DATASOURCE_URL, SPRING_R2DBC_URL …). "
             "의존성에만 있고 쓰지 않는 저장소와 SQLite는 뺀다."
         ),
@@ -730,6 +746,20 @@ def _hits(root: Path, items) -> list:
     return hits
 
 
+URL_FIELDS = {"host", "port", "user", "password", "database"}
+
+
+def url_template(template: str | None) -> str | None:
+    """AI가 적은 URL 형식은 정해진 자리표시자만 쓰고 {host}가 있어야 받는다. 아니면 None (그 종류의 흔한 URL)"""
+    try:
+        parts = list(string.Formatter().parse(template or ""))
+    except ValueError:
+        return None
+    fields = {f for _, f, _, _ in parts if f is not None}
+    plain = all(not spec and conv is None for _, f, spec, conv in parts if f is not None)
+    return template if plain and "host" in fields and fields <= URL_FIELDS else None
+
+
 def validate(name: str, report, root: Path, text: str) -> dict:
     """확인한 보고서 dict. 근거는 실제 줄로 바꾸고, 저장소에 없는 이름은 버린다."""
 
@@ -753,7 +783,14 @@ def validate(name: str, report, root: Path, text: str) -> dict:
     if name == "resources":
         return {
             "items": [
-                {"kind": r.kind, "env": {e.role: e.name for e in r.env if known(e.name)}}
+                {
+                    "kind": r.kind,
+                    "name": r.name if r.kind == "other" else None,
+                    "env": {e.role: e.name for e in r.env if known(e.name)},
+                    "url_template": next(
+                        (url_template(e.template) for e in r.env if e.role == "url" and known(e.name)), None
+                    ),
+                }
                 for r in report.items
             ]
         }

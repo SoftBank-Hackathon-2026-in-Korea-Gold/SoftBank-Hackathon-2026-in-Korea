@@ -12,7 +12,7 @@ import pytest
 from app import deployer
 from app.deployer import Outcome, Step, diagnose_not_reachable, slug
 from app.healer import classify_error
-from app.schemas import ErrorCategory
+from app.schemas import EnvRequirement, ErrorCategory
 
 SAMPLE_APPS = Path(__file__).resolve().parents[2] / "sample-apps"
 
@@ -195,7 +195,9 @@ def test_users_own_database_url_skips_provisioning(tmp_path, monkeypatch, given,
     runs = _record_runs(monkeypatch)
     made = []
     monkeypatch.setattr(
-        deployer, "ensure_local_postgres", lambda app, r: made.append(app) or "postgresql://sidecar/app"
+        deployer,
+        "ensure_local_store",
+        lambda app, kind, r: made.append(kind) or {"url": "postgresql://sidecar/app"},
     )
     monkeypatch.setattr(deployer, "build_image", lambda *args: None)
     monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])
@@ -206,3 +208,28 @@ def test_users_own_database_url_skips_provisioning(tmp_path, monkeypatch, given,
     expected = "postgresql://sidecar/app" if provisioned else given["DATABASE_URL"]
     assert f"DATABASE_URL={expected}" in run_cmd
     assert bool(made) is provisioned
+
+
+def test_local_deploy_provisions_each_store_into_the_apps_own_names(tmp_path, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    monkeypatch.setattr(deployer, "build_image", lambda *args: None)
+    monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])
+    monkeypatch.setattr(deployer, "wait_up", lambda *args, **kw: (True, ""))
+
+    def req(name, kind, role):
+        return EnvRequirement(name=name, scope="runtime", secret=False, resource=kind, role=role)
+
+    stores = [
+        req("DB_HOST", "mysql", "host"),
+        req("DB_PASS", "mysql", "password"),
+        req("CACHE", "redis", "url"),
+    ]
+    cfg = deployer.Config(tunnel=False, stores=stores, env={"API_KEY": "k"})
+    out = Outcome(target="local")
+    deployer.deploy_local(tmp_path / "shop", cfg, deployer.Runner(), out)
+    sidecars = [cmd for cmd, _ in runs if cmd[:2] == ["sh", "-c"]]
+    assert [s[2].split("--name ")[1].split()[0] for s in sidecars] == ["shop-mysql", "shop-redis"]
+    run_cmd = next(cmd for cmd, _ in runs if cmd[:2] == ["docker", "run"])
+    for pair in ("DB_HOST=shop-mysql", "DB_PASS=app", "CACHE=redis://shop-redis:6379/0", "API_KEY=k"):
+        assert pair in run_cmd
+    assert out.handles["store_containers"] == ["shop-mysql", "shop-redis"]

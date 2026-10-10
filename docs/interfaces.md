@@ -30,7 +30,7 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 
 **AnalysisResult** — `target`, `service_models[]` (`caas|paas|faas|iaas`, 추천 순), `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`, `required_env[EnvRequirement]`
 
-**EnvRequirement** — `name`, `scope` (`build|runtime`), `secret`, `generate` (비우면 무작위 값), `reason`, `evidence["path:line"]`, `resource` (`postgres|mysql|redis|s3`: 외부 저장소 접속 정보 — 사용자가 자기 서버를 넣을 수 있어 항상 묻는다), `auto` (비우면 deployer가 만들어 연결: 지금은 Postgres가 감지된 앱의 `DATABASE_URL`만. main.py가 표시). 사용자가 `DATABASE_URL`을 넣으면 deployer는 Postgres/Cloud SQL을 만들지 않는다. deployer 전달: build+secret → `docker build --secret id=NAME,env=NAME` (BuildKit 필요, 값은 명령줄·레이어에 안 남음), build → `--build-arg`, runtime → 컨테이너 env
+**EnvRequirement** — `name`, `scope` (`build|runtime`), `secret`, `generate` (비우면 무작위 값), `reason`, `evidence["path:line"]`, `resource` (`postgres|mysql|redis|mongodb|s3|other`: 외부 저장소 접속 정보 — 사용자가 자기 서버를 넣을 수 있어 항상 묻는다), `role` (`url|host|port|user|password|database|bucket|endpoint|region|access_key|secret_key`: 접속 정보 중 무엇인지), `template` (`role=url`일 때 앱이 기대하는 URL 형식, 예 `jdbc:postgresql://{host}:{port}/{database}`. 없으면 그 종류의 흔한 URL), `auto` (비우면 deployer가 만들어 연결: 요청한 타깃 전부에서 만들 수 있는 종류만. main.py가 표시). 한 저장소의 접속 정보를 하나라도 넣으면 사용자 서버로 보고 그 저장소는 만들지 않는다. 다 비워 두면 main.py가 `stores`로 넘기고 deployer가 만들어 역할대로 채운다. deployer 전달: build+secret → `docker build --secret id=NAME,env=NAME` (BuildKit 필요, 값은 명령줄·레이어에 안 남음), build → `--build-arg`, runtime → 컨테이너 env
 
 **DeployResult** — `success`, `target`, `exit_code`, `stdout`, `stderr`, `url?`, `duration_sec?`
 

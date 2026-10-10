@@ -509,10 +509,17 @@ def source_fix_confirm(
 
 
 def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
-    """deployer.deploy options for the user's values (blank ones are left out)."""
+    """deployer.deploy options for the user's values (blank ones are left out).
+    `stores`: settings of every external store the user left entirely blank, for the deployer to provision.
+    One value given means their own server, so that store's other settings stay blank."""
     env: dict[str, str] = {}
     build_args: dict[str, str] = {}
     build_secrets: dict[str, str] = {}
+    by_kind: dict[str, list[EnvRequirement]] = {}
+    for item in required:
+        if item.resource and item.role:
+            by_kind.setdefault(item.resource, []).append(item)
+    stores = [e for items in by_kind.values() if not any(values.get(e.name) for e in items) for e in items]
     for item in required:
         value = values.get(item.name)
         if not value:
@@ -524,7 +531,8 @@ def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> di
         else:
             build_args[item.name] = value
     options = {"env": env, "build_args": build_args, "build_secrets": build_secrets}
-    return {k: v for k, v in options.items() if v}
+    # always set: with the analysis in hand the deployer must not fall back to guessing a database
+    return {k: v for k, v in options.items() if v} | {"stores": stores}
 
 
 def run_pipeline(
@@ -767,7 +775,7 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis, source_dir))
+                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis))
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -804,7 +812,7 @@ def create_app() -> FastAPI:
                     if "local" not in targets:
                         _remove_workspace(work_root)
 
-        def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
+        def _resolve_env(analysis: AnalysisResult) -> dict[str, str]:
             """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
             A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
             so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are kept per
@@ -831,7 +839,7 @@ def create_app() -> FastAPI:
                     )
                 )
                 return values
-            values |= _ask_env(missing, source_dir)
+            values |= _ask_env(missing)
             for e in missing:
                 if e.scope == "runtime" and e.generate and not values.get(e.name):
                     values[e.name] = secrets.token_urlsafe(32)
@@ -843,12 +851,16 @@ def create_app() -> FastAPI:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
             return values
 
-        def _ask_env(items: list[EnvRequirement], source_dir: str) -> dict[str, str]:
+        def _ask_env(items: list[EnvRequirement]) -> dict[str, str]:
             """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
-            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
-            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
+            `auto` marks what the deployer provisions on every target when left blank, so the card can say so
+            honestly."""
+            # DEPLOYER_DATABASE="" turns provisioning off
+            on = deployer.Config.from_env().database is not None
             job.required_env = [
-                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
+                e.model_copy(update={"auto": True})
+                if on and e.role and all(deployer.can_provision(e.resource, t) for t in targets)
+                else e
                 for e in items
             ]
             job.state = "waiting_input"

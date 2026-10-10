@@ -548,7 +548,7 @@ def test_two_jobs_names_api_status_and_sse(m, tmp_path, monkeypatch):
     )
     paths = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **options):
         paths.append(Path(directory))
         return DeployResult(success=True, target=target, exit_code=0, url="https://example.invalid")
 
@@ -618,7 +618,7 @@ def test_cloudrun_workspace_is_removed_after_heal_finishes(m, tmp_path, monkeypa
     )
     deploy_attempts = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **options):
         assert Path(directory).exists()
         assert (Path(directory) / "app.py").read_text() == "dummy"
         deploy_attempts.append(dockerfile)
@@ -692,7 +692,7 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     )
     deploy_attempts = []
 
-    def fake_deploy(directory, attempted_dockerfile, target):
+    def fake_deploy(directory, attempted_dockerfile, target, **options):
         deploy_attempts.append(attempted_dockerfile)
         if len(deploy_attempts) == 1:
             return DeployResult(
@@ -768,7 +768,7 @@ def test_stop_takes_down_every_live_target_once(m, tmp_path, monkeypatch):
     monkeypatch.setattr(
         m.deployer,
         "deploy",
-        lambda directory, dockerfile, target: DeployResult(
+        lambda directory, dockerfile, target, **options: DeployResult(
             success=True, target=target, exit_code=0, url=f"https://{target}.invalid"
         ),
     )
@@ -893,7 +893,7 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
     building, released = threading.Event(), threading.Event()
     calls, killed = [], []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **options):
         calls.append(target)
         building.set()
         assert released.wait(5)
@@ -939,7 +939,7 @@ def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, mon
 def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypatch):
     calls = []
 
-    def fake_deploy(directory, dockerfile, target):
+    def fake_deploy(directory, dockerfile, target, **options):
         calls.append(target)
         if len(calls) == 2:  # healer's first redeploy is in flight when the user cancels
             next(iter(m._jobs.values())).cancel.set()
@@ -1172,15 +1172,19 @@ def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
         return await routes["/deploy/{deployment_id}"](deployment_id)
 
     assert asyncio.run(scenario())["status"] == "completed"
-    assert calls == [{}]
+    assert calls == [{"stores": []}]  # analysis found no store: no guessing
 
 
-def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "targets, redis_auto",
+    [(["local"], True), (["local", "cloudrun"], False)],  # Cloud Run provisions only Postgres
+)
+def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch, targets, redis_auto):
     source, routes = _ask_env_setup(m, tmp_path, monkeypatch, lambda *a, **k: None)
-    (source / "app.py").write_text('import os\nDB = os.environ["DATABASE_URL"]\n')
     required = [
-        EnvRequirement(name="DATABASE_URL", scope="runtime", secret=True, resource="postgres"),
-        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis"),
+        EnvRequirement(name="DATABASE_URL", scope="runtime", secret=True, resource="postgres", role="url"),
+        EnvRequirement(name="REDIS_URL", scope="runtime", secret=True, resource="redis", role="url"),
+        EnvRequirement(name="KAFKA_BROKERS", scope="runtime", secret=False, resource="other", role="url"),
     ]
     monkeypatch.setattr(
         m.analyzer,
@@ -1191,7 +1195,7 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
     )
 
     async def scenario():
-        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        request = DeployRequest(source=str(source), targets=targets, ask_env=True)
         deployment_id = (await routes["/deploy"](request))["deployment_id"]
         job = m._jobs[deployment_id]
         await _until(lambda: job.state == "waiting_input")
@@ -1202,5 +1206,24 @@ def test_ask_env_marks_what_the_deployer_provisions(m, tmp_path, monkeypatch):
                 return json.loads(event["data"])["payload"]["items"]
 
     items = asyncio.run(scenario())
-    # only Postgres is provisioned when left blank; Redis is not, so the card must not promise it
-    assert [(i["name"], i["auto"]) for i in items] == [("DATABASE_URL", True), ("REDIS_URL", False)]
+    # `auto` only where every target provisions it when left blank, so the card never promises too much
+    assert [(i["name"], i["auto"]) for i in items] == [
+        ("DATABASE_URL", True),
+        ("REDIS_URL", redis_auto),
+        ("KAFKA_BROKERS", False),
+    ]
+
+
+def test_a_store_with_any_value_given_is_the_users_own(m):
+    def req(name, kind, role):
+        return EnvRequirement(name=name, scope="runtime", secret=role == "password", resource=kind, role=role)
+
+    required = [
+        req("DB_HOST", "mysql", "host"),
+        req("DB_PASSWORD", "mysql", "password"),
+        req("REDIS_URL", "redis", "url"),
+        EnvRequirement(name="API_KEY", scope="runtime", secret=True),
+    ]
+    options = m._env_overrides(required, {"DB_HOST": "db.example.com", "API_KEY": "k"})
+    assert options["env"] == {"DB_HOST": "db.example.com", "API_KEY": "k"}
+    assert [e.name for e in options["stores"]] == ["REDIS_URL"]  # MySQL is theirs: DB_PASSWORD stays blank

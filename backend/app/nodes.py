@@ -231,22 +231,6 @@ def run_container(
     return ssh_text(node, cmd, timeout=60).strip()
 
 
-def ensure_postgres(node: Node, app: str, *, timeout: int = 120) -> str:
-    """Start (or reuse) a Postgres sidecar `<app>-db` on the node's cloudmorph network; return DATABASE_URL.
-    Data lives in a named volume `<app>-dbdata`, so redeploys of the app keep their rows."""
-    db = f"{app}-db"
-    cmd = (
-        f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
-        f"docker start {db} >/dev/null 2>&1 || docker run -d --restart unless-stopped --name {db} --network {NETWORK} "
-        f"-e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app -v {app}-dbdata:/var/lib/postgresql/data "
-        f"postgres:16-alpine >/dev/null; "
-        f"for i in $(seq 1 60); do docker exec {db} pg_isready -U app -q && exit 0; sleep 1; done; "
-        f"echo 'postgres not ready' >&2; exit 1"
-    )
-    ssh_text(node, cmd, timeout=timeout)
-    return f"postgresql://app:app@{db}:5432/app"
-
-
 def container_status(node: Node, name: str) -> tuple[str, int]:
     cp = ssh(
         node,

@@ -70,7 +70,8 @@ AI 검사관 18개 (Claude, 동시에)  →  울타리 (코드)  →  타깃  �
 ## 팀에 제안 (합의 필요)
 
 1. **`AnalysisResult` 넓히기**: analyzer는 이미 아래 정보를 만들지만 계약에 칸이 없어 `notes` 문장으로만 넘긴다.
-   - `resources`: 필요한 DB·Redis·버킷과 접속 환경변수 이름 (deployer가 Cloud SQL 등을 만들거나 연결할 때 필요)
+   - `resources`: 필요한 DB·Redis·버킷과 접속 환경변수 이름 — 10/10부터 `required_env`의 `resource`·`role`·`template`으로 넘기고,
+     deployer가 비어 있는 저장소를 만들어 역할대로 채운다 ([node-pool-fleet.md](node-pool-fleet.md#데이터베이스-프로비저닝-1010-추가--sqlite--관리형-postgres))
    - `env`: 사용자가 넣어야 할 환경변수 (무작위 값을 넣어도 되는지)
    - `risks`: 기타 위험 (예: 시작할 때 큰 모델 로드, 이미지에 없는 파일)
 2. **동의를 화면에서 받기**: SSE에 질문 이벤트를 두고 답을 받는 API(`POST /deploy/{id}/answer`)를 두면,

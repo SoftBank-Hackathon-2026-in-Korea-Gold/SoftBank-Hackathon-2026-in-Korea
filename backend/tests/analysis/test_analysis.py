@@ -261,7 +261,11 @@ def test_notes_from_spec_inspectors(tmp_path):
                 kind="postgres",
                 evidence=[ev("main.py:4", 'DB = os.environ["DATABASE_URL"]')],
                 env=[
-                    an.EnvRole(role="url", name="DATABASE_URL"),
+                    an.EnvRole(
+                        role="url",
+                        name="DATABASE_URL",
+                        template="postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}",
+                    ),
                     an.EnvRole(role="password", name="MADE_UP_PW"),
                 ],
             )
@@ -290,7 +294,19 @@ def test_notes_from_spec_inspectors(tmp_path):
     r = run(tmp_path, answers)
     assert r.target == "cloudrun" and r.entrypoint == "uvicorn main:app --host 0.0.0.0 --port $PORT"
     # 저장소에 없는 이름은 버리고, 자원 접속 정보는 사용자 입력에서 뺀다
-    assert "외부 저장소가 필요합니다: postgres (DATABASE_URL). 배포 전에 만들어 연결해야 합니다." in r.notes
+    assert (
+        "외부 저장소가 필요합니다: postgres (DATABASE_URL). "
+        "접속 정보를 비워 두면 배포할 곳에서 만들 수 있을 때 만들어 붙입니다." in r.notes
+    )
+    # deployer가 역할대로 값을 채우도록 역할과 URL 형식이 같이 간다
+    assert [(e.name, e.resource, e.role, e.template) for e in r.required_env if e.resource] == [
+        (
+            "DATABASE_URL",
+            "postgres",
+            "url",
+            "postgresql+asyncpg://{user}:{password}@{host}:{port}/{database}",
+        )
+    ]
     assert "넣어야 하는 환경변수: SECRET_KEY (무작위 값 가능)" in r.notes
     assert [n for n in r.notes if n.startswith("기타 위험")] == ["기타 위험: DB 없이 시작하면 죽음 — "]
     assert not any(n.startswith("수정 제안") for n in r.notes)
@@ -759,3 +775,35 @@ def test_live_claude(monkeypatch, tmp_path):
     assert (r.target, r.language) == ("local", "python")  # SQLite는 데이터 손실 위험이라 local
     assert check_dockerfile(r.dockerfile, tmp_path, r.port) is None
     assert not any(n.startswith("AI 검사관 일부가 실패") for n in r.notes)
+
+
+def test_url_template_keeps_only_known_placeholders():
+    jdbc = "jdbc:postgresql://{host}:{port}/{database}"
+    assert an.url_template(jdbc) == jdbc
+    assert an.url_template("postgresql://{user}:{password}@db:5432/{database}") is None  # {host} 없음
+    assert an.url_template("http://{host}/{0}") is None
+    assert an.url_template("http://{host.__class__}") is None
+    assert an.url_template("http://{host!r}") is None
+    assert an.url_template("http://{host") is None
+    assert an.url_template(None) is None
+
+
+def test_unknown_store_kinds_are_named_and_not_promised(tmp_path):
+    (tmp_path / "main.py").write_text('import os\nBROKER = os.environ["KAFKA_BROKERS"]\n')
+    resources = an.ResourcesReport(
+        items=[
+            an.ResourceItem(
+                kind="other",
+                name="kafka",
+                evidence=[ev("main.py:2", 'BROKER = os.environ["KAFKA_BROKERS"]')],
+                env=[an.EnvRole(role="url", name="KAFKA_BROKERS")],
+            )
+        ]
+    )
+    r = run(tmp_path, {"resources": resources})
+    assert (
+        "외부 저장소가 필요합니다: kafka (KAFKA_BROKERS). CloudMorph가 만들 수 없는 종류라 접속 정보를 직접 넣어야 합니다."
+        in r.notes
+    )
+    ((e,),) = [[e for e in r.required_env if e.resource]]
+    assert (e.name, e.resource, e.reason) == ("KAFKA_BROKERS", "other", "kafka 접속 정보 (url)")

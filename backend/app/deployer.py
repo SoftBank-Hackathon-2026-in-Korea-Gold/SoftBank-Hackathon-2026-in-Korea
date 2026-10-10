@@ -37,18 +37,20 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from app import nodes as nodepool
-from app.schemas import DeployResult, DeployTarget
+from app.schemas import DeployResult, DeployTarget, EnvRequirement
 
 TAIL = 6000  # max chars kept per captured stream
 STATE_DIR = ".deployer"  # written inside src_dir: last outcome + tunnel logs
@@ -153,6 +155,9 @@ class Config:
     node_exclude: tuple = ()  # node names to skip (used by fleet scale-out)
     database: str | None = "auto"  # "auto": Postgres when the app reads DATABASE_URL; "postgres"; None: never
     cloudsql_instance: str = "cloudmorph-pg"  # Cloud SQL instance (cloudrun target)
+    # analyzer's store settings (EnvRequirement) the user left blank: provisioned and filled by role.
+    # None (no analysis, e.g. CLI) -> the `database` guess above
+    stores: list | None = None
 
     @classmethod
     def from_env(cls) -> Config:
@@ -442,17 +447,92 @@ def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# database provisioning ("SQLite -> managed Postgres"): sidecar on local/node, Cloud SQL on cloudrun
+# external stores: the analyzer names each connection setting the app reads (EnvRequirement.resource/role).
+# Settings the user left blank are provisioned here and filled in by role: sidecars on local/node,
+# Cloud SQL Postgres on cloudrun.
 # --------------------------------------------------------------------------- #
 _DB_HINTS = re.compile(
-    r"DATABASE_URL|psycopg|asyncpg|sqlalchemy|pg8000|\bfrom pg\b|require\(['\"]pg['\"]\)|['\"]pg['\"]\s*:|prisma|pymysql|mysqlclient",
+    r"DATABASE_URL|psycopg|asyncpg|sqlalchemy|pg8000|\bfrom pg\b|require\(['\"]pg['\"]\)|['\"]pg['\"]\s*:|prisma",
     re.IGNORECASE,
 )
 _SCAN_EXT = {".py", ".js", ".ts", ".mjs", ".cjs", ".txt", ".toml", ".json", ".env", ".example"}
 
+# kind -> sidecar recipe. Fixed credentials: a sidecar is reachable only on the cloudmorph docker network.
+# `ready` must pass only once the real server takes TCP connections (image init runs a socket-only server first).
+SIDECARS = {
+    "postgres": {
+        "container": "db",  # `<app>-db`, volume `<app>-dbdata`: names kept from the Postgres-only sidecar
+        "image": "postgres:16-alpine",
+        "args": "-e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app",
+        "data": "/var/lib/postgresql/data",
+        "cmd": "",
+        "ready": "pg_isready -h 127.0.0.1 -U app -q",
+        "conn": {"port": "5432", "user": "app", "password": "app", "database": "app"},
+        "url": "postgresql://{user}:{password}@{host}:{port}/{database}",
+    },
+    "mysql": {
+        "container": "mysql",
+        "image": "mysql:8.0",
+        "args": "-e MYSQL_ROOT_PASSWORD=app -e MYSQL_USER=app -e MYSQL_PASSWORD=app -e MYSQL_DATABASE=app",
+        "data": "/var/lib/mysql",
+        # older drivers (node `mysql`, pymysql without cryptography) can't do the default caching_sha2 auth
+        "cmd": "--default-authentication-plugin=mysql_native_password",
+        "ready": "mysql -h127.0.0.1 -uapp -papp -e 'select 1' app",
+        "conn": {"port": "3306", "user": "app", "password": "app", "database": "app"},
+        "url": "mysql://{user}:{password}@{host}:{port}/{database}",
+    },
+    "redis": {
+        "container": "redis",
+        "image": "redis:7-alpine",
+        "args": "",
+        "data": "/data",
+        "cmd": "redis-server --appendonly yes",
+        "ready": "redis-cli ping | grep -q PONG",
+        "conn": {"port": "6379", "user": "", "password": "", "database": "0"},
+        "url": "redis://{host}:{port}/{database}",
+    },
+    "mongodb": {
+        "container": "mongodb",
+        "image": "mongo:7",
+        "args": "-e MONGO_INITDB_ROOT_USERNAME=app -e MONGO_INITDB_ROOT_PASSWORD=app",
+        "data": "/data/db",
+        "cmd": "",
+        "ready": 'mongosh --quiet "mongodb://app:app@$(hostname -i):27017/?authSource=admin" '
+        "--eval 'db.runCommand({ping:1})'",
+        "conn": {"port": "27017", "user": "app", "password": "app", "database": "app"},
+        "url": "mongodb://{user}:{password}@{host}:{port}/{database}?authSource=admin",
+    },
+    "s3": {
+        # SeaweedFS S3 gateway (minio/minio is gone from Docker Hub). No identities configured -> any key is
+        # accepted, like the fixed passwords above. The bucket is created once the filer is up.
+        "container": "s3",
+        "image": "chrislusf/seaweedfs",
+        "args": "",
+        "data": "/data",
+        "cmd": "server -s3 -dir=/data",
+        "ready": "echo 's3.bucket.create -name app' | weed shell >/dev/null 2>&1; "
+        "wget -qO- http://127.0.0.1:8333/app >/dev/null",
+        "conn": {
+            "port": "8333",
+            "bucket": "app",
+            "access_key": "app",
+            "secret_key": "app-secret",
+            "region": "us-east-1",
+        },
+        "url": "http://{host}:{port}",
+    },
+}
+# what each target can provision when the user leaves a store blank (main.py marks those `auto`)
+STORE_KINDS = {"local": set(SIDECARS), "node": set(SIDECARS), "cloudrun": {"postgres"}}
+
+
+def can_provision(kind: str | None, target: str) -> bool:
+    return kind in STORE_KINDS.get(target, set())
+
 
 def detect_database(src_dir: Path) -> str | None:
     """'postgres' when the app reads DATABASE_URL or ships a Postgres driver; else None.
+    Only the fallback when no analysis is given (CLI); the pipeline passes the analyzer's stores.
     (An app that hard-codes a SQLite path gets nothing: injecting a URL it never reads would be theatre.)"""
     for p in src_dir.rglob("*"):
         if (
@@ -475,51 +555,105 @@ def wants_database(src_dir: Path, cfg: Config) -> str | None:
     return cfg.database or None
 
 
-def ensure_local_postgres(app: str, r: Runner) -> str:
-    """Postgres sidecar `<app>-db` on the local docker network; data in volume `<app>-dbdata`."""
-    db, net = f"{app}-db", nodepool.NETWORK
-    r.run("docker network", ["docker", "network", "create", net], check=False)
-    exists = subprocess.run(
-        ["docker", "ps", "-aq", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
-    )
-    if exists.stdout.strip():  # a stopped sidecar still holds the name; `docker start` is a no-op if running
-        r.run("docker start (postgres)", ["docker", "start", db], stage="deploy")
-    else:
-        r.run(
-            "docker run (postgres)",
-            [
-                "docker",
-                "run",
-                "-d",
-                "--restart",
-                "unless-stopped",
-                "--name",
-                db,
-                "--network",
-                net,
-                "-e",
-                "POSTGRES_USER=app",
-                "-e",
-                "POSTGRES_PASSWORD=app",
-                "-e",
-                "POSTGRES_DB=app",
-                "-v",
-                f"{app}-dbdata:/var/lib/postgresql/data",
-                "postgres:16-alpine",
-            ],
-            stage="deploy",
+def stores_to_provision(src_dir: Path, cfg: Config, target: str) -> dict[str, list[EnvRequirement]]:
+    """kind -> the app's blank connection settings that `target` can provision.
+    main.py passes the stores the user left entirely blank (cfg.stores); without them (CLI) the old guess applies:
+    Postgres into DATABASE_URL when the app reads it."""
+    if cfg.database is None:  # DEPLOYER_DATABASE="" turns provisioning off
+        return {}
+    items = cfg.stores
+    if items is None:
+        guess = "DATABASE_URL" not in cfg.env and wants_database(src_dir, cfg) == "postgres"
+        url = EnvRequirement(
+            name="DATABASE_URL", scope="runtime", secret=True, resource="postgres", role="url"
         )
-    deadline = time.time() + 90
-    while time.time() < deadline:
-        if (
-            subprocess.run(
-                ["docker", "exec", db, "pg_isready", "-U", "app", "-q"], capture_output=True, check=False
-            ).returncode
-            == 0
-        ):
-            return f"postgresql://app:app@{db}:5432/app"
-        time.sleep(1)
-    raise StepError("deploy", "deploy_error", f"postgres sidecar {db} did not become ready")
+        items = [url] if guess else []
+    out: dict[str, list[EnvRequirement]] = {}
+    for e in items:
+        if can_provision(e.resource, target):
+            out.setdefault(str(e.resource), []).append(e)
+    return out
+
+
+def provision_stores(src_dir: Path, cfg: Config, target: str, ensure) -> dict[str, str]:
+    """The app's container env: provisioned store settings, then the user's own values on top.
+    `ensure(kind)` starts/creates the store and returns its connection values by role."""
+    env: dict[str, str] = {}
+    for kind, items in stores_to_provision(src_dir, cfg, target).items():
+        env |= fill_store_env(items, ensure(kind))
+    return env | cfg.env
+
+
+def fill_store_env(items: list[EnvRequirement], conn: dict) -> dict[str, str]:
+    """Each setting gets the value of its role, in the env name the app reads. Roles the store lacks stay unset.
+    S3 also gets AWS_ENDPOINT_URL_S3, which current AWS SDKs read, so an app without an endpoint setting still
+    reaches the provisioned store."""
+    env = {"AWS_ENDPOINT_URL_S3": conn["endpoint"]} if "endpoint" in conn else {}
+    for e in items:
+        value = render_url(e.template, conn) if e.role == "url" and e.template else conn.get(e.role or "")
+        if value is not None:
+            env[e.name] = value
+    return env
+
+
+def render_url(template: str, conn: dict) -> str | None:
+    """Fill the analyzer's URL form ({host} {port} {user} {password} {database}).
+    A Cloud SQL unix socket has no host:port: libpq-style `?host=<dir>` instead (JDBC can't take that -> None)."""
+    socket_dir = conn.get("socket")
+    if socket_dir:
+        if template.startswith("jdbc:"):
+            return None
+        template = re.sub(r"\{host\}(:\{port\})?", "", template)
+    values = {k: urllib.parse.quote(str(conn.get(k) or ""), safe="") for k in ("user", "password")}
+    values |= {k: str(conn.get(k) or "") for k in ("host", "port", "database")}
+    url = template.format(**values)
+    return f"{url}{'&' if '?' in url else '?'}host={socket_dir}" if socket_dir else url
+
+
+def sidecar_conn(app: str, kind: str) -> dict:
+    s = SIDECARS[kind]
+    conn = {**s["conn"], "host": f"{app}-{s['container']}"}
+    conn["url"] = s["url"].format(**conn)
+    if kind == "s3":
+        conn["endpoint"] = conn["url"]
+    return conn
+
+
+def sidecar_script(app: str, kind: str) -> str:
+    """Start (or reuse) the `kind` sidecar of `app` and wait until it serves. Data lives in a named volume, so
+    redeploys keep it. The same script runs on local Docker and over ssh on a node."""
+    s, net = SIDECARS[kind], nodepool.NETWORK
+    c = f"{app}-{s['container']}"
+    run = (
+        f"docker run -d --restart unless-stopped --name {c} --network {net} {s['args']} "
+        f"-v {c}data:{s['data']} {s['image']} {s['cmd']}"
+    )
+    return (
+        f"docker network inspect {net} >/dev/null 2>&1 || docker network create {net} >/dev/null; "
+        f"docker start {c} >/dev/null 2>&1 || {run} >/dev/null || exit 1; "
+        f"for i in $(seq 1 120); do docker exec {c} sh -c {shlex.quote(s['ready'])} >/dev/null 2>&1 && exit 0; "
+        f"sleep 1; done; echo '{kind} sidecar {c} did not become ready' >&2; exit 1"
+    )
+
+
+def ensure_local_store(app: str, kind: str, r: Runner) -> dict:
+    r.run(f"{kind} sidecar", ["sh", "-c", sidecar_script(app, kind)], timeout=180, stage="deploy")
+    return sidecar_conn(app, kind)
+
+
+def cloudsql_conn(connection: str, url: str) -> dict:
+    """Connection values of ensure_cloudsql_database's URL; host is the socket directory (libpq and node-postgres
+    accept a directory as host)."""
+    p, socket_dir = urllib.parse.urlsplit(url), f"/cloudsql/{connection}"
+    return {
+        "url": url,
+        "host": socket_dir,
+        "socket": socket_dir,
+        "port": "5432",
+        "user": p.username,
+        "password": p.password,
+        "database": p.path.lstrip("/"),
+    }
 
 
 def ensure_cloudsql_database(app: str, cfg: Config, r: Runner) -> tuple[str, str]:
@@ -705,10 +839,13 @@ def tunnel_registered(log_path: Path, wait: int = 30) -> bool:
 
 
 def cleanup_local(handles: dict, *, drop_database: bool = False) -> list[str]:
-    """Stop the container and tunnel of a previous local deploy (idempotent). The Postgres sidecar survives
+    """Stop the container and tunnel of a previous local deploy (idempotent). Store sidecars survive
     redeploys (healer retries must keep the data); pass drop_database=True from an explicit cleanup."""
     done: list[str] = []
-    if drop_database and (db := handles.get("db_container")):
+    # db_container: state files written before every store got a sidecar
+    for db in (handles.get("store_containers") or [handles.get("db_container")]) if drop_database else []:
+        if not db:
+            continue
         cp = subprocess.run(["docker", "rm", "-f", db], capture_output=True, text=True, check=False)
         if cp.returncode == 0:
             done.append(f"removed database {db}")
@@ -749,10 +886,12 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
 
         out.stage = "deploy"
         r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
-        env = dict(cfg.env)
-        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
-            env["DATABASE_URL"] = ensure_local_postgres(name, r)
-            out.handles.update(database="postgres", db_container=f"{name}-db")
+
+        def ensure(kind: str) -> dict:
+            out.handles.setdefault("store_containers", []).append(f"{name}-{SIDECARS[kind]['container']}")
+            return ensure_local_store(name, kind, r)
+
+        env = provision_stores(src_dir, cfg, "local", ensure)
         run_cmd = [
             "docker",
             "run",
@@ -942,12 +1081,14 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
     cmd = _gcr(
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
     )
-    env = dict(cfg.env)
-    if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+
+    def ensure(kind: str) -> dict:  # Postgres only on Cloud Run (STORE_KINDS)
         conn, db_url = ensure_cloudsql_database(name, cfg, r)
-        env["DATABASE_URL"] = db_url
-        cmd += ["--add-cloudsql-instances", conn]
+        cmd.extend(["--add-cloudsql-instances", conn])
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
+        return cloudsql_conn(conn, db_url)
+
+    env = provision_stores(src_dir, cfg, "cloudrun", ensure)
     if env:
         cmd += [
             "--set-env-vars",
@@ -1126,10 +1267,13 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     out.stage = "deploy"
     t0 = time.time()
     try:
-        env = dict(cfg.env)
-        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
-            env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
-            out.handles.update(database="postgres", db_container=f"{name}-db")
+
+        def ensure(kind: str) -> dict:
+            out.handles.setdefault("store_containers", []).append(f"{name}-{SIDECARS[kind]['container']}")
+            nodepool.ssh_text(node, sidecar_script(name, kind), timeout=180)
+            return sidecar_conn(name, kind)
+
+        env = provision_stores(src_dir, cfg, "node", ensure)
         host_port = nodepool.free_port_on(node)
         cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, env)
     except RuntimeError as e:
@@ -1181,7 +1325,7 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
                 cfg.container_port,
                 fleet.Replica(node=node.name, container=cname, host=node.host, port=host_port),
                 str(src_dir),
-                stateful=out.handles.get("database") is not None,
+                stateful=bool(out.handles.get("store_containers")),
             )
             r.steps.append(
                 Step("router register", f"caddy route {public} -> {node_url}", 0, time.time() - t0, "", "")
