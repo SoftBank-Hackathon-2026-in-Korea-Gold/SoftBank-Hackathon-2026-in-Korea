@@ -1,5 +1,6 @@
-import React from 'react';
-import { Activity, Boxes, Eye, GitBranch, Layers, Radio, Server } from 'lucide-react';
+import React, { useState } from 'react';
+import { Activity, Boxes, Eye, GitBranch, KeyRound, Layers, Radio, Server } from 'lucide-react';
+import EnvEditor from './EnvEditor';
 import { Badge, Bar, Card, Dot } from './ui';
 import { fmtAgo, fmtTime } from '../lib/style';
 
@@ -23,7 +24,8 @@ const STATUS = {
   failed: { tone: 'rose', label: '실패' },
 };
 
-export function ProjectsPanel({ projects, currentId, onWatch, autoFollow, setAutoFollow }) {
+export function ProjectsPanel({ projects, currentId, onWatch, onRedeploy, autoFollow, setAutoFollow }) {
+  const [envOpen, setEnvOpen] = useState(null);
   return (
     <Card
       title="배포 중인 프로젝트"
@@ -45,7 +47,8 @@ export function ProjectsPanel({ projects, currentId, onWatch, autoFollow, setAut
             const urls = Object.entries(p.urls || {}).filter(([, u]) => u);
             const watching = p.last_deployment_id === currentId;
             return (
-              <div key={p.name} className={`flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-3 ${watching ? 'bg-violet-500/5' : ''}`}>
+              <div key={p.name} className={watching ? 'bg-violet-500/5' : ''}>
+              <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-5 py-3">
                 <div className="flex min-w-[220px] flex-1 items-center gap-3">
                   <Dot tone={st.tone} pulse={st.pulse} />
                   <div className="min-w-0">
@@ -69,7 +72,13 @@ export function ProjectsPanel({ projects, currentId, onWatch, autoFollow, setAut
                     className="flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-slate-300 hover:border-white/20 hover:text-white disabled:border-violet-500/40 disabled:text-violet-300">
                     <Eye className="h-3.5 w-3.5" /> {watching ? '보는 중' : '로그 보기'}
                   </button>
+                  <button type="button" onClick={() => setEnvOpen((n) => (n === p.name ? null : p.name))}
+                    className={`flex items-center gap-1 rounded-lg border px-2 py-1 hover:text-white ${envOpen === p.name ? 'border-violet-500/40 text-violet-300' : 'border-white/10 text-slate-300 hover:border-white/20'}`}>
+                    <KeyRound className="h-3.5 w-3.5" /> 환경변수
+                  </button>
                 </div>
+              </div>
+              {envOpen === p.name && <EnvEditor project={p} onRedeploy={onRedeploy} />}
               </div>
             );
           })}

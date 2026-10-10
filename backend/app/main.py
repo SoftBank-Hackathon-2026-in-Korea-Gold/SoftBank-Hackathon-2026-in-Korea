@@ -46,7 +46,15 @@ from sse_starlette.sse import EventSourceResponse
 from app import analyzer, deployer, env_store, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
-from app.schemas import AnalysisResult, DeployRequest, DeployTarget, EnvInput, EnvRequirement, PipelineEvent
+from app.schemas import (
+    AnalysisResult,
+    DeployRequest,
+    DeployTarget,
+    EnvInput,
+    EnvRequirement,
+    EnvUpdate,
+    PipelineEvent,
+)
 
 load_dotenv()
 
@@ -392,13 +400,23 @@ def _remove_workspace(path: Path) -> None:
         _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _env_key(item: EnvRequirement) -> str:
+    """Key of a value in the per-app store. Build inputs are kept apart so a saved build token never ends up
+    in the container's runtime env."""
+    return f"build:{item.name}" if item.scope == "build" else item.name
+
+
 def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
-    """deployer.deploy options for the user's values (blank ones are left out)."""
+    """deployer.deploy options for the values keyed by `_env_key` (blank ones are left out). Saved runtime
+    names the analyzer did not ask for (added in the dashboard) go into the container env too."""
     env: dict[str, str] = {}
     build_args: dict[str, str] = {}
     build_secrets: dict[str, str] = {}
     for item in required:
-        value = values.get(item.name)
+        value = values.get(_env_key(item))
         if not value:
             continue
         if item.scope == "runtime":
@@ -407,6 +425,9 @@ def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> di
             build_secrets[item.name] = value
         else:
             build_args[item.name] = value
+    for key, value in values.items():
+        if value and not key.startswith("build:"):
+            env.setdefault(key, value)
     options = {"env": env, "build_args": build_args, "build_secrets": build_secrets}
     return {k: v for k, v in options.items() if v}
 
@@ -664,17 +685,17 @@ def create_app() -> FastAPI:
             """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
             A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
             so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same."""
-            if not analysis.required_env:
-                return {}
             values = env_store.load(app_name) if name else {}
+            if not analysis.required_env:
+                return values  # names added in the dashboard still go in
             saved = dict(values)
-            if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
+            if used := sorted({e.name for e in analysis.required_env if values.get(_env_key(e))}):
                 emit(
                     PipelineEvent(
                         type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
                     )
                 )
-            missing = [e for e in analysis.required_env if not values.get(e.name)]
+            missing = [e for e in analysis.required_env if not values.get(_env_key(e))]
             if not missing:
                 return values
             if not ask_env:  # scripts and GitHub push: nobody to ask
@@ -685,10 +706,13 @@ def create_app() -> FastAPI:
                     )
                 )
                 return values
-            values |= _ask_env(missing)
+            answers = _ask_env(missing)
             for e in missing:
-                if e.scope == "runtime" and e.generate and not values.get(e.name):
-                    values[e.name] = secrets.token_urlsafe(32)
+                value = answers.get(e.name)
+                if not value and e.scope == "runtime" and e.generate:
+                    value = secrets.token_urlsafe(32)
+                if value:
+                    values[_env_key(e)] = value
             if name and values != saved:
                 try:
                     env_store.save(app_name, values)
@@ -782,6 +806,41 @@ def create_app() -> FastAPI:
     async def projects() -> dict:
         """Apps known to this server (by stable name) with their last deployment — what CD updates."""
         return {"projects": sorted(_projects.values(), key=lambda p: -p.get("updated_at", 0))}
+
+    def _saved_env(project: str) -> dict[str, str]:
+        if project not in _projects:
+            raise HTTPException(status_code=404, detail="unknown project")
+        if not env_store.enabled():
+            raise HTTPException(
+                status_code=409, detail="GCP_PROJECT_ID is not set, so env values are not stored"
+            )
+        try:
+            return env_store.load(project)
+        except env_store.EnvStoreError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from None
+
+    @app.get("/projects/{project}/env")
+    async def project_env(project: str) -> dict:
+        """Keys saved for an app ('build:NAME' for build inputs). Values never leave the server."""
+        return {"keys": sorted(await asyncio.to_thread(_saved_env, project))}
+
+    @app.put("/projects/{project}/env")
+    async def update_project_env(project: str, body: EnvUpdate) -> dict:
+        """Change saved values; the app gets them on its next deploy."""
+        if bad := [
+            k for k in [*body.values, *body.unset] if not ENV_NAME.fullmatch(k.removeprefix("build:"))
+        ]:
+            raise HTTPException(status_code=422, detail=f"invalid env name: {', '.join(bad)}")
+        values = await asyncio.to_thread(_saved_env, project)
+        updated = {k: v for k, v in values.items() if k not in body.unset} | {
+            k: v for k, v in body.values.items() if v
+        }
+        if updated != values:
+            try:
+                await asyncio.to_thread(env_store.save, project, updated)
+            except env_store.EnvStoreError as exc:
+                raise HTTPException(status_code=502, detail=str(exc)) from None
+        return {"keys": sorted(updated)}
 
     @app.post("/webhook/github")
     async def github_webhook(request: Request) -> dict:

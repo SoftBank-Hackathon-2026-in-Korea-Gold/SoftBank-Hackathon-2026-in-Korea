@@ -15,7 +15,7 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement
+from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement, EnvUpdate
 
 
 @pytest.fixture
@@ -895,6 +895,66 @@ def test_named_app_keeps_its_values_across_redeploys_and_push(m, tmp_path, monke
     assert all(c["env"]["SECRET_KEY"] == secret_key for c in calls)
     assert calls[1] == calls[2] and calls[2]["env"]["API_KEY"] == "k-1"
     assert calls[2]["build_secrets"] == {"GITHUB_TOKEN": "ghp_s3cret"}
+
+
+def test_dashboard_env_edits_reach_the_next_deploy(m, tmp_path, monkeypatch):
+    calls = []
+    store = {
+        "gb": {
+            "build:GITHUB_TOKEN": "ghp",
+            "build:GITHUB_USERNAME": "octo",
+            "SECRET_KEY": "s",
+            "API_KEY": "old",
+        }
+    }
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    monkeypatch.setattr(m.env_store, "enabled", lambda: True)
+    monkeypatch.setattr(m.env_store, "load", lambda app: dict(store.get(app, {})))
+    monkeypatch.setattr(m.env_store, "save", lambda app, values: store.__setitem__(app, dict(values)))
+    m._projects["gb"] = {"name": "gb", "history": []}
+    get, put = (
+        next(r.endpoint for r in m.app.routes if r.path == "/projects/{project}/env" and verb in r.methods)
+        for verb in ("GET", "PUT")
+    )
+
+    async def scenario():
+        keys = await get("gb")
+        edit = EnvUpdate(
+            values={"API_KEY": "new", "FEATURE_FLAG": "on", "SECRET_KEY": ""}, unset=["build:GITHUB_USERNAME"]
+        )
+        after = await put("gb", edit)
+        errors = []
+        for project, body in [("gb", EnvUpdate(values={"1BAD": "x"})), ("nope", EnvUpdate())]:
+            with pytest.raises(HTTPException) as exc:
+                await put(project, body)
+            errors.append(exc.value.status_code)
+        request = DeployRequest(source=str(source), targets=["local"], name="gb")  # a push: nothing is asked
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return keys, after, errors
+
+    keys, after, errors = asyncio.run(scenario())
+    assert keys == {"keys": ["API_KEY", "SECRET_KEY", "build:GITHUB_TOKEN", "build:GITHUB_USERNAME"]}
+    assert after == {
+        "keys": ["API_KEY", "FEATURE_FLAG", "SECRET_KEY", "build:GITHUB_TOKEN"]
+    }  # blank kept "s"
+    assert errors == [422, 404]
+    assert calls[0]["env"] == {
+        "API_KEY": "new",
+        "FEATURE_FLAG": "on",
+        "SECRET_KEY": "s",
+    }  # no build token here
+    assert calls[0]["build_secrets"] == {"GITHUB_TOKEN": "ghp"} and "build_args" not in calls[0]
+
+    monkeypatch.setattr(m.env_store, "enabled", lambda: False)
+    with pytest.raises(HTTPException) as off:
+        asyncio.run(get("gb"))
+    assert off.value.status_code == 409
 
 
 def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):

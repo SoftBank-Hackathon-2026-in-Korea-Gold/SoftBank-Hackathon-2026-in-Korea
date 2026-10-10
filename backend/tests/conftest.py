@@ -9,6 +9,7 @@ import pytest
 def _isolated_project_registry(tmp_path, monkeypatch):
     # env var survives importlib.reload(app.main) in tests that reload the module
     monkeypatch.setenv("CLOUDMORPH_PROJECTS_FILE", str(tmp_path / "projects.json"))
+    monkeypatch.delenv("GCP_PROJECT_ID", raising=False)  # and away from the real Secret Manager (env_store)
     from app import main
 
     monkeypatch.setattr(main, "PROJECTS_FILE", tmp_path / "projects.json")

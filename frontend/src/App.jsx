@@ -91,6 +91,15 @@ export default function App() {
   };
 
   const watchProject = (p) => attach(p.last_deployment_id, { source: p.source, targets: p.targets || [], name: p.name, trigger: p.trigger });
+  // same source/ref/targets as last time; saved env values are picked up by the backend
+  const redeployProject = async (p) => {
+    try {
+      const id = await startDeploy({ source: p.source, targets: p.targets, name: p.name, ref: p.ref || undefined });
+      attach(id, { source: p.source, targets: p.targets, name: p.name, trigger: 'api' });
+    } catch (e) {
+      setRun({ ...emptyRun(), status: 'failed', error: e.message, logs: [{ id: 0, at: new Date(), kind: 'error', stage: 'failed', text: `재배포 요청 실패: ${e.message}` }] });
+    }
+  };
   const saveToken = (v) => { setToken(v); setTokenState(v); };
 
   return (
@@ -147,7 +156,7 @@ export default function App() {
         </div>
 
         <div className="mt-5 space-y-5">
-          <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
+          <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} onRedeploy={redeployProject} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
           <FleetPanel fleet={fleet} />
         </div>
       </div>

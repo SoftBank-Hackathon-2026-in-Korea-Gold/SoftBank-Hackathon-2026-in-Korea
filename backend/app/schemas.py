@@ -168,3 +168,13 @@ class EnvInput(BaseModel):
     """POST /deploy/{deployment_id}/env body. Names not in the job's `required_env` are ignored."""
 
     values: dict[str, str] = Field(default_factory=dict)
+
+
+class EnvUpdate(BaseModel):
+    """PUT /projects/{name}/env body. Saved values are never read back; they reach the app on its next deploy."""
+
+    values: dict[str, str] = Field(
+        default_factory=dict,
+        description="Key -> new value; blank values are ignored. Build inputs are 'build:NAME'",
+    )
+    unset: list[str] = Field(default_factory=list, description="Keys to delete")

@@ -52,6 +52,20 @@ export async function getProjects() {
   return (await res.json()).projects
 }
 
+/** Keys saved for an app's env ('build:NAME' for build inputs); values never come back. null: not stored (409). */
+export async function getProjectEnv(name) {
+  const res = await fetch(`/projects/${name}/env`, { headers: headers() })
+  if (res.status === 409) return null
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
+  return (await res.json()).keys
+}
+
+export async function putProjectEnv(name, { values, unset }) {
+  const res = await fetch(`/projects/${name}/env`, { method: 'PUT', headers: headers(), body: JSON.stringify({ values, unset }) })
+  if (!res.ok) throw new Error(`${res.status} ${(await res.text()).slice(0, 300)}`)
+  return (await res.json()).keys
+}
+
 /** Subscribe to the SSE stream. `onEvent(type, payload, raw)`; returns a close() function. */
 export function subscribe(id, onEvent, onFail) {
   const q = getToken() ? `?token=${encodeURIComponent(getToken())}` : ''
