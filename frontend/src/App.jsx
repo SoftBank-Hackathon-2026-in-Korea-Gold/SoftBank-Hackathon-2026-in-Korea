@@ -1,14 +1,34 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Cloud, KeyRound } from 'lucide-react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
 import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import EnvRequestCard from './components/EnvRequestCard';
-import Stepper from './components/Stepper';
 import LogConsole from './components/LogConsole';
 import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
 import { FleetPanel, ProjectsPanel } from './components/OpsPanels';
-import { Dot } from './components/ui';
+import { DashboardHeader, RunHUD, ActivityDock } from './components/DashboardChrome';
+import DetailsDrawer from './components/DetailsDrawer';
+import { pendingInput } from './lib/dashboard';
+import SceneBoundary from './components/3d/SceneBoundary';
+import { shouldCelebrate } from './lib/victory';
+
+// three / fiber / drei live in lazy chunks so the 2D dashboard paints first
+const PipelineJourney = lazy(() => import('./components/3d/PipelineJourney'));
+const InstancedFleetGrid = lazy(() => import('./components/3d/InstancedFleetGrid'));
+const VictoryCelebration = lazy(() => import('./components/3d/VictoryCelebration'));
+
+const FLEET_DEMO_MAX = 500;
+
+// ?fleetDemo=N adds N synthetic nodes to the 3D fleet grid (instancing demo)
+function parseFleetDemo(search) {
+  const n = Number.parseInt(new URLSearchParams(search).get('fleetDemo') ?? '', 10);
+  return Number.isFinite(n) ? Math.min(FLEET_DEMO_MAX, Math.max(0, n)) : 0;
+}
+
+// same chrome and height as the loaded component, so nothing shifts when the chunk arrives
+function SceneMessage({ children }) {
+  return <div className="scene-message" role="status">{children}</div>;
+}
 
 export default function App() {
   const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false, function: false } });
@@ -17,7 +37,10 @@ export default function App() {
   const [fleet, setFleet] = useState(null);
   const [healthy, setHealthy] = useState(null);
   const [token, setTokenState] = useState(getToken());
-  const [showToken, setShowToken] = useState(false);
+  const [activeScene, setActiveScene] = useState('journey');
+  const [panel, setPanel] = useState(null);
+  const [fullscreen, setFullscreen] = useState(false);
+  const shell = useRef(null);
   const [autoFollow, setAutoFollow] = useState(true);
   const [notice, setNotice] = useState(null);
   const [stopping, setStopping] = useState(null);
@@ -26,6 +49,22 @@ export default function App() {
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
   const [now, setNow] = useState(() => Date.now());
+  const [dismissedVictoryIds, setDismissedVictoryIds] = useState(() => new Set());
+  const [fleetDemo] = useState(() => parseFleetDemo(window.location.search));
+  const pending = pendingInput(run);
+  const [lastInputKey, setLastInputKey] = useState(null);
+  if ((pending?.key || null) !== lastInputKey) {
+    setLastInputKey(pending?.key || null);
+    if (pending) setPanel('details');
+  }
+
+  useEffect(() => {
+    const update = () => setFullscreen(document.fullscreenElement === shell.current);
+    document.addEventListener('fullscreenchange', update);
+    return () => document.removeEventListener('fullscreenchange', update);
+  }, []);
+
+  useEffect(() => () => closeRef.current?.(), []);
 
   // re-render once a second while running so elapsed time moves
   useEffect(() => {
@@ -36,6 +75,9 @@ export default function App() {
 
   const attach = useCallback((id, meta) => {
     closeRef.current?.();
+    setActiveScene('journey');
+    setPanel(null);
+    setCancelling(null);
     setRun(emptyRun(id, meta));
     closeRef.current = subscribe(id, (type, p, raw) => setRun((r) => (r.id === id ? applyEvent(r, type, p, raw) : r)));
   }, []);
@@ -127,66 +169,67 @@ export default function App() {
 
   const watchProject = (p) => attach(p.last_deployment_id, { source: p.source, targets: p.targets || [], name: p.name, trigger: p.trigger });
   const saveToken = (v) => { setToken(v); setTokenState(v); };
+  const celebrate = shouldCelebrate(run, dismissedVictoryIds);
+
+  const dismissVictory = () => setDismissedVictoryIds((ids) => new Set(ids).add(run.id));
+  const selectScene = (scene) => {
+    if (celebrate) dismissVictory();
+    setActiveScene(scene);
+  };
+  const toggleFullscreen = async () => {
+    try {
+      if (document.fullscreenElement) await document.exitFullscreen();
+      else await shell.current?.requestFullscreen?.();
+    } catch {
+      flash('전체화면을 열지 못했습니다. 현재 화면에서 계속 사용할 수 있습니다.');
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-[#0a0d14] text-slate-100">
-      <div className="pointer-events-none fixed inset-x-0 top-0 h-72 bg-gradient-to-b from-violet-900/20 via-indigo-900/5 to-transparent" />
-      <div className="relative mx-auto max-w-[1400px] px-6 pb-16 pt-6">
-        <header className="mb-6 flex flex-wrap items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-violet-500 to-indigo-600 shadow-lg shadow-violet-900/50">
-              <Cloud className="h-5 w-5 text-white" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight">CloudMorph</h1>
-              <p className="text-xs text-slate-400">One Action, Infinite Clouds — 분석 · 배포 · 자가치유 · 멀티 클라우드</p>
-            </div>
+    <div ref={shell} className="dashboard-shell">
+      <div className="dashboard-page" inert={panel ? true : undefined}>
+        <DashboardHeader scene={activeScene} onScene={selectScene} healthy={healthy} onPanel={setPanel} fullscreen={fullscreen} onFullscreen={toggleFullscreen} />
+        <main className="dashboard-stage">
+          <RunHUD run={run} now={now} notice={notice} onPanel={setPanel} onCancel={onCancel} cancelling={cancelling === run.id} celebrate={celebrate} />
+          <div id="scene-view" className="scene-view" role="tabpanel" aria-labelledby={`scene-tab-${activeScene}`}>
+            <SceneBoundary key={celebrate ? `victory-${run.id}` : activeScene} fallback={<SceneMessage>3D 화면을 사용할 수 없습니다. 상태와 상세 패널에서 배포를 계속 확인할 수 있습니다.</SceneMessage>}>
+              <Suspense fallback={<SceneMessage>3D 장면을 준비하고 있습니다…</SceneMessage>}>
+                {celebrate ? <VictoryCelebration open run={run} presentation="stage" onClose={dismissVictory} />
+                  : activeScene === 'journey' ? <PipelineJourney run={run} presentation="stage" />
+                    : fleet ? <InstancedFleetGrid fleet={fleet} demoCount={fleetDemo} presentation="stage" />
+                      : <SceneMessage>노드 풀 데이터를 불러오지 못했습니다. 연결 상태와 설정을 확인해 주세요.</SceneMessage>}
+              </Suspense>
+            </SceneBoundary>
           </div>
-          <div className="flex items-center gap-3 text-xs">
-            <span className="flex items-center gap-1.5 rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-slate-300">
-              <Dot tone={healthy ? 'emerald' : healthy === false ? 'rose' : 'slate'} pulse={!!healthy} /> 백엔드 {healthy ? '연결됨' : healthy === false ? '끊김' : '확인 중'}
-            </span>
-            {fleet && <span className="rounded-full border border-white/10 bg-white/5 px-2.5 py-1 text-slate-300">노드 {fleet.nodes.filter((n) => n.ok).length}/{fleet.nodes.length}</span>}
-            <button type="button" onClick={() => setShowToken((s) => !s)} className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 ${token ? 'border-emerald-500/30 text-emerald-300' : 'border-white/10 text-slate-400'} hover:text-white`}>
-              <KeyRound className="h-3.5 w-3.5" /> {token ? '토큰 설정됨' : 'API 토큰'}
-            </button>
-            {showToken && (
-              <input autoFocus type="password" value={token} onChange={(e) => saveToken(e.target.value)} placeholder="공개 터널일 때만 필요"
-                className="w-52 rounded-lg border border-white/10 bg-black/40 px-2.5 py-1 text-slate-100 focus:border-violet-500/60 focus:outline-none" />
-            )}
-          </div>
-        </header>
-
-        {notice && (
-          <div className="mb-4 flex items-center gap-2 rounded-xl border border-sky-500/30 bg-sky-500/10 px-4 py-2.5 text-sm text-sky-100">
-            <Dot tone="sky" pulse /> {notice}
-          </div>
-        )}
-
-        <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
-          <div className="space-y-5">
-            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || run.status === 'running'} fleetAvailable={!!fleet} />
-            <AnalysisCard run={run} />
-          </div>
-          <div className="min-w-0 space-y-5">
-            {run.envRequest && <EnvRequestCard key={run.id} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
-            <Stepper run={run} now={now} onCancel={onCancel} cancelling={cancelling === run.id} />
-            <QuestionCard question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
-            <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
-              <LogConsole logs={run.logs} running={run.status === 'running'} />
-              <div className="min-w-0 space-y-5">
-                <Endpoints run={run} project={currentProject} onStop={onStop} stopping={stopping} />
-                <PatchList patches={run.patches} />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <div className="mt-5 space-y-5">
-          <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} onStop={onStop} stopping={stopping} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
-          <FleetPanel fleet={fleet} />
-        </div>
+          <ActivityDock run={run} project={currentProject} onPanel={setPanel} />
+        </main>
       </div>
+      <DetailsDrawer panel={panel} onPanel={setPanel} onClose={() => setPanel(null)}>
+        <div className="drawer-section" hidden={panel !== 'deploy'}>
+          <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || run.status === 'running'} fleetAvailable={!!fleet} />
+        </div>
+        <div className="drawer-section" hidden={panel !== 'details'}>
+          {run.envRequest && <EnvRequestCard key={`env-${run.id}`} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
+          <QuestionCard key={`question-${run.id}`} question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
+          <AnalysisCard run={run} />
+          <Endpoints run={run} project={currentProject} onStop={onStop} stopping={stopping} />
+          <PatchList patches={run.patches} />
+          <LogConsole logs={run.logs} running={run.status === 'running'} height={320} active={panel === 'details'} />
+        </div>
+        <div className="drawer-section" hidden={panel !== 'projects'}>
+          <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} onStop={onStop} stopping={stopping} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
+        </div>
+        <div className="drawer-section" hidden={panel !== 'nodes'}>
+          {fleet ? <FleetPanel fleet={fleet} /> : <p>노드 풀 데이터를 불러오지 못했습니다.</p>}
+        </div>
+        <div className="drawer-section settings-section" hidden={panel !== 'settings'}>
+          <h3>API 토큰</h3>
+          <p>인증이 필요한 서버에 연결할 때 설정하세요.</p>
+          <label htmlFor="api-token">API 토큰</label>
+          <input id="api-token" type="password" autoComplete="off" value={token} onChange={(e) => saveToken(e.target.value)} placeholder="API 토큰 입력" />
+          <p>{token ? '토큰이 설정되어 있습니다.' : '토큰이 설정되지 않았습니다.'}</p>
+        </div>
+      </DetailsDrawer>
     </div>
   );
 }

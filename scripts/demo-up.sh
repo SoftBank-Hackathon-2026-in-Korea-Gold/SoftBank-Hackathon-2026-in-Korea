@@ -55,7 +55,7 @@ say "backend  -> http://127.0.0.1:$BACKEND_PORT"
    > "$STATE/backend.log" 2>&1 & echo $! > "$STATE/backend.pid")
 say "frontend -> http://127.0.0.1:$FRONT_PORT"
 (cd "$ROOT/frontend" && VITE_BACKEND_URL="http://127.0.0.1:$BACKEND_PORT" nohup npm run dev -- --host 127.0.0.1 --port "$FRONT_PORT" \
-   > "$STATE/frontend.log" 2>&1 & echo $! > "$STATE/frontend.pid")
+   </dev/null > "$STATE/frontend.log" 2>&1 & echo $! > "$STATE/frontend.pid")
 for i in $(seq 1 30); do curl -sf "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null && break; sleep 1; done
 curl -sf "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null || die "backend did not come up, see $STATE/backend.log"
 for i in $(seq 1 30); do curl -sf "http://127.0.0.1:$FRONT_PORT/health" >/dev/null && break; sleep 1; done
