@@ -756,6 +756,99 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     assert decoded[5]["payload"]["success"] is True
 
 
+def test_stop_takes_down_every_live_target_once(m, tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(target="local", language="python", dockerfile="FROM scratch\n"),
+    )
+    monkeypatch.setattr(
+        m.deployer,
+        "deploy",
+        lambda directory, dockerfile, target: DeployResult(
+            success=True, target=target, exit_code=0, url=f"https://{target}.invalid"
+        ),
+    )
+    monkeypatch.setattr(m.deployer, "last_handles", lambda d: {"dir": Path(d).name})
+    torn = []
+    monkeypatch.setattr(m.deployer, "teardown", lambda t, h: torn.append((t, h["dir"])) or [f"down {t}"])
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    stop = routes["/projects/{name}/stop"]
+
+    async def scenario():
+        response = await routes["/deploy"](DeployRequest(source=str(source), name="demo"))
+        deployment_id = response["deployment_id"]
+        while not m._jobs[deployment_id].completed:
+            await asyncio.sleep(0.001)
+        assert set(m._projects["demo"]["live"]) == {"local", "cloudrun"}
+        first = await stop("demo")
+        second = await stop("demo")
+        with pytest.raises(m.HTTPException) as unknown:
+            await stop("nope")
+        m._app_locks["demo"].acquire()
+        with pytest.raises(m.HTTPException) as busy:
+            await stop("demo")
+        m._app_locks["demo"].release()
+        return first, second, unknown.value.status_code, busy.value.status_code
+
+    first, second, unknown, busy = asyncio.run(scenario())
+    assert first == {
+        "name": "demo",
+        "stopped": {"local": ["down local"], "cloudrun": ["down cloudrun"]},
+        "failed": {},
+    }
+    assert sorted(torn) == [("cloudrun", "demo-cloudrun"), ("local", "demo-local")]
+    assert second["stopped"] == {}  # nothing left serving
+    assert (unknown, busy) == (404, 409)
+    project = m._projects["demo"]
+    assert project["last_status"] == "stopped" and project["live"] == {} and project["urls"] == {}
+
+
+def test_stop_keeps_targets_that_failed_to_come_down(m, monkeypatch):
+    m._projects["demo"] = {
+        "name": "demo",
+        "last_status": "completed",
+        "urls": {"local": "u1", "cloudrun": "u2"},
+        "live": {"local": {}, "cloudrun": {"service": "demo-cloudrun"}},
+    }
+
+    def teardown(target, handles):
+        if target == "cloudrun":
+            raise RuntimeError("permission denied")
+        return ["down"]
+
+    monkeypatch.setattr(m.deployer, "teardown", teardown)
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    result = asyncio.run(routes["/projects/{name}/stop"]("demo"))
+    assert result["failed"] == {"cloudrun": "RuntimeError: permission denied"}
+    project = m._projects["demo"]
+    assert set(project["live"]) == {"cloudrun"} and project["urls"] == {"cloudrun": "u2"}
+    assert project["last_status"] == "completed"
+
+
+def _cancel_setup(m, tmp_path, monkeypatch, fake_deploy):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local", language="python", dockerfile='FROM python:3.11-slim\nCMD ["python", "app.py"]\n'
+        ),
+    )
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    original_mkdtemp = m.tempfile.mkdtemp
+    monkeypatch.setattr(m.tempfile, "mkdtemp", lambda *a, **kw: original_mkdtemp(dir=tmp_path, **kw))
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    return source, routes
+
+
 def _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy):
     source = tmp_path / "source"
     source.mkdir()
@@ -786,6 +879,94 @@ def _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy):
     monkeypatch.setattr(m.tempfile, "mkdtemp", mkdtemp_in_test_dir)
     routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
     return source, routes
+
+
+def _events(routes, deployment_id):
+    async def collect():
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        return [(e["event"], json.loads(e["data"])) async for e in response.body_iterator]
+
+    return asyncio.run(collect())
+
+
+def test_cancel_kills_the_build_and_skips_the_remaining_targets(m, tmp_path, monkeypatch):
+    building, released = threading.Event(), threading.Event()
+    calls, killed = [], []
+
+    def fake_deploy(directory, dockerfile, target):
+        calls.append(target)
+        building.set()
+        assert released.wait(5)
+        return DeployResult(success=False, target=target, exit_code=1, stderr="docker build killed")
+
+    def fake_pkill(cmd, **kwargs):
+        killed.append(cmd)
+        released.set()
+        return subprocess.CompletedProcess(cmd, 0)
+
+    source, routes = _cancel_setup(m, tmp_path, monkeypatch, fake_deploy)
+    monkeypatch.setattr(m.subprocess, "run", fake_pkill)
+
+    async def scenario():
+        deployment_id = (await routes["/deploy"](DeployRequest(source=str(source), name="demo")))[
+            "deployment_id"
+        ]
+        while not building.is_set():
+            await asyncio.sleep(0.001)
+        assert await routes["/deploy/{deployment_id}/cancel"](deployment_id) == {
+            "deployment_id": deployment_id,
+            "cancelled": True,
+        }
+        while not m._jobs[deployment_id].completed:
+            await asyncio.sleep(0.001)
+        with pytest.raises(m.HTTPException) as late:
+            await routes["/deploy/{deployment_id}/cancel"](deployment_id)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id), late.value.status_code
+
+    deployment_id, status, late = asyncio.run(scenario())
+    assert calls == ["local"]  # cloudrun never started
+    assert killed[0][:2] == ["pkill", "-f"] and "cloudmorph-deploy-" in killed[0][2]
+    assert status["status"] == "cancelled" and late == 409
+    assert m._projects["demo"]["last_status"] == "cancelled"
+    events = _events(routes, deployment_id)
+    assert events[-1] == (
+        "error",
+        {**events[-1][1], "payload": {"message": "cancelled by user", "cancelled": True}},
+    )
+    assert not any(e == "stage" and d["stage"] == "heal" for e, d in events)  # healer never ran
+
+
+def test_cancel_stops_the_healer_before_its_next_redeploy(m, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_deploy(directory, dockerfile, target):
+        calls.append(target)
+        if len(calls) == 2:  # healer's first redeploy is in flight when the user cancels
+            next(iter(m._jobs.values())).cancel.set()
+            return DeployResult(
+                success=False,
+                target=target,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'redis'",
+            )
+        return DeployResult(
+            success=False, target=target, exit_code=1, stderr="ModuleNotFoundError: No module named 'flask'"
+        )
+
+    source, routes = _cancel_setup(m, tmp_path, monkeypatch, fake_deploy)
+
+    async def scenario():
+        deployment_id = (
+            await routes["/deploy"](DeployRequest(source=str(source), targets=["local"], name="demo"))
+        )["deployment_id"]
+        while not m._jobs[deployment_id].completed:
+            await asyncio.sleep(0.001)
+        return deployment_id, await routes["/deploy/{deployment_id}"](deployment_id)
+
+    deployment_id, status = asyncio.run(scenario())
+    assert len(calls) == 2
+    assert status["status"] == "cancelled"
+    assert _events(routes, deployment_id)[-1][1]["payload"]["cancelled"] is True
 
 
 async def _until(check):

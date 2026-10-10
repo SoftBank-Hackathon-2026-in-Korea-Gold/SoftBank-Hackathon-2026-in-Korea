@@ -1442,6 +1442,44 @@ def cleanup(src_dir: str) -> list[str]:
     return cleanup_local(_read_handles(Path(src_dir).resolve()), drop_database=True)
 
 
+def last_handles(src_dir: str | os.PathLike) -> dict:
+    """Handles (container, tunnel pid, service, node) of the last deploy of `src_dir`, for teardown()."""
+    return _read_handles(Path(src_dir).resolve())
+
+
+def teardown(target: str, handles: dict) -> list[str]:
+    """Take down what a successful deploy left serving (idempotent). Databases are kept: data survives a stop."""
+    if target == "local":
+        return cleanup_local(handles)
+    if target == "cloudrun":
+        cfg = Config.from_env()
+        cfg.project, cfg.region = handles.get("project") or cfg.project, handles.get("region") or cfg.region
+        service = handles["service"]
+        cp = subprocess.run(
+            _gcr(cfg, "services", "delete", service), capture_output=True, text=True, check=False, timeout=300
+        )
+        if cp.returncode == 0:
+            return [f"deleted Cloud Run service {service}"]
+        if "could not be found" in cp.stderr or "NOT_FOUND" in cp.stderr:
+            return []
+        raise RuntimeError(f"gcloud run services delete {service} failed: {cp.stderr.strip()[-500:]}")
+    if target == "node":
+        from app import fleet
+
+        cname = handles.get("container_name")
+        app = next(
+            (a for a in fleet.load_state().apps.values() if any(r.container == cname for r in a.replicas)),
+            None,
+        )
+        if app is not None:  # routed: drop the hostname and every scaled-out replica with it
+            fleet.remove(app.name)
+            return [f"removed {app.name} from the fleet ({len(app.replicas)} replicas)"]
+        if cname and nodepool.remove_container(nodepool.load_registry().get(handles["node"]), cname):
+            return [f"removed container {cname} on {handles['node']}"]
+        return []
+    raise ValueError(f"unknown target: {target}")
+
+
 # --------------------------------------------------------------------------- #
 # CLI
 # --------------------------------------------------------------------------- #

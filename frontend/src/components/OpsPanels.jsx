@@ -1,7 +1,8 @@
 import React from 'react';
 import { Activity, Boxes, Eye, GitBranch, Layers, Radio, Server } from 'lucide-react';
-import { Badge, Bar, Card, Dot } from './ui';
+import { Badge, Bar, Card, Dot, StopButton } from './ui';
 import { fmtAgo, fmtTime } from '../lib/style';
+import { canStop } from '../lib/run';
 
 const EVENT_LABEL = { deploy: '배포', scale_out: '확장', scale_in: '축소', scale_out_blocked: '확장 보류' };
 
@@ -21,9 +22,11 @@ const STATUS = {
   completed: { tone: 'emerald', label: '정상' },
   partial_failure: { tone: 'amber', label: '일부 실패' },
   failed: { tone: 'rose', label: '실패' },
+  stopped: { tone: 'slate', label: '중지됨' },
+  cancelled: { tone: 'slate', label: '중단됨' },
 };
 
-export function ProjectsPanel({ projects, currentId, onWatch, autoFollow, setAutoFollow }) {
+export function ProjectsPanel({ projects, currentId, onWatch, onStop, stopping, autoFollow, setAutoFollow }) {
   return (
     <Card
       title="배포 중인 프로젝트"
@@ -69,6 +72,7 @@ export function ProjectsPanel({ projects, currentId, onWatch, autoFollow, setAut
                     className="flex items-center gap-1 rounded-lg border border-white/10 px-2 py-1 text-slate-300 hover:border-white/20 hover:text-white disabled:border-violet-500/40 disabled:text-violet-300">
                     <Eye className="h-3.5 w-3.5" /> {watching ? '보는 중' : '로그 보기'}
                   </button>
+                  {canStop(p) && <StopButton onClick={() => onStop(p.name)} busy={stopping === p.name} />}
                 </div>
               </div>
             );

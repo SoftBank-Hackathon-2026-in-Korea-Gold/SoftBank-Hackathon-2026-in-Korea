@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Cloud, KeyRound } from 'lucide-react';
-import { answerQuestion, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, submitEnv, subscribe } from './api';
+import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import EnvRequestCard from './components/EnvRequestCard';
@@ -20,6 +20,8 @@ export default function App() {
   const [showToken, setShowToken] = useState(false);
   const [autoFollow, setAutoFollow] = useState(true);
   const [notice, setNotice] = useState(null);
+  const [stopping, setStopping] = useState(null);
+  const [cancelling, setCancelling] = useState(null);
   const [starting, setStarting] = useState(false);
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
@@ -95,6 +97,34 @@ export default function App() {
     }
   };
 
+  const flash = (text) => { setNotice(text); setTimeout(() => setNotice(null), 6000); };
+  const onStop = async (name) => {
+    if (!window.confirm(`${name} 앱을 중지할까요?\n컨테이너 · 터널 · Cloud Run 서비스 · 노드 복제본을 내립니다. (DB 데이터는 남겨둡니다)`)) return;
+    setStopping(name);
+    try {
+      const r = await stopProject(name);
+      const failed = Object.entries(r.failed);
+      flash(failed.length ? `${name} 일부 중지 실패 · ${failed.map(([t, e]) => `${t}: ${e}`).join(' · ')}` : `${name} 중지됨`);
+    } catch (e) {
+      flash(`${name} 중지 실패 · ${e.message}`);
+    } finally {
+      setStopping(null);
+      getProjects().then((p) => p && setProjects(p)).catch(() => {});
+    }
+  };
+  const onCancel = async () => {
+    const id = run.id;
+    if (!window.confirm('진행 중인 배포를 중단할까요?\n이미 떠 있는 타깃은 그대로 두고, 나머지는 시작하지 않습니다.')) return;
+    setCancelling(id);
+    try {
+      await cancelDeploy(id);
+    } catch (e) {
+      flash(`중단 실패 · ${e.message}`);
+      setCancelling(null);
+    }
+  };
+  const currentProject = projects?.find((p) => p.last_deployment_id === run.id) || null;
+
   const watchProject = (p) => attach(p.last_deployment_id, { source: p.source, targets: p.targets || [], name: p.name, trigger: p.trigger });
   const saveToken = (v) => { setToken(v); setTokenState(v); };
 
@@ -140,12 +170,12 @@ export default function App() {
           </div>
           <div className="min-w-0 space-y-5">
             {run.envRequest && <EnvRequestCard key={run.id} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
-            <Stepper run={run} now={now} />
+            <Stepper run={run} now={now} onCancel={onCancel} cancelling={cancelling === run.id} />
             <QuestionCard question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
             <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
               <LogConsole logs={run.logs} running={run.status === 'running'} />
               <div className="min-w-0 space-y-5">
-                <Endpoints run={run} />
+                <Endpoints run={run} project={currentProject} onStop={onStop} stopping={stopping} />
                 <PatchList patches={run.patches} />
               </div>
             </div>
@@ -153,7 +183,7 @@ export default function App() {
         </div>
 
         <div className="mt-5 space-y-5">
-          <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
+          <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} onStop={onStop} stopping={stopping} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
           <FleetPanel fleet={fleet} />
         </div>
       </div>

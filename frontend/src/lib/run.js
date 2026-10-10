@@ -88,6 +88,8 @@ export function applyEvent(prev, type, p, raw) {
         push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 · ${line.slice(5)} → 배포를 이어갑니다` })
       } else if (line.startsWith('queue: ')) {
         push(run, { ts, kind: 'push', stage: 'queue', text: `대기 · 같은 앱의 이전 배포가 끝나면 시작합니다 (${line.slice(7)})` })
+      } else if (line.startsWith('cancel: ')) {
+        push(run, { ts, kind: 'error', stage: 'cancel', text: '중단 요청 · 진행 중인 빌드를 끊고 다음 단계에서 멈춥니다' })
       } else if (line.startsWith('github push')) {
         run.trigger = 'github-push'
         push(run, { ts, kind: 'push', stage: 'trigger', text: line })
@@ -148,7 +150,14 @@ export function applyEvent(prev, type, p, raw) {
     case 'error': {
       const t = p.target
       const msg = p.message || p.summary || '실패'
-      if (t) {
+      if (p.cancelled) {
+        for (const k of run.targets) {
+          if (!['done', 'failed'].includes(run.targetState[k]?.phase)) run.targetState[k] = { ...run.targetState[k], phase: 'cancelled' }
+        }
+        run.status = 'cancelled'
+        run.finishedAt = Date.now()
+        push(run, { ts, kind: 'error', stage: 'cancel', text: '사용자가 배포를 중단했습니다' })
+      } else if (t) {
         ensure(run, t)
         run.targetState[t] = { ...run.targetState[t], phase: 'failed', message: msg }
         push(run, { ts, kind: 'error', stage: 'failed', target: t, text: msg })
@@ -179,6 +188,10 @@ export function stepStatus(run) {
   const healed = run.patches.length > 0
   const finished = run.status !== 'running' && run.status !== 'idle'
   const failed = run.status === 'failed'
+  if (run.status === 'cancelled') {
+    const up = phases.includes('done')
+    return { analyze: run.analysis ? 'done' : 'cancelled', deploy: up ? 'done' : 'cancelled', heal: healed ? 'done' : 'cancelled', live: up ? 'partial' : 'cancelled' }
+  }
   return {
     analyze: run.status === 'idle' ? 'idle' : run.analysis || anyStarted ? 'done' : failed ? 'failed' : 'active',
     deploy: !anyStarted ? (finished && failed ? 'failed' : 'idle') : phases.some((p) => p === 'deploying') ? 'active' : 'done',
@@ -186,3 +199,6 @@ export function stepStatus(run) {
     live: finished ? (run.status === 'failed' ? 'failed' : run.status === 'partial_failure' ? 'partial' : 'done') : 'idle',
   }
 }
+
+/** True when the backend still holds something it can take down for this project. */
+export const canStop = (project) => !!project && project.last_status !== 'running' && Object.keys(project.live || {}).length > 0;
