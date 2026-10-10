@@ -1,0 +1,9 @@
+[deployer] stage=verify kind=runtime_error target=local
+container did not answer on PORT=8080 (timeout after 4s (last probe: RemoteDisconnected)); see runtime logs
+--- error ---
+container status=running exit_code=0; timeout after 4s (last probe: RemoteDisconnected)
+--- runtime logs ---
+running migrations
+waiting for database at localhost:5432 (attempt 1/5): [Errno 111] Connection refused
+waiting for database at localhost:5432 (attempt 2/5): [Errno 111] Connection refused
+waiting for database at localhost:5432 (attempt 3/5): [Errno 111] Connection refused

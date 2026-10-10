@@ -13,8 +13,14 @@ import pytest
 from app import healer
 from app.healer import (
     APP_CODE_STOP,
+    CONFIG_STOP,
+    CRASH_STOP,
+    SERVICE_STOP,
     RepoFix,
     _llm_context,
+    _patch_permission,
+    _patch_port_binding,
+    _patch_shared_library,
     _patch_unresolvable_pin,
     _source_file,
     _stops_on_app_code,
@@ -23,6 +29,7 @@ from app.healer import (
     classify_error,
     deployer_header,
     heal,
+    needs_human_stop,
     repo_edit_tool,
 )
 from app.schemas import DeployResult, ErrorCategory
@@ -37,6 +44,14 @@ EXPECTED = {
     "broken-import.local": ErrorCategory.UNKNOWN,
     "broken-import.cloudrun": ErrorCategory.UNKNOWN,
     "broken-health.local": ErrorCategory.UNKNOWN,
+    # issue #7: realistic failures (sample-apps/broken-*, measured with the local deployer)
+    "broken-bind-chain.local": ErrorCategory.PORT_BINDING,
+    "broken-native-lib.local": ErrorCategory.MISSING_DEPENDENCY,
+    "broken-permission.local": ErrorCategory.UNKNOWN,
+    "broken-db-startup.local": ErrorCategory.UNKNOWN,
+    "broken-db-startup.local.slow": ErrorCategory.UNKNOWN,
+    "broken-missing-env.local": ErrorCategory.UNKNOWN,
+    "broken-quiet-crash.local": ErrorCategory.UNKNOWN,
 }
 
 
@@ -124,16 +139,28 @@ def test_broken_port_sample_rebinds_cmd():
 
 # --------------------------------------------------------------------------- #
 # M2 demo contract: every real failure ends the same way on every run, without the LLM deciding it.
-# "healed" = a rule patch fixed the Dockerfile; "stopped" = intended stop, nothing redeployed.
+# "healed" = a rule patch fixed the Dockerfile; otherwise the fixed summary prefix of the intended
+# stop (nothing redeployed).
 # --------------------------------------------------------------------------- #
 OUTCOME = {
     "broken.local": "healed",
     "broken-port.local": "healed",
     "broken-requirements.local": "healed",
-    "broken-import.local": "stopped",
-    "broken-import.cloudrun": "stopped",
-    "broken-health.local": "stopped",
+    "broken-import.local": APP_CODE_STOP,
+    "broken-import.cloudrun": APP_CODE_STOP,
+    "broken-health.local": APP_CODE_STOP,
+    "broken-bind-chain.local": "healed",
+    "broken-native-lib.local": "healed",
+    "broken-permission.local": "healed",
+    "broken-db-startup.local": SERVICE_STOP,
+    "broken-db-startup.local.slow": SERVICE_STOP,
+    "broken-missing-env.local": CONFIG_STOP,
+    "broken-quiet-crash.local": CRASH_STOP,
 }
+HUMAN_STOPS = [
+    name for name, outcome in OUTCOME.items() if outcome in {SERVICE_STOP, CONFIG_STOP, CRASH_STOP}
+]
+RULE_HEALS = [name for name, outcome in OUTCOME.items() if outcome == "healed"]
 
 
 def _forbidden(what: str):
@@ -172,7 +199,231 @@ def test_fixture_outcome_is_deterministic_and_llm_free(name, outcome):
     else:
         assert not report.success and report.attempts == 0 and report.records == []
         assert report.final_dockerfile == _dockerfile(name)
-        assert report.summary.startswith(APP_CODE_STOP)
+        assert report.summary.startswith(outcome)
+
+
+@pytest.mark.parametrize("name", HUMAN_STOPS)
+def test_human_stop_holds_on_the_repo_agent_path(name):
+    """main.py runs the repo agent by default: it must not invent a secret, a DB or a crash fix."""
+    failed = _failed(name)
+    report = heal(
+        "/tmp/app",
+        failed.target,
+        failed,
+        _dockerfile(name),
+        _forbidden("redeploy"),
+        repair_fn=_forbidden("repo agent"),
+    )
+    assert not report.success and report.attempts == 0 and report.records == []
+    assert report.summary.startswith(OUTCOME[name])
+
+
+@pytest.mark.parametrize("name", RULE_HEALS)
+def test_rule_heal_beats_the_repo_agent(name):
+    failed = _failed(name)
+    report = heal(
+        "/tmp/app",
+        failed.target,
+        failed,
+        _dockerfile(name),
+        _succeed(failed.target),
+        repair_fn=_forbidden("repo agent"),
+    )
+    assert report.success and all(r.source == "rule" for r in report.records)
+
+
+@pytest.mark.parametrize("name", [n for n in EXPECTED if n not in HUMAN_STOPS])
+def test_human_stop_ignores_other_fixtures(name):
+    assert needs_human_stop(_stderr(name)) is None
+
+
+# --------------------------------------------------------------------------- #
+# issue #7 scenarios: what each rule writes, and that it is idempotent.
+# --------------------------------------------------------------------------- #
+def _heal_with_rules(name: str):
+    return heal(
+        "/tmp/app",
+        "local",
+        _failed(name),
+        _dockerfile(name),
+        _succeed("local"),
+        _forbidden("Dockerfile LLM patch"),
+    )
+
+
+def test_bind_chain_rebinds_gunicorn_inside_the_sh_chain():
+    report = _heal_with_rules("broken-bind-chain.local")
+    cmd = next(line for line in report.final_dockerfile.splitlines() if line.startswith("CMD"))
+    assert "python prestart.py && exec gunicorn -b 0.0.0.0:8080 --workers 1" in cmd
+    assert report.attempts == 1 and "start command" in report.records[0].rationale
+    assert _patch_port_binding(report.final_dockerfile, _stderr("broken-bind-chain.local")) is None
+
+
+def test_port_rationale_says_when_the_start_command_was_not_changed():
+    dockerfile = 'FROM python:3.12-slim\nEXPOSE 5000\nCMD ["python", "app.py"]\n'
+    _, rationale = _patch_port_binding(dockerfile, _stderr("broken-port.local"))
+    assert "no host/port bind found" in rationale and "Bind 0.0.0.0" not in rationale
+
+
+def test_native_lib_installs_the_soname_package_in_the_final_stage():
+    report = _heal_with_rules("broken-native-lib.local")
+    lines = report.final_dockerfile.splitlines()
+    final_from = max(i for i, line in enumerate(lines) if line.startswith("FROM "))
+    apt = lines[final_from + 1]
+    assert apt == (
+        "RUN apt-get update && apt-get install -y --no-install-recommends libxslt1.1 "
+        "&& rm -rf /var/lib/apt/lists/*"
+    )
+    assert (
+        lines[:final_from] == _dockerfile("broken-native-lib.local").splitlines()[:final_from]
+    )  # builder kept
+    assert report.records[0].category == ErrorCategory.MISSING_DEPENDENCY
+    assert "libxslt.so.1" in report.records[0].rationale
+    assert _patch_shared_library(report.final_dockerfile, _stderr("broken-native-lib.local")) is None
+
+
+def test_shared_library_rule_handles_loader_error_and_skips_unknown_sonames():
+    loader = (
+        "/usr/local/bin/app: error while loading shared libraries: libpq.so.5: cannot open shared object file"
+    )
+    patched, _ = _patch_shared_library("FROM debian:trixie-slim\nCMD app\n", loader)
+    assert "install -y --no-install-recommends libpq5 " in patched
+    assert classify_error(loader) == ErrorCategory.MISSING_DEPENDENCY
+    unknown = "ImportError: libfoo-internal.so.9: cannot open shared object file: No such file or directory"
+    assert _patch_shared_library("FROM python:3.12-slim\nCMD app\n", unknown) is None
+
+
+def test_permission_chowns_only_denied_directory_before_the_last_user():
+    report = _heal_with_rules("broken-permission.local")
+    lines = report.final_dockerfile.splitlines()
+    user = lines.index("USER appuser")
+    assert lines[user - 1] == "RUN mkdir -p -- /app/uploads && chown -h -- appuser /app/uploads"
+    assert lines[user + 1].startswith("CMD")  # nothing inserted after USER (chown there fails at build)
+    assert report.records[0].source == "rule"
+    assert _patch_permission(report.final_dockerfile, _stderr("broken-permission.local")) is None
+
+
+@pytest.mark.parametrize(
+    ("user", "owner"),
+    [("USER 10001", "10001"), ("USER app:app", "app:app"), ("USER 10001:10001", "10001:10001")],
+)
+def test_permission_rule_accepts_user_forms(user, owner):
+    dockerfile = f"FROM python:3.12-slim\nWORKDIR /srv\n{user}\nCMD python app.py\n"
+    patched, _ = _patch_permission(dockerfile, _stderr("broken-permission.local"))
+    assert f"RUN mkdir -p -- /srv/uploads && chown -h -- {owner} /srv/uploads\n{user}\n" in patched
+
+
+def test_permission_rule_rejects_absolute_paths_outside_workdir():
+    stderr = _stderr("broken-permission.local").replace("'uploads'", "'/data/cache/db.sqlite'")
+    dockerfile = "FROM python:3.12-slim\nWORKDIR /app\nUSER appuser\nCMD python app.py\n"
+    assert _patch_permission(dockerfile, stderr) is None
+
+
+@pytest.mark.parametrize(
+    "dockerfile",
+    [
+        "FROM python:3.12-slim\nWORKDIR /app\nCMD python app.py\n",  # no USER: root already
+        "FROM python:3.12-slim\nWORKDIR /app\nUSER root\nCMD python app.py\n",
+        "FROM python:3.12-slim\nWORKDIR /app\nUSER appuser\nFROM python:3.12-slim\nCMD python app.py\n",
+    ],
+)
+def test_permission_rule_needs_a_non_root_user_in_the_final_stage(dockerfile):
+    assert _patch_permission(dockerfile, _stderr("broken-permission.local")) is None
+
+
+def test_permission_rule_ignores_build_stage_permission_denied():
+    stderr = (
+        "[deployer] stage=build kind=build_error target=local\n--- error ---\n"
+        "/bin/sh: 1: ./entrypoint.sh: Permission denied\n"
+        "PermissionError: [Errno 13] Permission denied: 'uploads'\n"
+    )
+    assert _patch_permission(_dockerfile("broken-permission.local"), stderr) is None
+
+
+def test_db_startup_stop_names_the_unreachable_service():
+    for name in ("broken-db-startup.local", "broken-db-startup.local.slow"):
+        summary = needs_human_stop(_stderr(name))
+        assert summary.startswith(SERVICE_STOP) and "localhost:5432" in summary
+        assert "host, port, credentials" in summary
+
+
+def test_service_stop_reads_only_runtime_logs():
+    stderr = (
+        "[deployer] stage=verify kind=runtime_error target=local\n"
+        "container exited during startup; Connection refused\n--- error ---\n"
+        "container status=exited exit_code=1; Connection refused\n--- runtime logs ---\nboot\n"
+        "Traceback (most recent call last):\n"
+        '  File "/app/app.py", line 3, in <module>\n'
+        "    boom()\n"
+        "RuntimeError: boom\n"
+    )
+    assert needs_human_stop(stderr) is None
+
+
+def test_refused_optional_service_does_not_mask_an_unrelated_crash():
+    stderr = (
+        "[deployer] stage=verify kind=runtime_error target=local\n--- error ---\n"
+        "container status=exited exit_code=3\n--- runtime logs ---\n"
+        "cache at redis:6379 unavailable: [Errno 111] Connection refused; continuing without cache\n"
+        "Traceback (most recent call last):\n"
+        '  File "/app/app.py", line 9, in <module>\n'
+        "    app = Flask(__name__)\n"
+        "NameError: name 'Flask' is not defined\n"
+    )
+    assert needs_human_stop(stderr) is None
+    assert _stops_on_app_code(stderr) is not None  # the repo agent / app-code stop handles it
+
+
+def test_missing_env_stop_lists_every_required_name_without_values(tmp_path):
+    (tmp_path / "config.py").write_text((SAMPLE_APPS / "broken-missing-env" / "config.py").read_text())
+    stderr = _stderr("broken-missing-env.local")
+    assert "SECRET_KEY" in needs_human_stop(stderr)
+    report = heal(
+        str(tmp_path),
+        "local",
+        _failed("broken-missing-env.local"),
+        _dockerfile("broken-missing-env.local"),
+        _forbidden("redeploy"),
+        _forbidden("Dockerfile LLM patch"),
+        suggest_fn=_forbidden("source suggestion"),
+    )
+    assert report.summary.startswith(CONFIG_STOP)
+    assert "SECRET_KEY, DB_HOST" in report.summary and "fix the source" not in report.summary
+
+
+def test_plain_dict_key_error_is_not_a_config_stop():
+    stderr = (
+        "[deployer] stage=verify kind=runtime_error target=local\n--- error ---\n"
+        "container status=exited exit_code=3\n--- runtime logs ---\n"
+        "Traceback (most recent call last):\n"
+        '  File "/app/app.py", line 3, in <module>\n'
+        '    key = SETTINGS["SECRET_KEY"]\n'
+        "KeyError: 'SECRET_KEY'\n"
+    )
+    assert needs_human_stop(stderr) is None
+    assert _stops_on_app_code(stderr) is not None  # still an app-code stop
+
+
+def test_explicit_missing_env_message_is_a_config_stop():
+    stderr = (
+        "[deployer] stage=verify kind=runtime_error target=local\n--- error ---\n"
+        "container status=exited exit_code=1\n--- runtime logs ---\n"
+        "RuntimeError: environment variable API_TOKEN is not set\n"
+    )
+    summary = needs_human_stop(stderr)
+    assert summary.startswith(CONFIG_STOP) and "API_TOKEN" in summary
+
+
+def test_quiet_crash_stop_reports_signal_and_how_to_get_logs():
+    summary = needs_human_stop(_stderr("broken-quiet-crash.local"))
+    assert summary.startswith(CRASH_STOP)
+    assert "exit_code=139" in summary and "SIGSEGV" in summary and "PYTHONUNBUFFERED=1" in summary
+
+
+def test_quiet_exit_zero_is_not_a_crash_stop():
+    stderr = _stderr("broken-quiet-crash.local").replace("exit_code=139", "exit_code=0")
+    stderr = stderr.replace("Segmentation fault", "")
+    assert needs_human_stop(stderr) is None
 
 
 def test_broken_requirements_unpins_before_pip_install():
@@ -221,7 +472,16 @@ def test_app_code_failure_points_at_user_frame(name, where):
     assert error.exception.split(":")[0] in {"NameError", "RuntimeError"}
 
 
-@pytest.mark.parametrize("name", ["broken.local", "broken-port.local", "broken-requirements.local"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "broken.local",
+        "broken-port.local",
+        "broken-requirements.local",
+        "broken-bind-chain.local",
+        "broken-native-lib.local",
+    ],
+)
 def test_app_code_check_never_overrides_rule_categories(name):
     assert _stops_on_app_code(_stderr(name)) is None
 

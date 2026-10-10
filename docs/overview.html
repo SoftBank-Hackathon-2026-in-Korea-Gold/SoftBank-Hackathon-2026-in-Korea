@@ -480,20 +480,20 @@ ModuleNotFoundError: No module named 'flask'</pre>
           <h3>healer가 하는 일</h3>
           <div class="tablewrap"><table>
             <tr><th>분류</th><th>대표 신호</th><th>규칙 패치</th></tr>
-            <tr><td><span class="tag t-amber">missing_dependency</span></td><td><code>ModuleNotFoundError</code></td><td><code>RUN pip install &lt;패키지&gt;</code> 추가</td></tr>
-            <tr><td><span class="tag t-amber">port_binding</span></td><td>failed to start and listen on the port</td><td><code>0.0.0.0:8080</code> 바인딩, <code>ENV PORT</code></td></tr>
+            <tr><td><span class="tag t-amber">missing_dependency</span></td><td><code>ModuleNotFoundError</code>, <code>cannot open shared object file</code></td><td><code>RUN pip install &lt;패키지&gt;</code> 추가, 지원하는 공유 라이브러리는 Debian 런타임 스테이지에 <code>apt-get install</code></td></tr>
+            <tr><td><span class="tag t-amber">port_binding</span></td><td>failed to start and listen on the port</td><td><code>0.0.0.0:8080</code> 바인딩(<code>sh -c</code> 체인 속 <code>-b :5000</code> 포함), <code>ENV PORT</code></td></tr>
             <tr><td><span class="tag t-amber">build_failure</span></td><td>failed to solve, 없는 버전</td><td>해결 불가능한 버전 고정 완화</td></tr>
             <tr><td><span class="tag t-slate">bad_entrypoint</span></td><td>실행 파일 없음</td><td>LLM 폴백</td></tr>
-            <tr><td><span class="tag t-slate">unknown</span></td><td>그 외</td><td>LLM 폴백</td></tr>
+            <tr><td><span class="tag t-slate">unknown</span></td><td>그 외 (비root <code>USER</code>의 <code>Permission denied</code> 포함)</td><td>권한 거부는 비root <code>USER</code> 전환 전에 root로 WORKDIR 내부 경로만 <code>chown</code>(규칙), 나머지는 LLM 폴백</td></tr>
           </table></div>
           <p class="muted" style="font-size:13px">규칙이 먼저입니다. 데모 시나리오는 규칙만으로 고쳐져서 LLM API가 죽어도 동작합니다.</p>
         </div>
       </div>
-      <div class="callout"><b>LLM은 붙어 있습니다.</b> healer에는 LLM 폴백이 실제로 연결되어 있습니다. 규칙 표에 없는 오류(<code>bad_entrypoint</code>, <code>unknown</code>)이거나 규칙 패치가 듣지 않으면, healer가 stderr 끝부분과 현재 Dockerfile을 LLM에 보내 <b>고친 Dockerfile 전체</b>를 받아 다시 배포합니다. 순서는 <b>Claude → OpenAI → 로컬 모델(vLLM·Ollama 등)</b>이며, 키가 있는 첫 번째 것을 씁니다. 대시보드 패치 카드에 <code>규칙</code> 또는 <code>LLM</code>으로 출처가 표시됩니다. 위 예시들이 "LLM을 부르지 않는다"고 한 것은 그 오류가 규칙으로 해결되는 종류이기 때문입니다.</div>
+      <div class="callout"><b>LLM은 붙어 있습니다.</b> healer에는 LLM 폴백이 실제로 연결되어 있습니다. 규칙 표에 없는 오류(<code>bad_entrypoint</code>, <code>unknown</code>)이거나 규칙 패치가 듣지 않으면, healer가 stderr 끝부분과 현재 Dockerfile을 LLM에 보내 <b>고친 Dockerfile 전체</b>를 받아 다시 배포합니다. 순서는 <b>Claude → OpenAI → 로컬 모델(vLLM·Ollama 등)</b>이며, 키가 있는 첫 번째 것을 씁니다. 운영 호출에서 Anthropic 키가 설정되면 repo agent가 작업 사본을 읽고 소스도 수정할 수 있습니다. 대시보드 패치 카드에 <code>규칙</code> 또는 <code>LLM</code>으로 출처가 표시됩니다. 위 예시들이 "LLM을 부르지 않는다"고 한 것은 그 오류가 규칙으로 해결되는 종류이기 때문입니다.</div>
       <div class="grid g3">
         <div class="card"><b>LLM을 부르는 경우</b><p>규칙에 없는 오류, 규칙 패치 후에도 같은 오류, 실행 파일 경로 문제처럼 맥락을 읽어야 하는 경우입니다.</p></div>
-        <div class="card"><b>바로 멈추는 경우</b><p>사전 점검 실패(결제·권한), 이미지 업로드 실패, 타임아웃, 함수 빌드 실패, 앱 코드 자체의 오류입니다. Dockerfile을 고쳐서는 해결되지 않으니 헛돌지 않고 사람에게 넘깁니다.</p></div>
-        <div class="card"><b>지키는 규칙</b><p>healer는 <b>Dockerfile만</b> 고칩니다. 앱 소스는 건드리지 않고, 소스 수정이 필요해 보이면 제안만 로그로 남깁니다. 재시도는 최대 3회입니다.</p></div>
+        <div class="card"><b>바로 멈추는 경우</b><p>사전 점검 실패(결제·권한), 이미지 업로드 실패, 타임아웃, 함수 빌드 실패, 필수 환경변수 누락·기동 중 DB 등 외부 서비스 접속 불가·로그 없는 크래시입니다. repo agent가 꺼져 있으면 앱 코드 오류도 멈춥니다. Dockerfile을 고쳐서는 해결되지 않으니 헛돌지 않고 사람에게 넘깁니다.</p></div>
+        <div class="card"><b>지키는 규칙</b><p>규칙은 <b>Dockerfile</b>을 고칩니다. repo agent가 켜져 있으면 작업 사본의 소스도 수정할 수 있고, 운영 경로는 소스 수정 후 사용자 확인을 받습니다. repo agent가 꺼져 있으면 소스 수정은 제안만 남깁니다. 재시도는 최대 3회입니다.</p></div>
       </div>
       <h3>실제 패치 예시 (고장 앱 <code>sample-apps/broken</code>)</h3>
 <pre><span class="hunk">@@ 1차: missing_dependency @@</span>
@@ -577,7 +577,7 @@ ModuleNotFoundError: No module named 'flask'</pre>
       <h3>4. 비용과 보안</h3>
       <p>Cloud SQL은 가장 작은 사양(db-f1-micro)으로 월 1만~1만5천 원이며 모든 앱이 나눠 씁니다. 사이드카는 이미 있는 서버·VM 위에서 돌아 추가 비용이 없습니다. Cloud Run 쪽은 Cloud Run 서비스 계정에 Cloud SQL 접속 권한만 주었고, DB는 공인 인터넷이 아니라 구글 내부 소켓으로만 붙습니다.</p>
 
-      <div class="callout warn"><b>일부러 하지 않은 것.</b> SQLite 경로를 코드에 박아 둔 앱에는 DB를 붙이지 않습니다. 앱이 읽지도 않는 주소를 넣어 봐야 앱은 여전히 SQLite에 쓰므로 눈속임이기 때문입니다. 이런 앱은 analyzer가 "SQLite 파일이 재시작 때 사라진다"는 위험을 알려 주고, 서버리스 대신 node나 local을 권합니다. 앱이 <code>DATABASE_URL</code>을 읽도록 코드를 고치는 일은 사람의 몫으로 남겼습니다(healer는 소스를 고치지 않음).</div>
+      <div class="callout warn"><b>일부러 하지 않은 것.</b> SQLite 경로를 코드에 박아 둔 앱에는 DB를 붙이지 않습니다. 앱이 읽지도 않는 주소를 넣어 봐야 앱은 여전히 SQLite에 쓰므로 눈속임이기 때문입니다. 이런 앱은 analyzer가 "SQLite 파일이 재시작 때 사라진다"는 위험을 알려 주고, 서버리스 대신 node나 local을 권합니다. 앱이 <code>DATABASE_URL</code>을 읽도록 코드를 고치는 일은 사람의 몫으로 남겼습니다(DB 연동 코드의 자동 마이그레이션을 보장하지 않음).</div>
     </section>
 
     <!-- 9 -->

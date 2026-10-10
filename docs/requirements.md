@@ -143,6 +143,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
 - **FR-3.3**: 수정 전/후 Dockerfile의 `unified diff`를 생성하고 시도별 이력(`PatchRecord`)을 기록한다.
 - **FR-3.4**: 최대 재시도 횟수(`MAX_RETRIES = 3`) 내에서 수정된 Dockerfile로 재배포를 순환 실행한다.
 - **FR-3.5**: 최종 결과는 `HealReport` 형태로 반환한다.
+- **FR-3.6**: Dockerfile 패치로 고칠 수 없는 앱 수준 실패(필수 환경변수 누락, DB 등 외부 서비스 접속 불가, 트레이스백 없는 크래시)는 LLM/repo agent·재배포 없이 즉시 중단하고, 사람이 할 일(변수 이름, 접속 대상 host:port, exit code와 로그 확보 방법)을 summary로 안내한다. 비밀값이나 DB를 지어내지 않는다.
 
 ### FR-4: 중앙 파이프라인 오케스트레이션 (Main - `app/main.py`)
 - **FR-4.1**: `POST /deploy` 엔드포인트를 통해 비동기 파이프라인 작업을 등록하고 `deployment_id`를 즉시 반환한다.

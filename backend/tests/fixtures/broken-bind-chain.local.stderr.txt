@@ -1,0 +1,10 @@
+[deployer] stage=verify kind=runtime_error target=local
+container started but failed to start and listen on the port defined by PORT=8080 (timeout after 12s (last probe: RemoteDisconnected)); the app is probably bound to another port or to 127.0.0.1
+--- error ---
+container status=running exit_code=0; timeout after 12s (last probe: RemoteDisconnected)
+--- runtime logs ---
+prestart: wrote build-info.json
+[2026-10-10 23:07:49 +0000] [1] [INFO] Starting gunicorn 22.0.0
+[2026-10-10 23:07:49 +0000] [1] [INFO] Listening at: http://0.0.0.0:5000 (1)
+[2026-10-10 23:07:49 +0000] [1] [INFO] Using worker: gthread
+[2026-10-10 23:07:49 +0000] [8] [INFO] Booting worker with pid: 8

@@ -1,0 +1,17 @@
+[deployer] stage=verify kind=runtime_error target=local
+container exited during startup (process exited (last probe: URLError)); see runtime logs for the traceback
+--- error ---
+container status=exited exit_code=1; process exited (last probe: URLError)
+--- runtime logs ---
+running migrations
+waiting for database at localhost:5432 (attempt 1/5): [Errno 111] Connection refused
+waiting for database at localhost:5432 (attempt 2/5): [Errno 111] Connection refused
+waiting for database at localhost:5432 (attempt 3/5): [Errno 111] Connection refused
+waiting for database at localhost:5432 (attempt 4/5): [Errno 111] Connection refused
+waiting for database at localhost:5432 (attempt 5/5): [Errno 111] Connection refused
+Traceback (most recent call last):
+  File "/app/migrate.py", line 23, in <module>
+    connect()
+  File "/app/migrate.py", line 15, in connect
+    sock.connect((addr, DB_PORT))
+ConnectionRefusedError: [Errno 111] Connection refused
