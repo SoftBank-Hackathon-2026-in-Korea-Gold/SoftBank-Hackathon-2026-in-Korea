@@ -28,7 +28,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from app.schemas import AnalysisResult
+from app.schemas import AnalysisResult, EnvRequirement
 
 DEFAULT_MODEL = "claude-haiku-5-5"
 # 고를 유형 순서와 그 타깃
@@ -56,6 +56,12 @@ def analyze_with(src_dir: str, inspect, write) -> AnalysisResult:
             "local·cloudrun 어디에도 배포할 수 없습니다. Windows 전용 코드는 리눅스 컨테이너에서 돌지 않습니다 "
             "(Windows VM이 필요합니다)"
         )
+    # 파일 경로를 받는 환경변수: 값만으로는 파일이 생기지 않고, 키 파일은 소스에서도 빠진다 (main.py)
+    if files := [e for e in (reports["env"] or {}).get("items", []) if e["file"] and e["required"]]:
+        raise ValueError(
+            "배포할 수 없습니다. 앱이 컨테이너 안의 파일을 요구하는데 저장소에 없고 넣을 방법도 없습니다: "
+            + ", ".join(f"{e['name']} ({e['hits'][0]['evidence']})" for e in files)
+        )
     candidates, removed = apply_rules(values)
     t = next((t for t in TARGETS if t in candidates), None)
     if t is None:
@@ -82,7 +88,62 @@ def analyze_with(src_dir: str, inspect, write) -> AnalysisResult:
         entrypoint=app.start,
         dockerfile=dockerfile,
         notes=[why, *unconsented, *dockerfile_notes, *_notes(t, values, reports, app, root, errors)],
+        required_env=_required_env(reports),
     )
+
+
+# 외부 저장소 접속 정보 중 비밀값인 역할 (URL에는 비밀번호가 들어가곤 한다)
+SECRET_ROLES = {"url", "password", "access_key", "secret_key"}
+
+
+def _required_env(reports: dict) -> list[EnvRequirement]:
+    """사용자에게 물을 값: 빌드 입력 전부, 외부 저장소 접속 정보 전부 (사용자가 자기 서버를 쓸 수 있다),
+    실행에 꼭 필요한 나머지 환경변수. PORT는 뺀다. 비워 두면 무엇을 할지는 main.py·deployer가 정한다."""
+
+    def items(name):
+        return (reports[name] or {}).get("items", [])
+
+    env = {e["name"]: e for e in items("env")}
+
+    def evidence(name):
+        return [h["evidence"] for h in env.get(name, {}).get("hits", [])]
+
+    stores = {
+        name: EnvRequirement(
+            name=name,
+            scope="runtime",
+            secret=role in SECRET_ROLES,
+            reason=f"{r['kind']} 접속 정보 ({role})",
+            resource=r["kind"],
+            evidence=evidence(name),
+        )
+        for r in items("resources")
+        for role, name in r["env"].items()
+        if name != "PORT"
+    }
+    used = {"PORT", *stores}
+    build = [
+        EnvRequirement(
+            name=e["name"],
+            scope="build",
+            secret=e["secret"],
+            reason=e["reason"],
+            evidence=[h["evidence"] for h in e["hits"]],
+        )
+        for e in items("build_env")
+    ]
+    runtime = [
+        EnvRequirement(
+            name=e["name"],
+            scope="runtime",
+            secret=e["secret"],
+            generate=e["generate"],
+            evidence=[h["evidence"] for h in e["hits"]],
+        )
+        for e in items("env")
+        if e["required"] and e["name"] not in used
+    ]
+    return build + list(stores.values()) + runtime
 
 
 def _signals(reports: dict) -> tuple[dict, list[str]]:
@@ -150,6 +211,8 @@ def _notes(t: int, values: dict, reports: dict, app: App, root: Path, errors: li
             "넣어야 하는 환경변수: "
             + ", ".join(e["name"] + (" (무작위 값 가능)" if e["generate"] else "") for e in need)
         )
+    if build := items("build_env"):
+        notes.append("빌드할 때 넣어야 하는 값: " + ", ".join(f"{e['name']} ({e['reason']})" for e in build))
     if any(values[n] == "yes" for n in ("memory_state", "sqlite", "file_write", "scheduler")):
         notes.append(
             "인스턴스를 1대로 고정해야 합니다 (메모리 상태·로컬 파일·프로세스 안 주기 작업이 있습니다)."
@@ -325,7 +388,7 @@ class ResourcesReport(BaseModel):
 
 class EnvItem(BaseModel):
     name: str
-    kind: Literal["secret", "config"]
+    kind: Literal["secret", "config", "file"]
     required: bool = Field(description="운영에서 값을 넣어야 한다 (비밀값은 개발용 기본값이 있어도 true)")
     generate: bool = Field(
         description="무작위 값을 만들어 넣어도 되는 비밀값인가 (외부 서비스에서 받는 키면 false)"
@@ -335,6 +398,17 @@ class EnvItem(BaseModel):
 
 class EnvReport(BaseModel):
     items: list[EnvItem]
+
+
+class BuildEnvItem(BaseModel):
+    name: str = Field(description="빌드가 읽는 환경변수·빌드 인자·비밀값 id")
+    kind: Literal["secret", "config"]
+    reason: str = Field(description="한국어 한 구절. 무엇에 쓰는 값인지 (예: GitHub Packages 의존성 받기)")
+    evidence: list[Evidence]
+
+
+class BuildEnvReport(BaseModel):
+    items: list[BuildEnvItem]
 
 
 class Risk(BaseModel):
@@ -453,16 +527,27 @@ SPEC_INSPECTORS = {
         "환경변수",
         (
             "앱이 실행 중에 읽는 환경변수 전부 (코드의 getenv·process.env 등, 설정 파일의 ${...} 자리표시자). "
-            "빌드·CI에서만 쓰는 것과 PORT는 뺀다. 비밀번호·키·토큰은 secret, 그 밖(비밀값 파일의 경로 포함)은 config. "
+            "빌드·CI에서만 쓰는 것과 PORT는 뺀다. 비밀번호·키·토큰은 secret. "
+            "값이 컨테이너 안 파일의 경로(키·인증서·모델 파일 등)인데 그 파일이 저장소에 없으면 file, 그 밖은 config. "
             "비밀값은 개발용 기본값이 있어도 required. "
             "generate는 세션 서명 키, 이 앱이 발급하는 토큰처럼 무작위 값이면 되는 비밀값만 true."
         ),
         EnvReport,
     ),
+    "build_env": (
+        "빌드 입력",
+        (
+            "이미지를 빌드할 때 밖에서 받아야 하는 값: 비공개 패키지 저장소 인증(build.gradle·settings.gradle·pom.xml·"
+            "settings.xml·package.json·pip 설정이 읽는 환경변수), Dockerfile의 기본값 없는 ARG와 RUN --mount=type=secret의 id. "
+            "실행 중에만 읽는 환경변수, 기본값으로 충분한 ARG(버전 등), PORT는 뺀다. "
+            "토큰·비밀번호는 secret, 사용자 이름처럼 비밀이 아닌 값은 config."
+        ),
+        BuildEnvReport,
+    ),
     "risks": (
         "기타 위험",
         (
-            "다른 검사관이 보는 항목(위험 신호, 실행 방법, 외부 저장소, 환경변수) 말고도 배포에 중요한 위험: "
+            "다른 검사관이 보는 항목(위험 신호, 실행 방법, 외부 저장소, 환경변수, 빌드 입력) 말고도 배포에 중요한 위험: "
             "시작할 때 큰 모델·데이터를 메모리에 올림, 이미지에 없는 파일이 필요함, 환경변수가 없으면 시작하자마자 죽음, "
             "운영에 맞지 않는 설정 등. 코드에서 확인한 것만 적고, 없으면 빈 목록."
         ),
@@ -626,13 +711,30 @@ def validate(name: str, report, root: Path, text: str) -> dict:
             ]
         }
     if name == "env":
-        return {
-            "items": [
-                {"name": e.name, "required": e.required, "generate": e.generate and e.kind == "secret"}
-                for e in report.items
-                if known(e.name)
-            ]
-        }
+        items = []
+        for e in report.items:
+            if not known(e.name):
+                continue
+            hits = _hits(root, e.evidence)
+            items.append(
+                {
+                    "name": e.name,
+                    "required": e.required,
+                    "secret": e.kind == "secret",
+                    "generate": e.generate and e.kind == "secret",
+                    # 배포를 멈추게 하니 근거가 확인된 것만 file로 본다. 아니면 값으로 묻는다
+                    "file": e.kind == "file" and bool(hits),
+                    "hits": hits,
+                }
+            )
+        return {"items": items}
+    if name == "build_env":  # 빌드를 막는 값이라 근거가 확인된 것만 묻는다
+        items = []
+        for e in report.items:
+            hits = _hits(root, e.evidence)
+            if known(e.name) and hits:
+                items.append({"name": e.name, "secret": e.kind == "secret", "reason": e.reason, "hits": hits})
+        return {"items": items}
     # risks: 근거가 확인된 것만 남긴다
     items = []
     for r in report.items:

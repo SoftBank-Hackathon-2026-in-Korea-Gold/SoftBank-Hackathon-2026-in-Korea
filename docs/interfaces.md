@@ -24,11 +24,13 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 | `analyzer.py` | 이요환 | `analyze(src_dir: str) -> AnalysisResult` | 초기 Dockerfile은 `0.0.0.0:$PORT` 바인딩 |
 | `deployer.py` | 전동훈 | `deploy(src_dir: str, dockerfile: str, target: "local"\|"cloudrun") -> DeployResult` | **실패 시 raise 금지** → `success=False, stderr=...` 반환. `stderr`에는 CLI 출력뿐 아니라 **컨테이너 런타임 로그(`docker logs` / Cloud Run revision logs)** 포함 필수 |
 | `healer.py` | 박재현 | `heal(src_dir, target, failed: DeployResult, dockerfile, deploy_fn, llm_patch_fn=None, emit=None, suggest_fn=None) -> HealReport` | 재배포 루프를 healer가 소유. 규칙 패치 우선, LLM 폴백(Claude / OpenAI / 로컬 OpenAI 호환 서버 중 `.env`에 채워진 것, 실패 시 다음 제공자). **Dockerfile만 자동 수정**: verify 단계에서 앱 코드가 던진 예외(Traceback의 마지막 사용자 프레임)는 재배포·LLM 없이 즉시 중단하고 `summary`가 `Not auto-healable: application code error`로 시작. import 시점 크래시면 LLM 소스 수정 제안 diff를 summary와 `log` 이벤트(`payload.kind=source_suggestion`)로 리포트만 함 (적용 안 함) |
-| `main.py` | 백락원 | `POST /deploy`, `GET /deploy/{id}/events` (SSE) | 파이프라인 오케스트레이션 |
+| `main.py` | 백락원 | `POST /deploy`, `GET /deploy/{id}/events` (SSE), `POST /deploy/{id}/env` | 파이프라인 오케스트레이션. `ask_env: true`(대시보드)면 분석 뒤 `required_env`를 `input_required`로 묻고 `POST /deploy/{id}/env {values}`를 기다린다(15분). 값은 메모리에만 두고 이벤트로 내보내지 않으며, healer 재배포에도 같은 값이 간다 |
 
 ## Data types
 
-**AnalysisResult** — `target`, `service_models[]` (`caas|paas|faas|iaas`, 추천 순), `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`
+**AnalysisResult** — `target`, `service_models[]` (`caas|paas|faas|iaas`, 추천 순), `language`, `framework?`, `port` (default 8080), `entrypoint?`, `dockerfile`, `notes[]`, `required_env[EnvRequirement]`
+
+**EnvRequirement** — `name`, `scope` (`build|runtime`), `secret`, `generate` (비우면 무작위 값), `reason`, `evidence["path:line"]`, `resource` (`postgres|mysql|redis|s3`: 외부 저장소 접속 정보 — 사용자가 자기 서버를 넣을 수 있어 항상 묻는다), `auto` (비우면 deployer가 만들어 연결: 지금은 Postgres가 감지된 앱의 `DATABASE_URL`만. main.py가 표시). 사용자가 `DATABASE_URL`을 넣으면 deployer는 Postgres/Cloud SQL을 만들지 않는다. deployer 전달: build+secret → `docker build --secret id=NAME,env=NAME` (BuildKit 필요, 값은 명령줄·레이어에 안 남음), build → `--build-arg`, runtime → 컨테이너 env
 
 **DeployResult** — `success`, `target`, `exit_code`, `stdout`, `stderr`, `url?`, `duration_sec?`
 
@@ -45,7 +47,7 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 `event:` = `type`, `data:` = `PipelineEvent` JSON
 
 ```json
-{ "type": "stage | log | heal_diff | done | error",
+{ "type": "stage | log | heal_diff | input_required | done | error",
   "stage": "analyze | deploy | heal | redeploy | null",
   "payload": { },
   "ts": 1791380000.123 }
@@ -56,6 +58,7 @@ POST /deploy ─▶ analyzer.analyze(src_dir) ──AnalysisResult──▶ depl
 | `stage` | `{ "target"?, "attempt"?, "stderr"? }` — 진행 단계 표시 |
 | `log` | `{ "line": "..." }` — 빌드/배포 로그 스트리밍 |
 | `heal_diff` | `PatchRecord` — **AI 수정 전/후 비교 카드** |
+| `input_required` | `{ "items": [EnvRequirement], "timeout_sec" }` — 배포 전에 사용자에게 받을 값 (`ask_env`일 때만) |
 | `done` | `{ "target", "url" }` 또는 `HealReport` |
 | `error` | `{ "message" }` 또는 `HealReport` (gave_up) |
 

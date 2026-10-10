@@ -145,6 +145,10 @@ class Config:
     env: dict = field(
         default_factory=dict
     )  # extra env vars injected into the app container (e.g. DATABASE_URL)
+    build_args: dict = field(default_factory=dict)  # docker build --build-arg (non-secret build inputs)
+    # BuildKit secrets (RUN --mount=type=secret,id=NAME): handed over via the build's process env,
+    # so the values never appear on the command line, in the state file, or in image layers
+    build_secrets: dict = field(default_factory=dict)
     node_arch: str | None = None  # restrict node pool to an architecture; None -> any
     node_exclude: tuple = ()  # node names to skip (used by fleet scale-out)
     database: str | None = "auto"  # "auto": Postgres when the app reads DATABASE_URL; "postgres"; None: never
@@ -197,10 +201,18 @@ class Runner:
         check: bool = True,
         stage: str = "",
         kind: str = "deploy_error",
+        env: dict | None = None,  # extra process env (not recorded in Step.cmd)
     ) -> subprocess.CompletedProcess:
         t0 = time.time()
         try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+                env={**os.environ, **env} if env else None,
+            )
         except subprocess.TimeoutExpired as e:
             err = _as_text(e.stderr)
             self.steps.append(Step(name, " ".join(cmd), None, time.time() - t0, _as_text(e.stdout), err))
@@ -332,6 +344,14 @@ def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
         != 0
     ):
         problems.append("docker daemon not running (start Docker Desktop)")
+    elif (
+        cfg.build_secrets
+        and r.run("docker buildx", ["docker", "buildx", "version"], check=False).returncode != 0
+    ):
+        # the legacy builder has no --secret; a Dockerfile patch cannot fix that, so stop here
+        problems.append(
+            "build secrets need BuildKit: install the docker buildx plugin (docker-buildx-plugin)"
+        )
 
     if target == "local" and cfg.tunnel and shutil.which("cloudflared") is None:
         problems.append("cloudflared not installed (brew install cloudflared) or set DEPLOYER_TUNNEL=0")
@@ -600,7 +620,19 @@ def build_image(src_dir: Path, image: str, platform: str | None, cfg: Config, r:
     cmd = ["docker", "build", "-t", image]
     if platform:
         cmd += ["--platform", platform]
-    r.run("docker build", [*cmd, str(src_dir)], timeout=cfg.build_timeout, stage="build", kind="build_error")
+    for k, v in cfg.build_args.items():
+        cmd += ["--build-arg", f"{k}={v}"]
+    for k in cfg.build_secrets:
+        cmd += ["--secret", f"id={k},env={k}"]
+    env = {"DOCKER_BUILDKIT": "1", **cfg.build_secrets} if cfg.build_secrets else None
+    r.run(
+        "docker build",
+        [*cmd, str(src_dir)],
+        timeout=cfg.build_timeout,
+        stage="build",
+        kind="build_error",
+        env=env,
+    )
 
 
 def push_image(image: str, cfg: Config, r: Runner) -> None:
@@ -714,8 +746,8 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.stage = "deploy"
         r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
         env = dict(cfg.env)
-        if wants_database(src_dir, cfg) == "postgres":
-            env.setdefault("DATABASE_URL", ensure_local_postgres(name, r))
+        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+            env["DATABASE_URL"] = ensure_local_postgres(name, r)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         run_cmd = [
             "docker",
@@ -907,9 +939,9 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
     )
     env = dict(cfg.env)
-    if wants_database(src_dir, cfg) == "postgres":
+    if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
         conn, db_url = ensure_cloudsql_database(name, cfg, r)
-        env.setdefault("DATABASE_URL", db_url)
+        env["DATABASE_URL"] = db_url
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
     if env:
@@ -1064,8 +1096,8 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     t0 = time.time()
     try:
         env = dict(cfg.env)
-        if wants_database(src_dir, cfg) == "postgres":
-            env.setdefault("DATABASE_URL", nodepool.ensure_postgres(node, name))
+        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+            env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         host_port = nodepool.free_port_on(node)
         cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, env)

@@ -14,12 +14,14 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import functools
 import hmac
 import ipaddress
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -44,7 +46,7 @@ from sse_starlette.sse import EventSourceResponse
 from app import analyzer, deployer, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
-from app.schemas import AnalysisResult, DeployRequest, DeployTarget, PipelineEvent
+from app.schemas import AnalysisResult, DeployRequest, DeployTarget, EnvInput, EnvRequirement, PipelineEvent
 
 load_dotenv()
 
@@ -62,6 +64,7 @@ except ValueError as exc:
 if MAX_CONCURRENT_GIT_CLONES < 1:
     raise ValueError("CLOUDMORPH_MAX_CONCURRENT_GIT_CLONES must be a positive integer")
 GIT_CLONE_WAIT_SECONDS = 5
+ENV_INPUT_TIMEOUT_SECONDS = 15 * 60  # how long an `ask_env` job waits for POST /deploy/{id}/env
 _git_clone_semaphore = threading.BoundedSemaphore(MAX_CONCURRENT_GIT_CLONES)
 SOURCE_IGNORE = {".git", ".venv", "node_modules", ".deployer", "__pycache__"}
 SENSITIVE_DIRS = {".aws", ".azure", ".gnupg", ".kube", ".ssh"}
@@ -118,6 +121,10 @@ class Job:
     targets: dict[str, dict] = field(default_factory=dict)
     error: str | None = None
     completed: bool = False
+    # ask_env: what the job is waiting for, and the user's answer (memory only, never put in events)
+    required_env: list[EnvRequirement] = field(default_factory=list)
+    env_values: dict[str, str] | None = None
+    env_ready: threading.Event = field(default_factory=threading.Event)
 
 
 _jobs: dict[str, Job] = {}
@@ -385,19 +392,43 @@ def _remove_workspace(path: Path) -> None:
         _logger.warning("Could not remove completed Cloud Run workspace %s", path, exc_info=True)
 
 
+def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
+    """deployer.deploy options for the user's values. A blank runtime secret that may be random gets one."""
+    env: dict[str, str] = {}
+    build_args: dict[str, str] = {}
+    build_secrets: dict[str, str] = {}
+    for item in required:
+        value = values.get(item.name) or (
+            secrets.token_urlsafe(32) if item.scope == "runtime" and item.generate else None
+        )
+        if value is None:
+            continue
+        if item.scope == "runtime":
+            env[item.name] = value
+        elif item.secret:
+            build_secrets[item.name] = value
+        else:
+            build_args[item.name] = value
+    options = {"env": env, "build_args": build_args, "build_secrets": build_secrets}
+    return {k: v for k, v in options.items() if v}
+
+
 def run_pipeline(
     source: str,
     target: DeployTarget,
     emit: Callable[[PipelineEvent], None],
     analysis: AnalysisResult | None = None,
+    overrides: dict | None = None,
 ) -> bool:
-    """Run one target synchronously; healer owns all retry attempts."""
+    """Run one target synchronously; healer owns all retry attempts.
+    `overrides` (deployer options such as env/build_secrets) apply to the healer's redeploys too."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
         analysis = analyzer.analyze(source)
 
+    deploy_fn = functools.partial(deployer.deploy, **overrides) if overrides else deployer.deploy
     emit(PipelineEvent(type="stage", stage="deploy", payload={"target": target}))
-    result = deployer.deploy(source, analysis.dockerfile, target)
+    result = deploy_fn(source, analysis.dockerfile, target)
     if result.success:
         emit(PipelineEvent(type="done", payload={"target": target, "url": result.url}))
         return True
@@ -412,7 +443,7 @@ def run_pipeline(
             },
         )
     )
-    report = healer.heal(source, target, result, analysis.dockerfile, deployer.deploy, emit=emit)
+    report = healer.heal(source, target, result, analysis.dockerfile, deploy_fn, emit=emit)
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
     return report.success
@@ -534,6 +565,7 @@ def create_app() -> FastAPI:
         ref: str | None = None,
         intro: list[str] | None = None,
         trigger: str = "api",
+        ask_env: bool = False,
     ) -> str:
         """Create a job and run analyze -> deploy -> heal for every target in a worker thread.
         Shared by POST /deploy (user click) and POST /webhook/github (push)."""
@@ -606,6 +638,9 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
+                overrides = (
+                    _env_overrides(analysis.required_env, _ask_env(analysis, source_dir)) if ask_env else {}
+                )
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -615,7 +650,7 @@ def create_app() -> FastAPI:
                     target_dir = work_root / f"{app_name}-{target}"
                     try:
                         target_dir = Path(_copy_for_target(source_dir, target_dir))
-                        run_pipeline(target_dir, target, emit, analysis=analysis)
+                        run_pipeline(target_dir, target, emit, analysis=analysis, overrides=overrides)
                     except Exception as exc:  # noqa: BLE001 — isolate target failures
                         emit(
                             PipelineEvent(
@@ -628,6 +663,43 @@ def create_app() -> FastAPI:
                             _remove_workspace(target_dir)
                 if "local" not in targets:
                     _remove_workspace(work_root)
+
+        def _ask_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
+            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
+            if not analysis.required_env:
+                return {}
+            postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
+            job.required_env = [
+                e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
+                for e in analysis.required_env
+            ]
+            job.state = "waiting_input"
+            emit(
+                PipelineEvent(
+                    type="input_required",
+                    stage="analyze",
+                    payload={
+                        "items": [e.model_dump() for e in job.required_env],
+                        "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
+                    },
+                )
+            )
+            if not job.env_ready.wait(ENV_INPUT_TIMEOUT_SECONDS):
+                raise TimeoutError(
+                    f"배포에 필요한 값을 {ENV_INPUT_TIMEOUT_SECONDS // 60}분 안에 받지 못해 배포를 멈췄습니다"
+                )
+            job.state = "running"
+            values, job.env_values = job.env_values or {}, None
+            given = sorted(values)
+            emit(
+                PipelineEvent(
+                    type="log",
+                    stage="analyze",
+                    payload={"line": f"env: 입력받은 값 {', '.join(given) if given else '없음'}"},
+                )
+            )
+            return values
 
         async def worker() -> None:
             job.state = "running"
@@ -661,7 +733,24 @@ def create_app() -> FastAPI:
 
     @app.post("/deploy")
     async def start_deploy(req: DeployRequest) -> dict[str, str]:
-        return {"deployment_id": app.state.launch(req.source, req.targets, name=req.name, ref=req.ref)}
+        return {
+            "deployment_id": app.state.launch(
+                req.source, req.targets, name=req.name, ref=req.ref, ask_env=req.ask_env
+            )
+        }
+
+    @app.post("/deploy/{deployment_id}/env")
+    async def submit_env(deployment_id: str, body: EnvInput) -> dict:
+        """Answer an `input_required` event. Blank values are skipped; the job resumes right away."""
+        job = _jobs.get(deployment_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="unknown deployment_id")
+        if job.state != "waiting_input" or job.env_ready.is_set():
+            raise HTTPException(status_code=409, detail="deployment is not waiting for input")
+        wanted = {e.name for e in job.required_env}
+        job.env_values = {k: v for k, v in body.values.items() if k in wanted and v}
+        job.env_ready.set()
+        return {"accepted": sorted(job.env_values)}
 
     @app.get("/projects")
     async def projects() -> dict:

@@ -24,6 +24,7 @@ export function emptyRun(id = null, meta = {}) {
     targetState: Object.fromEntries(targets.map((t) => [t, freshTarget()])),
     logs: [],
     patches: [],
+    envRequest: null, // { items, timeoutSec } while the backend waits for POST /deploy/{id}/env
     seen: new Set(),
     error: null,
   }
@@ -72,6 +73,9 @@ export function applyEvent(prev, type, p, raw) {
       } else if (line.startsWith('analyzer: ')) {
         run.notes.push(line.slice('analyzer: '.length))
         push(run, { ts, kind: 'note', stage: 'analyze', text: line.slice('analyzer: '.length) })
+      } else if (line.startsWith('env: ')) {
+        run.envRequest = null
+        push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 · ${line.slice(5)} → 배포를 이어갑니다` })
       } else if (line.startsWith('queue: ')) {
         push(run, { ts, kind: 'push', stage: 'queue', text: `대기 · 같은 앱의 이전 배포가 끝나면 시작합니다 (${line.slice(7)})` })
       } else if (line.startsWith('github push')) {
@@ -104,6 +108,12 @@ export function applyEvent(prev, type, p, raw) {
       }
       break
     }
+    case 'input_required': {
+      const items = p.items || []
+      run.envRequest = { items, timeoutSec: p.timeout_sec }
+      push(run, { ts, kind: 'push', stage: 'analyze', text: `배포에 필요한 값 ${new Set(items.map((i) => i.name)).size}개를 기다리는 중 · ${[...new Set(items.map((i) => i.name))].join(', ')}` })
+      break
+    }
     case 'heal_diff': {
       const t = run.currentTarget
       run.patches.push({ ...p, target: t })
@@ -134,6 +144,7 @@ export function applyEvent(prev, type, p, raw) {
         push(run, { ts, kind: 'error', stage: 'failed', target: t, text: msg })
       } else {
         run.error = msg
+        run.envRequest = null
         run.status = 'failed'
         run.finishedAt = Date.now()
         push(run, { ts, kind: 'error', stage: 'failed', text: msg })
