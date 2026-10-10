@@ -478,9 +478,11 @@ def ensure_local_postgres(app: str, r: Runner) -> str:
     db, net = f"{app}-db", nodepool.NETWORK
     r.run("docker network", ["docker", "network", "create", net], check=False)
     exists = subprocess.run(
-        ["docker", "ps", "-q", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
+        ["docker", "ps", "-aq", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
     )
-    if not exists.stdout.strip():
+    if exists.stdout.strip():  # a stopped sidecar still holds the name; `docker start` is a no-op if running
+        r.run("docker start (postgres)", ["docker", "start", db], stage="deploy")
+    else:
         r.run(
             "docker run (postgres)",
             [
