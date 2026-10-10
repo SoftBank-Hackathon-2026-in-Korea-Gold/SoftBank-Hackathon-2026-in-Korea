@@ -851,6 +851,52 @@ def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monk
     assert m._jobs[status["deployment_id"]].env_values is None
 
 
+def test_named_app_keeps_its_values_across_redeploys_and_push(m, tmp_path, monkeypatch):
+    """Values are saved per app: the next dashboard deploy asks only what is still missing, a GitHub push
+    deploy (no ask_env) gets them too, and a generated SECRET_KEY stays the same."""
+    calls = []
+    store: dict[str, dict] = {}
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    monkeypatch.setattr(m.env_store, "load", lambda app: dict(store.get(app, {})))
+    monkeypatch.setattr(m.env_store, "save", lambda app, values: store.__setitem__(app, dict(values)))
+
+    async def deploy(ask_env, answer=None):
+        request = DeployRequest(source=str(source), targets=["local"], name="gb", ask_env=ask_env)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        job = m._jobs[deployment_id]
+        if answer is not None:
+            await _until(lambda: job.state == "waiting_input")
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer))
+        await _until(lambda: job.completed)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        events = [event async for event in response.body_iterator]
+        return [
+            [i["name"] for i in json.loads(e["data"])["payload"]["items"]]
+            for e in events
+            if e["event"] == "input_required"
+        ]
+
+    async def scenario():
+        first = await deploy(True, {"GITHUB_TOKEN": "ghp_s3cret", "GITHUB_USERNAME": "octo"})
+        second = await deploy(True, {"API_KEY": "k-1"})
+        push = await deploy(False)
+        return first, second, push
+
+    first, second, push = asyncio.run(scenario())
+    assert first == [["GITHUB_TOKEN", "GITHUB_USERNAME", "SECRET_KEY", "API_KEY"]]
+    assert second == [["API_KEY"]]  # only what the first answer left blank
+    assert push == []
+    secret_key = store["gb"]["SECRET_KEY"]
+    assert all(c["env"]["SECRET_KEY"] == secret_key for c in calls)
+    assert calls[1] == calls[2] and calls[2]["env"]["API_KEY"] == "k-1"
+    assert calls[2]["build_secrets"] == {"GITHUB_TOKEN": "ghp_s3cret"}
+
+
 def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):
     def fake_deploy(*args, **kwargs):
         raise AssertionError("must not deploy without an answer")

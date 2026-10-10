@@ -43,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer, webhooks
+from app import analyzer, deployer, env_store, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, EnvInput, EnvRequirement, PipelineEvent
@@ -393,15 +393,13 @@ def _remove_workspace(path: Path) -> None:
 
 
 def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
-    """deployer.deploy options for the user's values. A blank runtime secret that may be random gets one."""
+    """deployer.deploy options for the user's values (blank ones are left out)."""
     env: dict[str, str] = {}
     build_args: dict[str, str] = {}
     build_secrets: dict[str, str] = {}
     for item in required:
-        value = values.get(item.name) or (
-            secrets.token_urlsafe(32) if item.scope == "runtime" and item.generate else None
-        )
-        if value is None:
+        value = values.get(item.name)
+        if not value:
             continue
         if item.scope == "runtime":
             env[item.name] = value
@@ -638,7 +636,7 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = _env_overrides(analysis.required_env, _ask_env(analysis)) if ask_env else {}
+                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis))
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -662,18 +660,53 @@ def create_app() -> FastAPI:
                 if "local" not in targets:
                     _remove_workspace(work_root)
 
-        def _ask_env(analysis: AnalysisResult) -> dict[str, str]:
-            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values."""
+        def _resolve_env(analysis: AnalysisResult) -> dict[str, str]:
+            """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
+            A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
+            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same."""
             if not analysis.required_env:
                 return {}
-            job.required_env = analysis.required_env
+            values = env_store.load(app_name) if name else {}
+            saved = dict(values)
+            if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
+                emit(
+                    PipelineEvent(
+                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
+                    )
+                )
+            missing = [e for e in analysis.required_env if not values.get(e.name)]
+            if not missing:
+                return values
+            if not ask_env:  # scripts and GitHub push: nobody to ask
+                lacking = ", ".join(sorted({e.name for e in missing}))
+                emit(
+                    PipelineEvent(
+                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
+                    )
+                )
+                return values
+            values |= _ask_env(missing)
+            for e in missing:
+                if e.scope == "runtime" and e.generate and not values.get(e.name):
+                    values[e.name] = secrets.token_urlsafe(32)
+            if name and values != saved:
+                try:
+                    env_store.save(app_name, values)
+                except env_store.EnvStoreError as exc:
+                    line = f"env: 값을 저장하지 못해 다음 배포에서 다시 묻습니다 ({exc})"
+                    emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
+            return values
+
+        def _ask_env(items: list[EnvRequirement]) -> dict[str, str]:
+            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values."""
+            job.required_env = items
             job.state = "waiting_input"
             emit(
                 PipelineEvent(
                     type="input_required",
                     stage="analyze",
                     payload={
-                        "items": [e.model_dump() for e in analysis.required_env],
+                        "items": [e.model_dump() for e in items],
                         "timeout_sec": ENV_INPUT_TIMEOUT_SECONDS,
                     },
                 )
