@@ -237,7 +237,7 @@ def ensure_postgres(node: Node, app: str, *, timeout: int = 120) -> str:
     db = f"{app}-db"
     cmd = (
         f"docker network inspect {NETWORK} >/dev/null 2>&1 || docker network create {NETWORK} >/dev/null; "
-        f"docker ps -q -f name=^{db}$ | grep -q . || docker run -d --restart unless-stopped --name {db} --network {NETWORK} "
+        f"docker start {db} >/dev/null 2>&1 || docker run -d --restart unless-stopped --name {db} --network {NETWORK} "
         f"-e POSTGRES_USER=app -e POSTGRES_PASSWORD=app -e POSTGRES_DB=app -v {app}-dbdata:/var/lib/postgresql/data "
         f"postgres:16-alpine >/dev/null; "
         f"for i in $(seq 1 60); do docker exec {db} pg_isready -U app -q && exit 0; sleep 1; done; "

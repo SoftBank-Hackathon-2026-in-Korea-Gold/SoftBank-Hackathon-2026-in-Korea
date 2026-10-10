@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
-from app import deployer, fleet
+import pytest
+
+from app import deployer, fleet, nodes
 from app.deployer import Config, detect_database, wants_database
 
 
@@ -43,6 +46,29 @@ def test_wants_database_respects_explicit_config(tmp_path):
     assert wants_database(src, Config(database="auto")) is None
     assert wants_database(src, Config(database="postgres")) == "postgres"
     assert wants_database(_app(tmp_path / "f", **{"app.py": "DATABASE_URL"}), Config(database=None)) is None
+
+
+@pytest.mark.parametrize("listed, restarted", [("3f2a9c1b\n", True), ("", False)])
+def test_local_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch, listed, restarted):
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, listed if cmd[:2] == ["docker", "ps"] else "", "")
+
+    monkeypatch.setattr(deployer.subprocess, "run", fake_run)
+    url = deployer.ensure_local_postgres("todo", deployer.Runner())
+    assert url == "postgresql://app:app@todo-db:5432/app"
+    assert ["docker", "ps", "-aq", "-f", "name=^todo-db$"] in calls  # stopped containers count as existing
+    assert (["docker", "start", "todo-db"] in calls) is restarted
+    assert any(c[:2] == ["docker", "run"] for c in calls) is not restarted  # same name again -> Conflict
+
+
+def test_node_postgres_restarts_a_stopped_sidecar_instead_of_recreating_it(monkeypatch):
+    sent: list[str] = []
+    monkeypatch.setattr(nodes, "ssh_text", lambda node, cmd, timeout=60: sent.append(cmd) or "")
+    nodes.ensure_postgres(nodes.Node(name="a", host="10.0.0.2"), "todo")
+    assert "docker start todo-db >/dev/null 2>&1 || docker run -d" in sent[0]
 
 
 def test_cloudsql_provisioning_builds_unix_socket_url(monkeypatch):
