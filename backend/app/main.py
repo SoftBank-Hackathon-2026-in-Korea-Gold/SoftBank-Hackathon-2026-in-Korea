@@ -43,7 +43,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sse_starlette.sse import EventSourceResponse
 
-from app import analyzer, deployer, healer, webhooks
+from app import analyzer, deployer, env_store, healer, webhooks
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.schemas import AnalysisResult, DeployRequest, DeployTarget, EnvInput, EnvRequirement, PipelineEvent
@@ -315,6 +315,20 @@ def _inspect_source(source: str | Path, destination: Path | None = None) -> None
         os.close(root_fd)
 
 
+def _source_identity(source: str) -> str:
+    """Stable id of where an app's code comes from, so saved env values only go back to the same source.
+    Spellings of one repo agree ('https://GitHub.com/Octo/App.git/' == 'https://github.com/octo/app');
+    the branch is left out so every branch of a repo shares its values."""
+    if source.startswith("https://"):
+        parsed = urlparse(source)
+        path = parsed.path.strip("/").removesuffix(".git").lower()
+        return f"git:{(parsed.hostname or '').lower()}/{path}"
+    path = Path(source).expanduser()
+    if not path.is_absolute() and not path.exists() and (REPO_ROOT / source).exists():
+        path = REPO_ROOT / source  # same preset rule as prepare_source
+    return f"path:{path.resolve()}"
+
+
 @contextmanager
 def prepare_source(source: str, ref: str | None = None) -> Iterator[str]:
     """Prepare a local directory, local ZIP, or allowlisted public Git URL.
@@ -393,15 +407,13 @@ def _remove_workspace(path: Path) -> None:
 
 
 def _env_overrides(required: list[EnvRequirement], values: dict[str, str]) -> dict:
-    """deployer.deploy options for the user's values. A blank runtime secret that may be random gets one."""
+    """deployer.deploy options for the user's values (blank ones are left out)."""
     env: dict[str, str] = {}
     build_args: dict[str, str] = {}
     build_secrets: dict[str, str] = {}
     for item in required:
-        value = values.get(item.name) or (
-            secrets.token_urlsafe(32) if item.scope == "runtime" and item.generate else None
-        )
-        if value is None:
+        value = values.get(item.name)
+        if not value:
             continue
         if item.scope == "runtime":
             env[item.name] = value
@@ -638,9 +650,7 @@ def create_app() -> FastAPI:
                 )
                 for note in analysis.notes[:8]:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
-                overrides = (
-                    _env_overrides(analysis.required_env, _ask_env(analysis, source_dir)) if ask_env else {}
-                )
+                overrides = _env_overrides(analysis.required_env, _resolve_env(analysis, source_dir))
                 # Separate target workspaces because deployer writes Dockerfile and may leave background
                 # local container/tunnel artifacts. The folder name is the app/service name the deployer uses,
                 # so a stable `name` means "update the same service" (CD) instead of "create another one";
@@ -664,15 +674,52 @@ def create_app() -> FastAPI:
                 if "local" not in targets:
                     _remove_workspace(work_root)
 
-        def _ask_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
-            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
-            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
+        def _resolve_env(analysis: AnalysisResult, source_dir: str) -> dict[str, str]:
+            """Values saved for this app (named deploys only) first; the dashboard is asked only for the rest.
+            A blank runtime secret that may be random gets one, and new values are saved for the next deploy,
+            so a GitHub push redeploy keeps the keys and SECRET_KEY stays the same. Values are kept per
+            name *and* source: another repo deployed under the same name is asked afresh, never handed these."""
             if not analysis.required_env:
                 return {}
+            owner = _source_identity(source)
+            values = env_store.load(app_name, owner) if name else {}
+            saved = dict(values)
+            if used := sorted({e.name for e in analysis.required_env if values.get(e.name)}):
+                emit(
+                    PipelineEvent(
+                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 {', '.join(used)}"}
+                    )
+                )
+            missing = [e for e in analysis.required_env if not values.get(e.name)]
+            if not missing:
+                return values
+            if not ask_env:  # scripts and GitHub push: nobody to ask
+                lacking = ", ".join(sorted({e.name for e in missing}))
+                emit(
+                    PipelineEvent(
+                        type="log", stage="analyze", payload={"line": f"env: 저장된 값 없음 {lacking}"}
+                    )
+                )
+                return values
+            values |= _ask_env(missing, source_dir)
+            for e in missing:
+                if e.scope == "runtime" and e.generate and not values.get(e.name):
+                    values[e.name] = secrets.token_urlsafe(32)
+            if name and values != saved:
+                try:
+                    env_store.save(app_name, owner, values)
+                except env_store.EnvStoreError as exc:
+                    line = f"env: 값을 저장하지 못해 다음 배포에서 다시 묻습니다 ({exc})"
+                    emit(PipelineEvent(type="log", stage="analyze", payload={"line": line}))
+            return values
+
+        def _ask_env(items: list[EnvRequirement], source_dir: str) -> dict[str, str]:
+            """Pause until the user answers POST /deploy/{id}/env. Only names and evidence go out, never values.
+            `auto` marks what the deployer provisions when left blank, so the card can say so honestly."""
             postgres = deployer.wants_database(Path(source_dir), deployer.Config.from_env()) == "postgres"
             job.required_env = [
                 e.model_copy(update={"auto": True}) if postgres and e.name == "DATABASE_URL" else e
-                for e in analysis.required_env
+                for e in items
             ]
             job.state = "waiting_input"
             emit(

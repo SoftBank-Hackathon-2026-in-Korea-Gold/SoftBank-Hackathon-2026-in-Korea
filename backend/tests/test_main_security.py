@@ -851,6 +851,109 @@ def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monk
     assert m._jobs[status["deployment_id"]].env_values is None
 
 
+def _fake_env_store(m, monkeypatch, store):
+    monkeypatch.setattr(m.env_store, "load", lambda app, owner: dict(store.get((app, owner), {})))
+    monkeypatch.setattr(
+        m.env_store, "save", lambda app, owner, values: store.__setitem__((app, owner), dict(values))
+    )
+
+
+def test_named_app_keeps_its_values_across_redeploys_and_push(m, tmp_path, monkeypatch):
+    """Values are saved per app: the next dashboard deploy asks only what is still missing, a GitHub push
+    deploy (no ask_env) gets them too, and a generated SECRET_KEY stays the same."""
+    calls = []
+    store: dict[tuple[str, str], dict] = {}
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    _fake_env_store(m, monkeypatch, store)
+
+    async def deploy(ask_env, answer=None):
+        request = DeployRequest(source=str(source), targets=["local"], name="gb", ask_env=ask_env)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        job = m._jobs[deployment_id]
+        if answer is not None:
+            await _until(lambda: job.state == "waiting_input")
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer))
+        await _until(lambda: job.completed)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        events = [event async for event in response.body_iterator]
+        return [
+            [i["name"] for i in json.loads(e["data"])["payload"]["items"]]
+            for e in events
+            if e["event"] == "input_required"
+        ]
+
+    async def scenario():
+        first = await deploy(True, {"GITHUB_TOKEN": "ghp_s3cret", "GITHUB_USERNAME": "octo"})
+        second = await deploy(True, {"API_KEY": "k-1"})
+        push = await deploy(False)
+        return first, second, push
+
+    first, second, push = asyncio.run(scenario())
+    assert first == [["GITHUB_TOKEN", "GITHUB_USERNAME", "SECRET_KEY", "API_KEY"]]
+    assert second == [["API_KEY"]]  # only what the first answer left blank
+    assert push == []
+    secret_key = store[("gb", m._source_identity(str(source)))]["SECRET_KEY"]
+    assert all(c["env"]["SECRET_KEY"] == secret_key for c in calls)
+    assert calls[1] == calls[2] and calls[2]["env"]["API_KEY"] == "k-1"
+    assert calls[2]["build_secrets"] == {"GITHUB_TOKEN": "ghp_s3cret"}
+
+
+def test_same_name_from_another_source_never_gets_the_saved_values(m, tmp_path, monkeypatch):
+    """Names are free-form: another repo deployed as `gb` is asked afresh and its container gets none of
+    the first app's keys, from the dashboard or from a push."""
+    calls = []
+    store: dict[tuple[str, str], dict] = {}
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "app.py").write_text("print(os.environ)")
+    _fake_env_store(m, monkeypatch, store)
+
+    async def deploy(src, ask_env, answer=None):
+        request = DeployRequest(source=str(src), targets=["local"], name="gb", ask_env=ask_env)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        job = m._jobs[deployment_id]
+        if answer is not None:
+            await _until(lambda: job.state == "waiting_input")
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values=answer))
+        await _until(lambda: job.completed)
+
+    async def scenario():
+        await deploy(source, True, {"API_KEY": "k-victim", "GITHUB_TOKEN": "ghp_victim"})
+        await deploy(other, False)  # push-style: nothing to ask, and nothing saved for this source
+        await deploy(other, True, {})  # dashboard: asked again, answers nothing
+
+    asyncio.run(scenario())
+    victim, push, dashboard = calls
+    assert not push.get("env") and not push.get("build_secrets")
+    assert set(dashboard["env"]) == {"SECRET_KEY"} and not dashboard.get("build_secrets")
+    assert dashboard["env"]["SECRET_KEY"] != victim["env"]["SECRET_KEY"]  # its own, freshly generated
+    assert store[("gb", m._source_identity(str(source)))]["API_KEY"] == "k-victim"  # left untouched
+
+
+def test_source_identity_ignores_spelling_but_not_owner(m):
+    same = {
+        m._source_identity(u)
+        for u in (
+            "https://github.com/octo/app",
+            "https://GitHub.com/Octo/App.git",
+            "https://github.com/octo/app/",
+        )
+    }
+    assert same == {"git:github.com/octo/app"}
+    assert m._source_identity("https://github.com/mallory/app") != "git:github.com/octo/app"
+
+
 def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):
     def fake_deploy(*args, **kwargs):
         raise AssertionError("must not deploy without an answer")

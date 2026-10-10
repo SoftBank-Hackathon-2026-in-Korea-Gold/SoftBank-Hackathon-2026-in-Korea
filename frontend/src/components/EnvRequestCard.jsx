@@ -43,7 +43,7 @@ export default function EnvRequestCard({ request, onSubmit }) {
   return (
     <Card title="배포에 필요한 값" icon={KeyRound} right={<Badge tone="amber">입력 대기</Badge>} className="border-amber-500/30">
       <p className="mb-4 text-xs leading-5 text-slate-400">
-        AI 검사관이 코드에서 아래 값을 찾았습니다. 직접 쓰는 서버 · 키가 있으면 넣고, 비워 두면 CloudMorph가 만들 수 있는 것은 만들어 넣습니다 (항목마다 표시). 넣은 값은 이번 배포에만 쓰고 로그 · 이벤트에 남기지 않습니다.
+        AI 검사관이 코드에서 아래 값을 찾았습니다. 직접 쓰는 서버 · 키가 있으면 넣고, 비워 두면 CloudMorph가 만들 수 있는 것은 만들어 넣습니다 (항목마다 표시). 앱 이름을 정해 배포하면 값을 앱별로 저장해 두고(GCP Secret Manager) 다음 배포부터는 새로 필요한 값만 묻습니다. 로그 · 이벤트에는 남기지 않습니다.
         {request.timeoutSec ? ` ${Math.round(request.timeoutSec / 60)}분 안에 답하지 않으면 배포를 멈춥니다.` : ''}
       </p>
       <form className="space-y-3" onSubmit={(e) => { e.preventDefault(); send(values); }}>
