@@ -20,6 +20,7 @@ export default function App() {
   const [showToken, setShowToken] = useState(false);
   const [autoFollow, setAutoFollow] = useState(true);
   const [notice, setNotice] = useState(null);
+  const [starting, setStarting] = useState(false);
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
   const [now, setNow] = useState(() => Date.now());
@@ -82,11 +83,15 @@ export default function App() {
 
   const onDeploy = async () => {
     const targets = Object.keys(form.targets).filter((t) => form.targets[t]);
+    // lock the button before the request returns, otherwise a double click starts two deployments
+    setStarting(true);
     try {
       const id = await startDeploy({ source: form.source.trim(), targets, name: form.name.trim() || undefined, ref: form.ref.trim() || undefined });
       attach(id, { source: form.source, targets, name: form.name || null, trigger: 'api' });
     } catch (e) {
       setRun({ ...emptyRun(), status: 'failed', error: e.message, logs: [{ id: 0, at: new Date(), kind: 'error', stage: 'failed', text: `배포 요청 실패: ${e.message}` }] });
+    } finally {
+      setStarting(false);
     }
   };
 
@@ -130,7 +135,7 @@ export default function App() {
 
         <div className="grid gap-5 xl:grid-cols-[360px_minmax(0,1fr)]">
           <div className="space-y-5">
-            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={run.status === 'running'} fleetAvailable={!!fleet} />
+            <DeployForm form={form} setForm={setForm} onDeploy={onDeploy} busy={starting || run.status === 'running'} fleetAvailable={!!fleet} />
             <AnalysisCard run={run} />
           </div>
           <div className="min-w-0 space-y-5">
