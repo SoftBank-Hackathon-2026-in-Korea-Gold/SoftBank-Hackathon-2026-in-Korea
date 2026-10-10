@@ -194,7 +194,7 @@ function StationPad({ position, label, state, celebrate, reduced, portal }) {
         </mesh>
       )}
       <Html position={LABEL_OFFSET} center zIndexRange={HTML_Z} pointerEvents="none" portal={portal}>
-        <span className={`pointer-events-none select-none whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${LABEL_CLASS[state] || LABEL_CLASS.idle}`}>
+        <span data-scene-label className={`pointer-events-none select-none whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[10px] font-semibold ${LABEL_CLASS[state] || LABEL_CLASS.idle}`}>
           {label}
         </span>
       </Html>
@@ -307,7 +307,7 @@ function JourneyScene({ runId, steps, journey, path, reduced, portal }) {
   );
 }
 
-export default function PipelineJourney({ run, className = '', height = 220 }) {
+export default function PipelineJourney({ run, className = '', height = 220, presentation = 'card' }) {
   const reduced = useReducedMotion();
   // Html labels portal here: without a fixed target drei re-mounts every label root once R3F connects its events
   const labelLayer = useRef(null);
@@ -315,6 +315,17 @@ export default function PipelineJourney({ run, className = '', height = 220 }) {
   const steps = useMemo(() => (run ? stepStatus(run) : { analyze: 'idle', deploy: 'idle', heal: 'idle', live: 'idle' }), [run]);
   const path = useMemo(() => pathTo(journey.station, journey.healed), [journey.station, journey.healed]);
   const summary = `배포 여정: ${STATION_LABEL[journey.station]} · ${MODE_LABEL[journey.mode]}${journey.healed ? ' · 자가치유 경유' : ''}`;
+
+  const view = (
+    <div ref={labelLayer} role="img" aria-label={summary} className={`relative isolate overflow-hidden ${presentation === 'stage' ? 'scene-embedded' : 'rounded-xl bg-[#0a0d14]/60'}`} style={{ height: presentation === 'stage' ? '100%' : height }}>
+      <Canvas dpr={[1, 2]} camera={CAMERA} gl={GL}>
+        <Suspense fallback={null}>
+          <JourneyScene runId={run?.id} steps={steps} journey={journey} path={path} reduced={reduced} portal={labelLayer} />
+        </Suspense>
+      </Canvas>
+    </div>
+  );
+  if (presentation === 'stage') return view;
 
   return (
     <div className={`rounded-2xl border border-white/5 bg-slate-900/60 p-4 shadow-xl shadow-black/20 ${className}`}>
@@ -325,13 +336,7 @@ export default function PipelineJourney({ run, className = '', height = 220 }) {
           <span className={`font-medium ${MODE_BADGE[journey.mode]}`}>{MODE_LABEL[journey.mode]}</span>
         </div>
       </div>
-      <div ref={labelLayer} role="img" aria-label={summary} className="relative isolate overflow-hidden rounded-xl bg-[#0a0d14]/60" style={{ height }}>
-        <Canvas dpr={[1, 2]} camera={CAMERA} gl={GL}>
-          <Suspense fallback={null}>
-            <JourneyScene runId={run?.id} steps={steps} journey={journey} path={path} reduced={reduced} portal={labelLayer} />
-          </Suspense>
-        </Canvas>
-      </div>
+      {view}
     </div>
   );
 }

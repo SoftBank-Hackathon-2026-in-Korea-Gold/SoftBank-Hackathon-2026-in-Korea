@@ -1,5 +1,5 @@
 import React, { Component, Suspense, useEffect, useMemo, useRef, useState } from 'react';
-import { Canvas, useFrame } from '@react-three/fiber';
+import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { ContactShadows, Sparkles, useAnimations, useGLTF } from '@react-three/drei';
 import * as THREE from 'three';
 import { ExternalLink, Wrench, X } from 'lucide-react';
@@ -321,7 +321,7 @@ function HealSummary({ run, summary }) {
 }
 
 // All hooks live here so the default export can bail out before any of them run.
-function Overlay({ run, onClose, modelUrl, clip, autoCloseMs, className, height }) {
+function Overlay({ run, onClose, modelUrl, clip, autoCloseMs, className, height, presentation }) {
   const closeButton = useRef(null);
   // App re-renders on every tick with a fresh onClose; reading it through a ref keeps the timer from resetting.
   const onCloseRef = useRef(onClose);
@@ -350,6 +350,23 @@ function Overlay({ run, onClose, modelUrl, clip, autoCloseMs, className, height 
     const id = setTimeout(() => onCloseRef.current?.(), autoCloseMs);
     return () => clearTimeout(id);
   }, [autoCloseMs]);
+
+  if (presentation === 'stage') return (
+    <section className="victory-embedded" aria-label="AI 자가치유 성공 축하">
+      <div className="victory-heading">
+        <p>{summary.patchCount ? `패치 ${summary.patchCount}개로 배포를 복구했어요` : '실패한 배포를 고쳐 다시 올렸어요'}</p>
+        <button ref={closeButton} className="dashboard-button" onClick={() => onCloseRef.current?.()}>돌아가기</button>
+      </div>
+      <div className="victory-canvas">
+        <SceneBoundary fallback={<div className="scene-message">AI 자가치유 성공 · 공개 URL에서 결과를 확인하세요</div>}>
+          <Canvas shadows="percentage" dpr={[1, 2]} camera={{ fov: 40 }}>
+            <VictoryCameraRig />
+            <Suspense fallback={null}><VictoryStage modelUrl={modelUrl} clip={clip} reduced={reduced} /></Suspense>
+          </Canvas>
+        </SceneBoundary>
+      </div>
+    </section>
+  );
 
   return (
     <div className={`pointer-events-none fixed inset-0 z-50 flex items-center justify-center p-4 ${className}`}>
@@ -385,7 +402,24 @@ export default function VictoryCelebration({
   autoCloseMs = 0,
   className = '',
   height = 380,
+  presentation = 'overlay',
 }) {
   if (!open) return null;
-  return <Overlay run={run} onClose={onClose} modelUrl={modelUrl} clip={clip} autoCloseMs={autoCloseMs} className={className} height={height} />;
+  return <Overlay run={run} onClose={onClose} modelUrl={modelUrl} clip={clip} autoCloseMs={autoCloseMs} className={className} height={height} presentation={presentation} />;
+}
+
+function VictoryCameraRig() {
+  const get = useThree((s) => s.get);
+  const size = useThree((s) => s.size);
+  useEffect(() => {
+    const { camera } = get();
+    const halfV = THREE.MathUtils.degToRad(20);
+    const halfH = Math.atan(Math.tan(halfV) * size.width / Math.max(1, size.height));
+    const distance = 3.25 / Math.sin(Math.min(halfV, halfH)) * 1.05;
+    const elevation = THREE.MathUtils.degToRad(18);
+    camera.position.set(0, 1 + Math.sin(elevation) * distance, Math.cos(elevation) * distance);
+    camera.lookAt(...SPOT_TARGET);
+    camera.updateProjectionMatrix();
+  }, [get, size.width, size.height]);
+  return null;
 }

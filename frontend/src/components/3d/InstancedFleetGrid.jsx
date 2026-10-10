@@ -194,7 +194,7 @@ function Legend({ counts }) {
   );
 }
 
-export default function InstancedFleetGrid({ fleet, demoCount = 0, className = '', height = 320 }) {
+export default function InstancedFleetGrid({ fleet, demoCount = 0, className = '', height = 320, presentation = 'card' }) {
   const reduced = usePrefersReducedMotion();
   const liveNodes = fleet?.nodes;
   const nodes = useMemo(() => {
@@ -204,19 +204,8 @@ export default function InstancedFleetGrid({ fleet, demoCount = 0, className = '
   const counts = useMemo(() => countByStatus(nodes), [nodes]);
   const demo = demoCount > 0 ? Math.floor(demoCount) : 0;
 
-  return (
-    <Card
-      title="노드 풀 3D"
-      icon={Boxes}
-      className={className}
-      right={
-        <span className="text-[11px] text-slate-500">
-          노드 <span className="font-mono tabular-nums text-slate-300">{nodes.length}</span>개
-          {demo > 0 && <span className="text-amber-300/80"> · 데모 {demo}개 포함</span>}
-        </span>
-      }
-    >
-      <div className="relative overflow-hidden rounded-xl border border-white/5 bg-[#0a0d14]" style={{ height }}>
+  const view = (
+      <div className={`relative overflow-hidden ${presentation === 'stage' ? 'scene-embedded' : 'rounded-xl border border-white/5 bg-[#0a0d14]'}`} style={{ height: presentation === 'stage' ? '100%' : height }}>
         {nodes.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-1 text-center">
             <Boxes className="h-6 w-6 text-slate-600" />
@@ -237,11 +226,12 @@ export default function InstancedFleetGrid({ fleet, demoCount = 0, className = '
             </Canvas>
             <Legend counts={counts} />
             <span className="pointer-events-none absolute right-3 top-3 rounded-md bg-slate-950/70 px-2 py-1 font-mono text-[10px] text-violet-300/90 ring-1 ring-inset ring-violet-500/20">
-              단일 드로우콜 · Instanced
+              {demo > 0 ? `데모 ${demo}개 포함 · ` : ''}드래그로 회전
             </span>
           </>
         )}
       </div>
-    </Card>
   );
+  if (presentation === 'stage') return view;
+  return <Card title="노드 풀 3D" icon={Boxes} className={className} right={<span className="text-[11px] text-slate-500">노드 {nodes.length}개{demo > 0 && ` · 데모 ${demo}개 포함`}</span>}>{view}</Card>;
 }

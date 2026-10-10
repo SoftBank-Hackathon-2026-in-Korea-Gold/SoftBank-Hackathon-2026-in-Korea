@@ -63,11 +63,10 @@ function Row({ log }) {
   );
 }
 
-export default function LogConsole({ logs, running }) {
+export default function LogConsole({ logs, running, height = 460, active = true }) {
   const [filter, setFilter] = useState('key');
   const [target, setTarget] = useState('all');
   const [follow, setFollow] = useState(true);
-  const endRef = useRef(null);
   const boxRef = useRef(null);
 
   const targets = useMemo(() => [...new Set(logs.map((l) => l.target).filter(Boolean))], [logs]);
@@ -76,7 +75,8 @@ export default function LogConsole({ logs, running }) {
     return logs.filter((l) => (!f?.test || f.test(l)) && (target === 'all' || !l.target || l.target === target));
   }, [logs, filter, target]);
 
-  useEffect(() => { if (follow) endRef.current?.scrollIntoView({ block: 'end' }); }, [shown.length, follow]);
+  const scrollToEnd = () => { const box = boxRef.current; if (box) box.scrollTop = box.scrollHeight; };
+  useEffect(() => { if (follow && active) scrollToEnd(); }, [shown.length, follow, active]);
 
   const onScroll = () => {
     const el = boxRef.current;
@@ -104,14 +104,14 @@ export default function LogConsole({ logs, running }) {
               {targets.map((t) => <option key={t} value={t}>{t}</option>)}
             </select>
           )}
-          <button type="button" title="맨 아래로 따라가기" onClick={() => { setFollow(true); endRef.current?.scrollIntoView({ block: 'end' }); }}
+          <button type="button" title="맨 아래로 따라가기" onClick={() => { setFollow(true); scrollToEnd(); }}
             className={`rounded-lg p-1.5 ${follow ? 'text-violet-300' : 'text-slate-500 hover:text-slate-200'}`}>
             <ArrowDownToLine className="h-4 w-4" />
           </button>
         </>
       }
     >
-      <div ref={boxRef} onScroll={onScroll} className="h-[460px] overflow-y-auto px-2 py-2">
+      <div ref={boxRef} onScroll={onScroll} className="overflow-y-auto px-2 py-2" style={{ height }}>
         {shown.length === 0 ? (
           <div className="flex h-full flex-col items-center justify-center gap-2 text-center text-sm text-slate-500">
             <Sparkles className="h-6 w-6 text-slate-600" />
@@ -131,7 +131,6 @@ export default function LogConsole({ logs, running }) {
             진행 중
           </div>
         )}
-        <div ref={endRef} />
       </div>
       <footer className="flex items-center justify-between border-t border-white/5 px-4 py-2 text-[11px] text-slate-500">
         <span>{shown.length} / {logs.length} 줄</span>

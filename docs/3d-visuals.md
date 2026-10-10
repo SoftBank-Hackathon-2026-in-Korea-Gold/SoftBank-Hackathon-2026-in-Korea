@@ -18,7 +18,8 @@
 <PipelineJourney run={run} height={220} className="" />
 ```
 
-- `run`: `lib/run.js`의 run 객체(Stepper와 같은 것). SSE를 다시 파싱하지 않고 `stepStatus(run)`에서 파생합니다.
+- `presentation`: 기본 `card`. `stage`는 카드 제목·테두리 없이 부모 영역을 채웁니다.
+- `run`: `lib/run.js`의 run 객체. SSE를 다시 파싱하지 않고 `stepStatus(run)`에서 파생합니다.
 - 큐브 위치: `idle → analyze → deploy → (heal) → live`. `heal`은 deploy와 live 사이에서 갈라지는 우회 트랙이며, 패치가 하나라도 있으면 live로 갈 때 이 우회로를 거칩니다.
 - 실행 중에는 live에 도달하지 않고, 실패하면 실패한 지점에서 붉게 흔들린 뒤 멈춥니다.
 - 배포 ID가 바뀌면 이동 큐브를 다시 마운트해 이전 배포의 위치·경유지·실패 흔들림을 초기화합니다. Canvas와 트랙은 유지합니다.
@@ -31,6 +32,7 @@
 <InstancedFleetGrid fleet={fleet} demoCount={0} height={320} className="" />
 ```
 
+- `presentation`: 기본 `card`. `stage`는 부모 영역을 채웁니다.
 - `fleet`: `GET /fleet` 응답(`fleet.nodes`). 노드가 없으면 Canvas 없이 안내 카드만 그립니다.
 - `demoCount`: 0보다 크면 결정적(seed 7) 가상 노드를 뒤에 덧붙입니다. 시연용입니다.
 - 상태 색상: 정상 `#10b981`(에메랄드), 과부하 `#f97316`(주황, `load1 / cpus >= 0.8`, 백엔드와 같은 기준), 장애 `#ef4444`(빨강, `ok=false`).
@@ -46,7 +48,8 @@
   modelUrl={import.meta.env.VITE_VICTORY_MODEL_URL} clip="hiphop01" autoCloseMs={0} height={380} />
 ```
 
-- `fixed inset-0 z-50` 오버레이입니다. 바깥 래퍼는 `pointer-events-none`이라 뒤의 2D UI를 계속 쓸 수 있고, 무대 카드와 우측 상단 닫기 버튼만 `pointer-events-auto`입니다. Esc로도 닫힙니다.
+- `presentation`: 기본 `overlay`. `stage`는 메인 장면을 축하 무대로 바꾸고, 성공 요약·공개 URL은 화면의 HUD·하단 로그 영역에서 확인합니다. 무대 카메라는 화면 비율에 맞게 거리를 조절합니다.
+- 기본 모드는 `fixed inset-0 z-50` 오버레이입니다. 바깥 래퍼는 `pointer-events-none`이라 뒤의 2D UI를 계속 쓸 수 있고, 무대 카드와 우측 상단 닫기 버튼만 `pointer-events-auto`입니다. Esc로도 닫힙니다.
 - 카드 높이는 `100dvh - 2rem`으로 제한하고 내부 스크롤을 허용합니다. 닫을 때 이전에 포커스했던 요소가 남아 있으면 포커스를 돌려줍니다.
 - Canvas에 별도 `SceneBoundary`를 두어 WebGL 초기화가 실패해도 성공 요약, 공개 URL, 닫기 버튼은 유지합니다.
 - 무대: 원형 스테이지, 키·필 `spotLight` 2개, 림 `pointLight` 2개, `<Sparkles />` 4겹(보라·에메랄드·호박·별가루), `ContactShadows`.
@@ -111,75 +114,31 @@ http://localhost:5173/?fleetDemo=200
 
 닫으면 그 `run.id`를 `dismissedIds`에 추가합니다. 다른 배포를 닫은 뒤 이전 배포를 다시 열람해도 재등장하지 않습니다. 아직 닫지 않은 자가치유 배포는 다시 열람할 때 축하 화면을 표시합니다. 이 기록은 현재 페이지에만 유지되고 새로고침하면 초기화됩니다.
 
-## App.jsx 연동 예시
+## App.jsx 연동
 
-three / fiber / drei는 `React.lazy`로 분리된 청크에 들어가므로 2D UI가 먼저 그려집니다. 각 3D 컴포넌트는 `SceneBoundary`(에러 경계)와 `Suspense`(같은 높이의 스켈레톤)로 감쌉니다.
+`App.jsx`는 `100dvh` 화면에서 헤더 → 상태 요약 → 남은 높이를 채우는 3D 장면 → 핵심 로그·공개 URL을 배치합니다. 배포 여정은 대기 중에도 표시되며, 노드 풀 탭은 같은 장면 영역을 사용합니다. 화면 높이가 600px 이하이면 단계 요약을 접고 마지막 핵심 로그만 표시합니다.
 
-```jsx
-import React, { Suspense, lazy, useState } from 'react';
-import SceneBoundary from './components/3d/SceneBoundary';
-import { shouldCelebrate } from './lib/victory'; // 순수 함수라 정적 import해도 three가 딸려오지 않음
+세 컴포넌트는 `presentation="stage"`로 렌더됩니다. `React.lazy`와 `Suspense`로 현재 선택한 장면의 청크를 불러오고, `SceneBoundary`가 3D 오류를 격리합니다. 성공 축하 무대는 기존 발동 규칙을 사용합니다. 돌아가기·Esc를 누르면 이전 장면으로 복귀하고, 탭을 선택하면 해당 장면으로 전환합니다.
 
-const PipelineJourney = lazy(() => import('./components/3d/PipelineJourney'));
-const InstancedFleetGrid = lazy(() => import('./components/3d/InstancedFleetGrid'));
-const VictoryCelebration = lazy(() => import('./components/3d/VictoryCelebration'));
+`DetailsDrawer`에는 새 배포·배포 상세·프로젝트·노드·설정이 있습니다. 데스크톱에서는 우측 최대 440px, 모바일에서는 하단 85dvh 패널이며 패널 내부에서만 스크롤합니다. 닫힌 섹션도 마운트를 유지해 입력 내용을 보존합니다. 배포 ID가 바뀌면 환경 변수·질문 카드의 입력 상태를 초기화합니다.
 
-// JourneySkeleton, FleetSkeleton, parseFleetDemo(?fleetDemo=N → 0~500)는 frontend/src/App.jsx 참고
-export default function App() {
-  // ... run, fleet 등 기존 상태
-  const [fleetDemo] = useState(() => parseFleetDemo(window.location.search));
-  const [dismissedVictoryIds, setDismissedVictoryIds] = useState(() => new Set());
-  const celebrate = shouldCelebrate(run, dismissedVictoryIds);
-
-  return (
-    <>
-      <Stepper run={run} /* ... */ />
-      {run.status !== 'idle' && (
-        <SceneBoundary>
-          <Suspense fallback={<JourneySkeleton />}>
-            <PipelineJourney run={run} height={220} />
-          </Suspense>
-        </SceneBoundary>
-      )}
-
-      <FleetPanel fleet={fleet} />
-      {fleet && (
-        <SceneBoundary>
-          <Suspense fallback={<FleetSkeleton />}>
-            <InstancedFleetGrid fleet={fleet} demoCount={fleetDemo} height={320} />
-          </Suspense>
-        </SceneBoundary>
-      )}
-
-      {/* 열릴 때만 렌더해야 축하 청크를 첫 화면에서 받지 않음 */}
-      {celebrate && (
-        <SceneBoundary key={run.id}>
-          <Suspense fallback={null}>
-            <VictoryCelebration open run={run} onClose={() => setDismissedVictoryIds((ids) => new Set(ids).add(run.id))} />
-          </Suspense>
-        </SceneBoundary>
-      )}
-    </>
-  );
-}
-```
-
-포인트:
-
-- `React.lazy`는 요소가 렌더되는 순간 청크를 가져옵니다. `VictoryCelebration`은 닫혀 있을 때 `null`을 반환하지만, 그래도 렌더 트리에 두면 three 청크를 첫 화면에서 받게 되므로 `celebrate &&`로 감쌉니다.
-- 오버레이는 레이아웃 흐름 밖(`fixed`)이라 `Suspense` fallback은 `null`입니다. 나머지 둘은 컴포넌트와 같은 카드 외형·높이의 스켈레톤을 써서 레이아웃이 밀리지 않게 합니다.
-- `SceneBoundary`의 기본 fallback은 `null`입니다. 렌더링·WebGL 초기화 오류는 3D 영역에 격리됩니다. 축하 화면의 내부 경계는 2D 성공 메시지를 fallback으로 표시합니다. 컨텍스트 유실 이벤트 자체의 복구는 Three.js 렌더러가 담당합니다.
-- 실제 연동 코드는 `frontend/src/App.jsx`에 있습니다.
+- 환경 변수나 자가치유 질문은 요청별로 패널을 한 번 자동으로 엽니다. 닫은 뒤에는 HUD의 **입력 필요** 버튼으로 다시 엽니다.
+- 패널은 배경을 `inert`로 만들고 포커스를 가둡니다. Esc는 패널을 먼저 닫고 포커스를 복원하며, 다음 Esc가 축하 무대를 닫습니다.
+- 장면·패널 전환은 SSE 연결과 폴링을 다시 시작하지 않습니다. 새 배포·프로젝트 따라가기는 이전 연결을 닫고 배포 여정으로 돌아갑니다.
+- 전체화면 버튼은 사용자 클릭으로 브라우저 Fullscreen API를 호출합니다. 지원하지 않는 환경에서도 기본 뷰포트 레이아웃을 사용할 수 있습니다.
+- 로그 자동 이동은 로그 박스의 `scrollTop`만 바꾸므로 부모 화면이 스크롤되지 않습니다.
 
 ## 검증
 
 ```bash
 cd frontend
-npm test        # vitest: lib/pipelineJourney, lib/fleetStatus, lib/victory
+npm test        # vitest: 3D 상태·카메라·대시보드 요약 로직
 npm run lint    # oxlint
-npm run build   # three 계열은 별도 청크로 분리, 엔트리 청크에는 포함되지 않음
+npm run build   # three 계열은 별도 청크로 분리
+npx playwright install chromium
+npm run test:e2e # 목업 API/SSE로 브라우저 회귀 검사
 ```
 
-GitHub CI도 `npm ci` 뒤 위 세 검사를 실행합니다. 카메라 테스트는 실제 Three.js 카메라에 노드 모서리를 투영하여 좁은 화면·회전 시에도 화면 안에 들어오는지 검증합니다.
+GitHub CI도 `npm ci` 뒤 위 검사를 실행합니다. 브라우저 검사는 1920×1080, 1366×768, 375×667, 375×320에서 페이지 스크롤·조작 버튼·장면 전환을 확인하고 입력 유지, 포커스, SSE 연결 수, 성공 축하, WebGL 실패를 검증합니다. 실제 클라우드 배포를 생성하지 않습니다. 카메라 테스트는 실제 Three.js 카메라에 노드 모서리를 투영하여 좁은 화면·회전 시에도 화면 안에 들어오는지 검증합니다.
 
-빌드 시 three / fiber / drei 공유 청크가 500 kB를 넘는다는 Vite 경고가 나오지만, 지연 로드되는 청크라 첫 화면에는 영향이 없습니다.
+빌드 시 three / fiber / drei 공유 청크가 500 kB를 넘는다는 Vite 경고가 나오지만, 별도 청크로 분리됩니다. 기본 배포 여정이 첫 화면에 표시되므로 3D 청크는 초기 화면에서 요청되며, 헤더·상태·로그는 먼저 렌더됩니다.

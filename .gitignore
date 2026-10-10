@@ -75,3 +75,5 @@ backend/.cloudmorph/
 
 # local-only GLB models for the 3D victory dancer (never committed)
 frontend/public/models/
+frontend/test-results/
+frontend/playwright-report/
