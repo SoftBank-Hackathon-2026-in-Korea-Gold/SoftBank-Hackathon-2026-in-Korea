@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Cloud, KeyRound } from 'lucide-react';
+import React, { Suspense, lazy, useCallback, useEffect, useRef, useState } from 'react';
+import { Boxes, Cloud, KeyRound } from 'lucide-react';
 import { answerQuestion, cancelDeploy, getDeployment, getFleet, getHealth, getProjects, getToken, setToken, startDeploy, stopProject, submitEnv, subscribe } from './api';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
@@ -8,7 +8,42 @@ import Stepper from './components/Stepper';
 import LogConsole from './components/LogConsole';
 import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
 import { FleetPanel, ProjectsPanel } from './components/OpsPanels';
-import { Dot } from './components/ui';
+import { Card, Dot } from './components/ui';
+import SceneBoundary from './components/3d/SceneBoundary';
+import { shouldCelebrate } from './lib/victory';
+
+// three / fiber / drei live in lazy chunks so the 2D dashboard paints first
+const PipelineJourney = lazy(() => import('./components/3d/PipelineJourney'));
+const InstancedFleetGrid = lazy(() => import('./components/3d/InstancedFleetGrid'));
+const VictoryCelebration = lazy(() => import('./components/3d/VictoryCelebration'));
+
+const JOURNEY_HEIGHT = 220;
+const FLEET_3D_HEIGHT = 320;
+const FLEET_DEMO_MAX = 500;
+
+// ?fleetDemo=N adds N synthetic nodes to the 3D fleet grid (instancing demo)
+function parseFleetDemo(search) {
+  const n = Number.parseInt(new URLSearchParams(search).get('fleetDemo') ?? '', 10);
+  return Number.isFinite(n) ? Math.min(FLEET_DEMO_MAX, Math.max(0, n)) : 0;
+}
+
+// same chrome and height as the loaded component, so nothing shifts when the chunk arrives
+function JourneySkeleton() {
+  return (
+    <div className="rounded-2xl border border-white/5 bg-slate-900/60 p-4 shadow-xl shadow-black/20">
+      <div className="mb-2 h-5 px-1 text-sm font-semibold text-slate-200">배포 여정</div>
+      <div className="animate-pulse rounded-xl bg-[#0a0d14]/60" style={{ height: JOURNEY_HEIGHT }} />
+    </div>
+  );
+}
+
+function FleetSkeleton() {
+  return (
+    <Card title="노드 풀 3D" icon={Boxes}>
+      <div className="animate-pulse rounded-xl border border-white/5 bg-[#0a0d14]" style={{ height: FLEET_3D_HEIGHT }} />
+    </Card>
+  );
+}
 
 export default function App() {
   const [form, setForm] = useState({ source: 'sample-apps/guestbook', name: '', ref: '', targets: { local: true, cloudrun: true, node: false, function: false } });
@@ -26,6 +61,8 @@ export default function App() {
   const closeRef = useRef(null);
   const seenDeployments = useRef(null);
   const [now, setNow] = useState(() => Date.now());
+  const [dismissedVictoryId, setDismissedVictoryId] = useState(null);
+  const [fleetDemo] = useState(() => parseFleetDemo(window.location.search));
 
   // re-render once a second while running so elapsed time moves
   useEffect(() => {
@@ -127,6 +164,7 @@ export default function App() {
 
   const watchProject = (p) => attach(p.last_deployment_id, { source: p.source, targets: p.targets || [], name: p.name, trigger: p.trigger });
   const saveToken = (v) => { setToken(v); setTokenState(v); };
+  const celebrate = shouldCelebrate(run, dismissedVictoryId);
 
   return (
     <div className="min-h-screen bg-[#0a0d14] text-slate-100">
@@ -171,6 +209,13 @@ export default function App() {
           <div className="min-w-0 space-y-5">
             {run.envRequest && <EnvRequestCard key={run.id} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
             <Stepper run={run} now={now} onCancel={onCancel} cancelling={cancelling === run.id} />
+            {run.status !== 'idle' && (
+              <SceneBoundary>
+                <Suspense fallback={<JourneySkeleton />}>
+                  <PipelineJourney run={run} height={JOURNEY_HEIGHT} />
+                </Suspense>
+              </SceneBoundary>
+            )}
             <QuestionCard question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
             <div className="grid gap-5 2xl:grid-cols-[minmax(0,1fr)_380px]">
               <LogConsole logs={run.logs} running={run.status === 'running'} />
@@ -185,8 +230,24 @@ export default function App() {
         <div className="mt-5 space-y-5">
           <ProjectsPanel projects={projects} currentId={run.id} onWatch={watchProject} onStop={onStop} stopping={stopping} autoFollow={autoFollow} setAutoFollow={setAutoFollow} />
           <FleetPanel fleet={fleet} />
+          {fleet && (
+            <SceneBoundary>
+              <Suspense fallback={<FleetSkeleton />}>
+                <InstancedFleetGrid fleet={fleet} demoCount={fleetDemo} height={FLEET_3D_HEIGHT} />
+              </Suspense>
+            </SceneBoundary>
+          )}
         </div>
       </div>
+
+      {/* fixed z-50 overlay: rendered only while open so its chunk is fetched on the first celebration */}
+      {celebrate && (
+        <SceneBoundary key={run.id}>
+          <Suspense fallback={null}>
+            <VictoryCelebration open run={run} onClose={() => setDismissedVictoryId(run.id)} />
+          </Suspense>
+        </SceneBoundary>
+      )}
     </div>
   );
 }

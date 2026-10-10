@@ -72,3 +72,6 @@ backend/.cloudmorph/
 
 # demo-up.sh runtime state
 .demo/
+
+# local-only GLB models for the 3D victory dancer (never committed)
+frontend/public/models/

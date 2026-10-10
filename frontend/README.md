@@ -19,6 +19,9 @@ npm ci            # 의존성 설치 (lockfile 기준)
 npm run dev       # 개발 서버 http://localhost:5173
 npm run build     # 프로덕션 빌드 → dist/
 npm run lint      # oxlint
+npm test          # vitest (src/lib 순수 로직 테스트)
 ```
+
+3D 시각화(배포 여정 · 노드 풀 3D · 자가치유 축하) 설치와 연동: [`../docs/3d-visuals.md`](../docs/3d-visuals.md)
 
 Tailwind는 현재 `index.html`의 CDN 스크립트(`cdn.tailwindcss.com`)로 로드합니다 — 시연용이며 정식 설치는 후속 작업.
