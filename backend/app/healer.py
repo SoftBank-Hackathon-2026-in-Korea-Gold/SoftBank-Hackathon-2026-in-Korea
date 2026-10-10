@@ -118,7 +118,10 @@ _DEPLOYER_HEADER = re.compile(r"^\[deployer\] stage=(\S+) kind=(\S+)", re.MULTIL
 
 # Failures a Dockerfile patch cannot fix: credentials/billing/APIs, registry push, deployer bugs,
 # CLI timeouts (a retry costs up to the full build/deploy timeout). Stop and ask a human instead.
-UNHEALABLE_KINDS = frozenset({"user_action_required", "push_error", "internal_error", "timeout"})
+# function_error: Cloud Run functions are built from source by buildpacks; a Dockerfile patch cannot fix them
+UNHEALABLE_KINDS = frozenset(
+    {"user_action_required", "push_error", "internal_error", "timeout", "function_error"}
+)
 
 
 def deployer_header(error_log: str) -> tuple[str, str] | None:

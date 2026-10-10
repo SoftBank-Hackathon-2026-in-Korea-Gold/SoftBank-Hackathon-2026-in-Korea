@@ -1,0 +1,168 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1700 1160" width="1700" height="1160" font-family="Pretendard, 'Apple SD Gothic Neo', system-ui, -apple-system, sans-serif">
+  <defs>
+    <linearGradient id="bgg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#140f24"/><stop offset=".35" stop-color="#0a0d14"/></linearGradient>
+    <marker id="mv" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#a78bfa"/></marker>
+    <marker id="ms" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#38bdf8"/></marker>
+    <marker id="me" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#34d399"/></marker>
+    <marker id="ma" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#fbbf24"/></marker>
+    <marker id="mg" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#94a3b8"/></marker>
+    <style>
+      .zone { fill: rgba(255,255,255,.015); stroke: rgba(255,255,255,.10); stroke-width: 1.2; }
+      .zone2 { fill: rgba(56,189,248,.035); stroke: rgba(56,189,248,.28); stroke-width: 1.2; stroke-dasharray: 5 5; }
+      .zone3 { fill: rgba(139,92,246,.05); stroke: rgba(167,139,250,.35); stroke-width: 1.2; }
+      .zone4 { fill: rgba(52,211,153,.035); stroke: rgba(52,211,153,.25); stroke-width: 1.2; stroke-dasharray: 5 5; }
+      .zt { fill: #94a3b8; font-size: 12px; font-weight: 700; letter-spacing: .06em; }
+      .zt.v { fill: #c4b5fd; } .zt.s { fill: #7dd3fc; } .zt.e { fill: #6ee7b7; } .zt.a { fill: #fcd34d; }
+      .b { fill: #121a2b; stroke: rgba(255,255,255,.14); stroke-width: 1.2; }
+      .b.v { fill: rgba(139,92,246,.13); stroke: rgba(167,139,250,.55); }
+      .b.s { fill: rgba(56,189,248,.10); stroke: rgba(56,189,248,.5); }
+      .b.e { fill: rgba(52,211,153,.10); stroke: rgba(52,211,153,.5); }
+      .b.a { fill: rgba(251,191,36,.10); stroke: rgba(251,191,36,.5); }
+      .b.r { fill: rgba(251,113,133,.09); stroke: rgba(251,113,133,.45); }
+      .b.dash { stroke-dasharray: 6 5; fill: rgba(255,255,255,.02); }
+      .t { fill: #f1f5f9; font-size: 14px; font-weight: 700; }
+      .s { fill: #94a3b8; font-size: 11.5px; font-weight: 500; }
+      .m { font-family: ui-monospace, 'SF Mono', Menlo, monospace; }
+      .ln { fill: none; stroke-width: 2; }
+      .lv { stroke: #a78bfa; } .ls { stroke: #38bdf8; } .le { stroke: #34d399; } .la { stroke: #fbbf24; } .lg { stroke: #94a3b8; stroke-width: 1.6; }
+      .dsh { stroke-dasharray: 6 5; }
+      .lb { font-size: 11px; font-weight: 600; paint-order: stroke; stroke: #0a0d14; stroke-width: 4px; stroke-linejoin: round; }
+      .lb.v { fill: #c4b5fd; } .lb.s { fill: #7dd3fc; } .lb.e { fill: #6ee7b7; } .lb.a { fill: #fcd34d; } .lb.g { fill: #cbd5e1; }
+    </style>
+  </defs>
+
+  <rect width="1700" height="1160" fill="url(#bgg)"/>
+
+  <!-- title -->
+  <g transform="translate(28,30)">
+    <rect width="34" height="34" rx="10" fill="#7c3aed"/>
+    <path d="M23.5 25H13a6.5 6.5 0 1 1 6.2-8.5h1.8a4.25 4.25 0 1 1 0 8.5Z" fill="none" stroke="#fff" stroke-width="2" transform="translate(-1,-2)"/>
+    <text x="46" y="17" class="t" style="font-size:20px">CloudMorph 아키텍처</text>
+    <text x="46" y="34" class="s" style="font-size:12.5px">One Action, Infinite Clouds — 분석 · 배포 · 자가치유 · 멀티 클라우드 (서버 호스팅 기준, 2026-10-10)</text>
+  </g>
+  <!-- legend -->
+  <g transform="translate(1060,26)">
+    <rect width="612" height="44" rx="10" fill="rgba(255,255,255,.03)" stroke="rgba(255,255,255,.08)"/>
+    <line x1="16" y1="22" x2="44" y2="22" class="ln lv" marker-end="url(#mv)"/><text x="50" y="26" class="lb v">제어 · API</text>
+    <line x1="128" y1="22" x2="156" y2="22" class="ln ls" marker-end="url(#ms)"/><text x="162" y="26" class="lb s">배포 · 관리</text>
+    <line x1="246" y1="22" x2="274" y2="22" class="ln le" marker-end="url(#me)"/><text x="280" y="26" class="lb e">사용자 트래픽</text>
+    <line x1="378" y1="22" x2="406" y2="22" class="ln la" marker-end="url(#ma)"/><text x="412" y="26" class="lb a">AI 호출</text>
+    <line x1="476" y1="22" x2="504" y2="22" class="ln lg dsh" marker-end="url(#mg)"/><text x="510" y="26" class="lb g">응답 · 내부</text>
+  </g>
+
+  <!-- ================= ZONES ================= -->
+  <rect class="zone" x="24" y="92" width="232" height="964" rx="18"/><text class="zt" x="44" y="118">사용자 · 외부</text>
+  <rect class="zone3" x="286" y="92" width="766" height="964" rx="18"/><text class="zt v" x="306" y="118">CloudMorph 서버 · GCE VM cloudmorph-control (e2-standard-4 · 34.64.253.41)</text>
+  <g transform="translate(60,0)"><rect class="zone" x="1082" y="92" width="534" height="964" rx="18"/><text class="zt" x="1102" y="118">클라우드</text></g>
+
+  <!-- ================= CLIENTS ================= -->
+  <rect class="b v" x="44" y="140" width="192" height="72" rx="12"/><text class="t" x="60" y="170">대시보드 사용자</text><text class="s" x="60" y="190">노트북 · 휴대폰 브라우저</text>
+  <rect class="b" x="44" y="290" width="192" height="60" rx="12"/><text class="t" x="60" y="316">개발자</text><text class="s m" x="60" y="335">git push</text>
+  <rect class="b v" x="44" y="380" width="192" height="68" rx="12"/><text class="t" x="60" y="408">GitHub</text><text class="s" x="60" y="428">push 웹훅 (HMAC 서명)</text>
+  <rect class="b e" x="44" y="760" width="192" height="72" rx="12"/><text class="t" x="60" y="790">앱 사용자 (누구나)</text><text class="s" x="60" y="810">배포된 서비스 접속</text>
+  <rect class="b dash" x="44" y="560" width="192" height="96" rx="12"/><text class="t" x="60" y="586">노트북 (선택)</text><text class="s" x="60" y="606">demo-up.sh로 같은 코드를</text><text class="s" x="60" y="624">노트북에서도 실행 가능.</text><text class="s" x="60" y="642">내 PC 배포 시연용</text>
+
+  <!-- ================= CONTROL PLANE ================= -->
+  <rect class="b v" x="306" y="140" width="210" height="72" rx="12"/><text class="t" x="322" y="168">Caddy · HTTPS</text><text class="s" x="322" y="188">자동 인증서 · 토큰 필요</text>
+  <rect class="b v" x="540" y="140" width="492" height="72" rx="12"/><text class="t" x="556" y="168">대시보드 (React 빌드)</text><text class="s m" x="556" y="188">cloudmorph.34-64-253-41.sslip.io · API·웹훅은 백엔드로</text>
+
+  <!-- backend -->
+  <rect class="zone3" x="306" y="240" width="726" height="402" rx="16" style="fill:rgba(139,92,246,.04)"/><text class="zt v" x="1014" y="630" text-anchor="end">FastAPI 백엔드 · systemd 상시 실행</text>
+  <rect class="b v" x="326" y="280" width="224" height="66" rx="11"/><text class="t" x="342" y="306">API · 인증</text><text class="s" x="342" y="326">토큰 · HMAC · fail-closed</text>
+  <rect class="b v" x="566" y="280" width="224" height="66" rx="11"/><text class="t" x="582" y="306">작업 실행기</text><text class="s" x="582" y="326">소스 준비 · 앱별 잠금 · 격리</text>
+  <rect class="b v" x="806" y="280" width="206" height="66" rx="11"/><text class="t" x="822" y="306">SSE 이벤트 버스</text><text class="s m" x="822" y="326">stage·log·heal_diff·done</text>
+
+  <rect class="b a" x="326" y="374" width="160" height="74" rx="11"/><text class="t" x="342" y="402">analyzer</text><text class="s" x="342" y="422">Claude 검사관 17개</text><text class="s" x="342" y="438">타깃 · Dockerfile</text>
+  <rect class="b s" x="502" y="374" width="162" height="74" rx="11"/><text class="t" x="518" y="402">deployer</text><text class="s" x="518" y="422">local·cloudrun·node·fn</text><text class="s" x="518" y="438">블루그린 · DB 준비</text>
+  <rect class="b a" x="682" y="374" width="160" height="74" rx="11"/><text class="t" x="698" y="402">healer</text><text class="s" x="698" y="422">stderr 분류 → 패치</text><text class="s" x="698" y="438">규칙 우선 · LLM 폴백</text>
+  <rect class="b v" x="858" y="374" width="154" height="74" rx="11"/><text class="t" x="874" y="402">webhooks</text><text class="s" x="874" y="422">push 파싱</text><text class="s" x="874" y="438">앱 이름 = 저장소</text>
+
+  <rect class="b s" x="326" y="478" width="204" height="74" rx="11"/><text class="t" x="342" y="506">fleet 감시 루프</text><text class="s" x="342" y="526">cgroup CPU 구간 평균</text><text class="s" x="342" y="542">50% ×2 → 확장 · 축소</text>
+  <rect class="b s" x="600" y="478" width="190" height="74" rx="11"/><text class="t" x="616" y="506">nodes</text><text class="s" x="616" y="526">노드 레지스트리 · SSH</text><text class="s" x="616" y="542">부하 점수 · 이미지 전송</text>
+  <rect class="b" x="812" y="478" width="200" height="74" rx="11"/><text class="t" x="828" y="506">상태 저장</text><text class="s m" x="828" y="526">projects.json · .fleet</text><text class="s m" x="828" y="542">nodes.json · .deployer</text>
+
+  <text class="s" x="584" y="580">계약 schemas.py:</text><text class="s m" x="684" y="580">AnalysisResult → DeployResult → HealReport</text>
+  <text class="s" x="584" y="602">자가치유: 실패 → healer가 Dockerfile 패치 → 재배포 (최대 3회)</text>
+
+  <!-- local docker -->
+  <rect class="zone4" x="306" y="672" width="726" height="290" rx="16"/><text class="zt e" x="324" y="696">서버 Docker 엔진 · local 타깃 실행 환경 (온프레미스형)</text>
+  <rect class="b e" x="326" y="712" width="222" height="70" rx="11"/><text class="t" x="342" y="740">앱 컨테이너</text><text class="s m" x="342" y="760">&lt;app&gt;-local · PORT=8080</text>
+  <rect class="b r" x="566" y="712" width="206" height="70" rx="11"/><text class="t" x="582" y="740">Postgres 사이드카</text><text class="s" x="582" y="760">postgres:16 · 볼륨 보존</text>
+  <rect class="b e" x="790" y="712" width="222" height="70" rx="11"/><text class="t" x="806" y="740">앱별 cloudflared 터널</text><text class="s m" x="806" y="760">*.trycloudflare.com</text>
+  <rect class="b" x="326" y="818" width="446" height="34" rx="9" style="fill:rgba(255,255,255,.03)"/><text class="s m" x="342" y="840">docker network: cloudmorph  (앱 ↔ DB, DATABASE_URL 주입)</text>
+  <rect class="b" x="326" y="872" width="686" height="68" rx="11"/><text class="t" x="342" y="900">이미지 빌드</text><text class="s" x="342" y="920">서버가 x86이라 local·cloudrun은 그대로, node는 노드 아키텍처(amd64·arm64)로 빌드</text>
+
+  <g transform="translate(60,0)">
+  <!-- ================= CLOUD ================= -->
+  <rect class="zone" x="1102" y="134" width="494" height="84" rx="14" style="fill:rgba(251,191,36,.03);stroke:rgba(251,191,36,.25)"/>
+  <rect class="b a" x="1120" y="148" width="458" height="56" rx="11"/><text class="t" x="1136" y="172">Anthropic Claude API</text><text class="s" x="1136" y="191">claude-haiku-5-5 · analyzer 검사관 · healer LLM 폴백 (→ OpenAI → 로컬)</text>
+
+  <rect class="zone2" x="1102" y="240" width="494" height="674" rx="16"/><text class="zt s" x="1120" y="264">Google Cloud · weighty-forest-457108-r2 · asia-northeast3</text>
+  <rect class="b s" x="1120" y="280" width="458" height="56" rx="11"/><text class="t" x="1136" y="304">Artifact Registry</text><text class="s m" x="1136" y="323">hackathon · amd64 이미지</text>
+
+  <rect class="b" x="1120" y="354" width="458" height="150" rx="12" style="fill:rgba(56,189,248,.05);stroke:rgba(56,189,248,.45)"/>
+  <text class="t" x="1136" y="380">Cloud Run · 앱마다 서비스 1개</text><text class="s m" x="1400" y="380">*.run.app</text>
+  <rect class="b e" x="1136" y="394" width="206" height="48" rx="9"/><text class="t" x="1150" y="415" style="font-size:12.5px">리비전 N</text><text class="s" x="1150" y="432">트래픽 100% · 서비스 중</text>
+  <rect class="b v" x="1356" y="394" width="206" height="48" rx="9"/><text class="t" x="1370" y="415" style="font-size:12.5px">리비전 N+1 · candidate</text><text class="s" x="1370" y="432">트래픽 0% · 태그 URL 검증</text>
+  <path d="M1459,442 C1459,470 1239,470 1239,446" class="ln lv dsh" marker-end="url(#mv)"/><text class="lb v" x="1268" y="478">검증 통과 시에만 승격</text>
+  <text class="s" x="1136" y="496">로그: Cloud Logging (리비전 필터) → deployer</text>
+
+  <rect class="b r" x="1120" y="522" width="458" height="56" rx="11"/><text class="t" x="1136" y="546">Cloud SQL</text><text class="s" x="1136" y="565">cloudmorph-pg · PostgreSQL 16 · 앱마다 DB · 계정</text>
+  <path d="M1349,504 L1349,522" class="ln lg" marker-end="url(#mg)"/><text class="lb g" x="1356" y="517">unix socket</text>
+
+  <rect class="b a" x="1120" y="596" width="458" height="56" rx="11"/><text class="t" x="1136" y="620">Cloud Run functions (2세대)</text><text class="s" x="1136" y="639">서버리스 함수 · 소스 업로드 → Cloud Build 빌드팩 · *.run.app</text>
+  <g transform="translate(0,74)"><rect class="b" x="1120" y="596" width="458" height="228" rx="12" style="fill:rgba(56,189,248,.04);stroke:rgba(56,189,248,.35)"/>
+  <text class="t" x="1136" y="620">Compute Engine · 노드 풀</text><text class="s" x="1340" y="620">Container-Optimized OS</text>
+  <rect class="b e" x="1136" y="636" width="426" height="56" rx="10"/><text class="t" x="1152" y="660">라우터 VM · Caddy</text><text class="s m" x="1152" y="679">고정 IP · &lt;app&gt;.IP.nip.io · round robin</text>
+  <rect class="b s" x="1136" y="722" width="206" height="88" rx="10"/><text class="t" x="1152" y="748">노드 VM 1</text><text class="s" x="1152" y="768">e2-small · 앱 복제본</text><text class="s" x="1152" y="786">Postgres 사이드카</text>
+  <rect class="b s" x="1356" y="722" width="206" height="88" rx="10"/><text class="t" x="1372" y="748">노드 VM 2</text><text class="s" x="1372" y="768">e2-small · 앱 복제본</text><text class="s" x="1372" y="786">← 부하 시 자동 복제</text>
+  <path d="M1239,692 L1239,722" class="ln le" marker-end="url(#me)"/>
+  <path d="M1459,692 L1459,722" class="ln le" marker-end="url(#me)"/></g>
+
+  <path d="M1136,752 C1114,752 1112,790 1112,830 L1112,912 C1112,928 1122,934 1134,936" class="ln le dsh" marker-end="url(#me)"/>
+  <rect class="b s" x="1120" y="936" width="222" height="76" rx="12"/><text class="t" x="1136" y="962">AWS EC2 노드</text><text class="s" x="1136" y="982">t3.small · 서울</text><text class="s" x="1136" y="999">노드 풀 운영 중</text>
+  <rect class="b dash" x="1356" y="936" width="222" height="76" rx="12"/><text class="t" x="1372" y="962">오라클 · 기타 VM</text><text class="s" x="1372" y="982">SSH + Docker면</text><text class="s" x="1372" y="999">노드 목록 한 줄로 추가</text>
+  <text class="zt" x="1120" y="1036" style="font-size:11px;fill:#64748b">점선 상자 = 같은 인터페이스로 확장 가능 (미등록)</text>
+
+  </g>
+
+  <!-- ================= EDGES ================= -->
+  <!-- browser -> tunnel -> vite -> api -->
+  <path d="M236,176 L306,176" class="ln lv" marker-end="url(#mv)"/><text class="lb v" x="246" y="166">HTTPS</text>
+  <path d="M516,176 L540,176" class="ln lv" marker-end="url(#mv)"/>
+  <path d="M640,212 C640,254 452,244 440,280" class="ln lv" marker-end="url(#mv)"/><text class="lb v" x="560" y="246">프록시</text>
+  <path d="M910,280 L910,212" class="ln lg dsh" marker-end="url(#mg)"/><text class="lb g" x="918" y="238">SSE</text>
+  <!-- github -->
+  <path d="M140,350 L140,380" class="ln lg" marker-end="url(#mg)"/>
+  <path d="M236,414 C276,414 300,260 360,212" class="ln lv" marker-end="url(#mv)"/><text class="lb v" x="250" y="318">웹훅 (HMAC)</text>
+  <!-- internal control -->
+  <path d="M550,313 L566,313" class="ln lv" marker-end="url(#mv)"/>
+  <path d="M790,313 L806,313" class="ln lg dsh" marker-end="url(#mg)"/>
+  <path d="M610,346 C610,360 420,360 410,374" class="ln lv" marker-end="url(#mv)"/>
+  <path d="M640,346 L600,374" class="ln lv" marker-end="url(#mv)"/>
+  <path d="M900,374 C900,360 790,360 760,346" class="ln lv" marker-end="url(#mv)"/>
+  <path d="M664,400 L682,400" class="ln la" marker-end="url(#ma)"/>
+  <path d="M682,424 L664,424" class="ln la" marker-end="url(#ma)"/>
+  <path d="M530,515 L600,515" class="ln ls" marker-end="url(#ms)"/>
+  <!-- AI -->
+  <path d="M1032,380 C1100,380 1110,176 1180,176" class="ln la" marker-end="url(#ma)"/><text class="lb a" x="1106" y="236" style="text-anchor:middle">Claude API</text>
+  <!-- deployer -> local docker -->
+  <path d="M565,448 L565,712" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="572" y="660">docker build · run</text>
+  <!-- deployer -> GCP -->
+  <path d="M1032,300 C1100,300 1110,308 1180,308" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="1106" y="294" style="text-anchor:middle">docker push</text>
+  <path d="M1032,420 C1100,420 1110,418 1180,418" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="1106" y="408" style="text-anchor:middle">run deploy</text><text class="lb s" x="1106" y="440" style="text-anchor:middle">update-traffic</text>
+  <path d="M1180,488 C1110,488 1090,462 1032,462" class="ln lg dsh" marker-end="url(#mg)"/><text class="lb g" x="1106" y="490" style="text-anchor:middle">오류 로그</text>
+  <path d="M1032,530 C1100,530 1110,550 1180,550" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="1106" y="524" style="text-anchor:middle">sql db · user</text>
+  <path d="M1032,566 C1100,566 1110,624 1180,624" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="1100" y="620" style="text-anchor:middle">functions</text><text class="lb s" x="1100" y="634" style="text-anchor:middle">deploy</text>
+  <!-- fleet/nodes -> VMs -->
+  <path d="M1032,606 C1110,606 1120,738 1196,738" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="1106" y="676" style="text-anchor:middle">SSH → Caddy</text><text class="lb s" x="1106" y="690" style="text-anchor:middle">admin API</text>
+  <path d="M1032,624 C1110,624 1120,840 1196,840" class="ln ls" marker-end="url(#ms)"/><text class="lb s" x="1106" y="790" style="text-anchor:middle">SSH · probe</text><text class="lb s" x="1106" y="804" style="text-anchor:middle">docker load/run</text>
+  <path d="M1032,640 C1110,640 1120,974 1180,974" class="ln ls" marker-end="url(#ms)"/>
+  <!-- app users -->
+  <path d="M236,796 C262,796 270,802 290,802 L790,802 C820,802 840,800 860,782" class="ln le" marker-end="url(#me)"/><text class="lb e" x="600" y="798">*.trycloudflare.com</text>
+  <path d="M140,832 L140,1100 L1668,1100 L1668,738 L1622,738" class="ln le" marker-end="url(#me)"/>
+  <path d="M1668,738 L1668,430 L1638,430" class="ln le" marker-end="url(#me)"/>
+  <path d="M1668,624 L1638,624" class="ln le" marker-end="url(#me)"/>
+  <text class="lb e" x="600" y="1092">앱 사용자 트래픽 → *.run.app (Cloud Run · functions) · &lt;app&gt;.IP.nip.io (GCP 라우터 → GCP·AWS 노드)</text>
+  <path d="M548,747 L566,747" class="ln lg" marker-end="url(#mg)"/>
+</svg>

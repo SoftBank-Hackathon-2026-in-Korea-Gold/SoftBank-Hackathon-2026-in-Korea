@@ -15,8 +15,9 @@ say() { printf '\033[1;36m[demo]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[demo] %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ---- preflight ---------------------------------------------------------------
-[[ -f "$ROOT/.env" ]] || die ".env not found. cp .env.example .env and fill GCP_PROJECT_ID / OPENAI_API_KEY"
+[[ -f "$ROOT/.env" ]] || die ".env not found. cp .env.example .env and fill GCP_PROJECT_ID / ANTHROPIC_API_KEY"
 set -a; source "$ROOT/.env"; set +a
+[[ -n "${ANTHROPIC_API_KEY:-}" ]] || die "ANTHROPIC_API_KEY is empty in .env (analyzer needs it; OPENAI_API_KEY alone is not enough)"
 command -v docker >/dev/null || die "docker not installed"
 docker info >/dev/null 2>&1 || die "Docker daemon not running (start Docker Desktop)"
 command -v uv >/dev/null || die "uv not installed"

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -94,6 +95,51 @@ def test_unknown_option_is_a_programming_error(tmp_path):
         deployer.deploy(str(tmp_path), "", "local", nonsense=True)
 
 
+def _record_runs(monkeypatch, failing=()):
+    runs = []
+
+    def fake_run(cmd, **kwargs):
+        runs.append((cmd, kwargs.get("env")))
+        return subprocess.CompletedProcess(cmd, 1 if tuple(cmd[:2]) in failing else 0, "", "")
+
+    monkeypatch.setattr(deployer.subprocess, "run", fake_run)
+    return runs
+
+
+def test_build_secrets_stay_off_the_command_line(tmp_path, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    cfg = deployer.Config(
+        build_args={"GITHUB_USERNAME": "octo"}, build_secrets={"GITHUB_TOKEN": "ghp_s3cret"}
+    )
+    r = deployer.Runner()
+    deployer.build_image(tmp_path, "app:1", None, cfg, r)
+    ((cmd, env),) = runs
+    assert cmd == [
+        "docker", "build", "-t", "app:1",
+        "--build-arg", "GITHUB_USERNAME=octo",
+        "--secret", "id=GITHUB_TOKEN,env=GITHUB_TOKEN",
+        str(tmp_path),
+    ]  # fmt: skip
+    assert env["GITHUB_TOKEN"] == "ghp_s3cret" and env["DOCKER_BUILDKIT"] == "1"
+    assert "ghp_s3cret" not in r.steps[0].cmd  # the step (and last_result.json) never sees the value
+
+
+def test_build_without_inputs_is_unchanged(tmp_path, monkeypatch):
+    runs = _record_runs(monkeypatch)
+    deployer.build_image(tmp_path, "app:1", "linux/amd64", deployer.Config(), deployer.Runner())
+    assert runs == [(["docker", "build", "-t", "app:1", "--platform", "linux/amd64", str(tmp_path)], None)]
+
+
+def test_build_secrets_without_buildx_ask_the_user(tmp_path, monkeypatch):
+    (tmp_path / "Dockerfile").write_text("FROM scratch\n")
+    monkeypatch.setattr(shutil, "which", lambda name: f"/usr/bin/{name}")
+    _record_runs(monkeypatch, failing={("docker", "buildx")})
+    cfg = deployer.Config(tunnel=False, build_secrets={"GITHUB_TOKEN": "x"})
+    with pytest.raises(deployer.StepError) as e:
+        deployer.preflight("local", tmp_path, cfg, deployer.Runner())
+    assert e.value.kind == "user_action_required" and "buildx" in e.value.error
+
+
 @pytest.mark.skipif(not os.environ.get("DEPLOYER_IT"), reason="set DEPLOYER_IT=1 to run against local Docker")
 def test_local_healthy_sample_end_to_end():
     res = deployer.deploy(str(SAMPLE_APPS / "healthy"), "", "local", tunnel=False, verify_timeout=60)
@@ -112,3 +158,24 @@ def test_local_broken_sample_reports_missing_dependency():
         assert classify_error(res.stderr) == ErrorCategory.MISSING_DEPENDENCY
     finally:
         deployer.cleanup(str(SAMPLE_APPS / "broken"))
+
+
+@pytest.mark.parametrize(
+    "given, provisioned", [({}, True), ({"DATABASE_URL": "postgresql://my-own-db/app"}, False)]
+)
+def test_users_own_database_url_skips_provisioning(tmp_path, monkeypatch, given, provisioned):
+    (tmp_path / "app.py").write_text('import os\nDB = os.environ["DATABASE_URL"]\n')
+    runs = _record_runs(monkeypatch)
+    made = []
+    monkeypatch.setattr(
+        deployer, "ensure_local_postgres", lambda app, r: made.append(app) or "postgresql://sidecar/app"
+    )
+    monkeypatch.setattr(deployer, "build_image", lambda *args: None)
+    monkeypatch.setattr(deployer, "cleanup_local", lambda handles, **kw: [])
+    monkeypatch.setattr(deployer, "wait_up", lambda *args, **kw: (True, ""))
+    cfg = deployer.Config(tunnel=False, env=dict(given))
+    deployer.deploy_local(tmp_path, cfg, deployer.Runner(), deployer.Outcome(target="local"))
+    run_cmd = next(cmd for cmd, _ in runs if cmd[:2] == ["docker", "run"])
+    expected = "postgresql://sidecar/app" if provisioned else given["DATABASE_URL"]
+    assert f"DATABASE_URL={expected}" in run_cmd
+    assert bool(made) is provisioned

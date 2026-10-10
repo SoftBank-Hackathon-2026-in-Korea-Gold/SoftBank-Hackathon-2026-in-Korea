@@ -1,14 +1,15 @@
 import React from 'react';
-import { Cloud, FolderGit2, Loader2, Network, Play, Server, Tag } from 'lucide-react';
+import { Zap, Cloud, FolderGit2, Loader2, Network, Play, Server, Tag } from 'lucide-react';
 import { TARGET_META } from '../lib/run';
 import { Card } from './ui';
 import { TONE } from '../lib/style';
 
-const ICONS = { local: Server, cloudrun: Cloud, node: Network };
+const ICONS = { local: Server, cloudrun: Cloud, node: Network, function: Zap };
 const PRESETS = [
   { label: '방명록 (DB)', value: 'sample-apps/guestbook' },
   { label: '고장 앱 (자가치유)', value: 'sample-apps/broken' },
   { label: 'GitHub 데모 저장소', value: 'https://github.com/Jeonsubb/cloudmorph-demo-guestbook' },
+  { label: '서버리스 함수', value: 'sample-apps/function-hello' },
 ];
 
 export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailable }) {

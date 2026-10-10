@@ -145,6 +145,10 @@ class Config:
     env: dict = field(
         default_factory=dict
     )  # extra env vars injected into the app container (e.g. DATABASE_URL)
+    build_args: dict = field(default_factory=dict)  # docker build --build-arg (non-secret build inputs)
+    # BuildKit secrets (RUN --mount=type=secret,id=NAME): handed over via the build's process env,
+    # so the values never appear on the command line, in the state file, or in image layers
+    build_secrets: dict = field(default_factory=dict)
     node_arch: str | None = None  # restrict node pool to an architecture; None -> any
     node_exclude: tuple = ()  # node names to skip (used by fleet scale-out)
     database: str | None = "auto"  # "auto": Postgres when the app reads DATABASE_URL; "postgres"; None: never
@@ -197,10 +201,18 @@ class Runner:
         check: bool = True,
         stage: str = "",
         kind: str = "deploy_error",
+        env: dict | None = None,  # extra process env (not recorded in Step.cmd)
     ) -> subprocess.CompletedProcess:
         t0 = time.time()
         try:
-            cp = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=timeout)
+            cp = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=timeout,
+                env={**os.environ, **env} if env else None,
+            )
         except subprocess.TimeoutExpired as e:
             err = _as_text(e.stderr)
             self.steps.append(Step(name, " ".join(cmd), None, time.time() - t0, _as_text(e.stdout), err))
@@ -322,6 +334,8 @@ def _read_handles(src_dir: Path) -> dict:
 # preflight
 # --------------------------------------------------------------------------- #
 def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
+    if target == "function":
+        return preflight_function(src_dir, cfg, r)
     problems: list[str] = []
     if not (src_dir / "Dockerfile").exists():
         problems.append(f"Dockerfile not found in {src_dir}")
@@ -332,6 +346,14 @@ def preflight(target: str, src_dir: Path, cfg: Config, r: Runner) -> None:
         != 0
     ):
         problems.append("docker daemon not running (start Docker Desktop)")
+    elif (
+        cfg.build_secrets
+        and r.run("docker buildx", ["docker", "buildx", "version"], check=False).returncode != 0
+    ):
+        # the legacy builder has no --secret; a Dockerfile patch cannot fix that, so stop here
+        problems.append(
+            "build secrets need BuildKit: install the docker buildx plugin (docker-buildx-plugin)"
+        )
 
     if target == "local" and cfg.tunnel and shutil.which("cloudflared") is None:
         problems.append("cloudflared not installed (brew install cloudflared) or set DEPLOYER_TUNNEL=0")
@@ -458,9 +480,11 @@ def ensure_local_postgres(app: str, r: Runner) -> str:
     db, net = f"{app}-db", nodepool.NETWORK
     r.run("docker network", ["docker", "network", "create", net], check=False)
     exists = subprocess.run(
-        ["docker", "ps", "-q", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
+        ["docker", "ps", "-aq", "-f", f"name=^{db}$"], capture_output=True, text=True, check=False
     )
-    if not exists.stdout.strip():
+    if exists.stdout.strip():  # a stopped sidecar still holds the name; `docker start` is a no-op if running
+        r.run("docker start (postgres)", ["docker", "start", db], stage="deploy")
+    else:
         r.run(
             "docker run (postgres)",
             [
@@ -600,7 +624,19 @@ def build_image(src_dir: Path, image: str, platform: str | None, cfg: Config, r:
     cmd = ["docker", "build", "-t", image]
     if platform:
         cmd += ["--platform", platform]
-    r.run("docker build", [*cmd, str(src_dir)], timeout=cfg.build_timeout, stage="build", kind="build_error")
+    for k, v in cfg.build_args.items():
+        cmd += ["--build-arg", f"{k}={v}"]
+    for k in cfg.build_secrets:
+        cmd += ["--secret", f"id={k},env={k}"]
+    env = {"DOCKER_BUILDKIT": "1", **cfg.build_secrets} if cfg.build_secrets else None
+    r.run(
+        "docker build",
+        [*cmd, str(src_dir)],
+        timeout=cfg.build_timeout,
+        stage="build",
+        kind="build_error",
+        env=env,
+    )
 
 
 def push_image(image: str, cfg: Config, r: Runner) -> None:
@@ -714,8 +750,8 @@ def deploy_local(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
         out.stage = "deploy"
         r.run("docker network", ["docker", "network", "create", nodepool.NETWORK], check=False)
         env = dict(cfg.env)
-        if wants_database(src_dir, cfg) == "postgres":
-            env.setdefault("DATABASE_URL", ensure_local_postgres(name, r))
+        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+            env["DATABASE_URL"] = ensure_local_postgres(name, r)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         run_cmd = [
             "docker",
@@ -907,9 +943,9 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
         cfg, "deploy", service, "--image", image, "--port", str(cfg.container_port), "--tag", CANDIDATE_TAG
     )
     env = dict(cfg.env)
-    if wants_database(src_dir, cfg) == "postgres":
+    if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
         conn, db_url = ensure_cloudsql_database(name, cfg, r)
-        env.setdefault("DATABASE_URL", db_url)
+        env["DATABASE_URL"] = db_url
         cmd += ["--add-cloudsql-instances", conn]
         out.handles.update(database="cloudsql", cloudsql_connection=conn)
     if env:
@@ -1002,6 +1038,19 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
 # --------------------------------------------------------------------------- #
 # node target: least-loaded SSH/Docker host in the pool (GCP / Oracle / AWS / anything)
 # --------------------------------------------------------------------------- #
+def _pinned_node(reg: nodepool.Registry, app_name: str) -> nodepool.Node | None:
+    """The node a stateful app (database sidecar) already lives on, so redeploys stay with their data."""
+    from app import fleet
+
+    app = fleet.load_state().apps.get(app_name)
+    if app is None or not app.stateful or not app.replicas:
+        return None
+    try:
+        return reg.get(app.replicas[0].node)
+    except KeyError:
+        return None
+
+
 def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     reg = nodepool.load_registry()
     if not reg.nodes:
@@ -1015,13 +1064,27 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
 
     out.stage = "deploy"
     t0 = time.time()
-    try:
-        node, metrics = nodepool.select_node(reg, arch=cfg.node_arch, exclude=set(cfg.node_exclude))
-    except RuntimeError as e:
-        raise StepError("deploy", "user_action_required", f"node selection failed: {e}") from None
+    pinned = _pinned_node(reg, name)
+    if pinned is not None:
+        # A stateful app's database lives on its node; moving it would silently leave the data behind.
+        metrics = [nodepool.probe(pinned)]
+        if not metrics[0].ok:
+            raise StepError(
+                "deploy",
+                "user_action_required",
+                f"{name} keeps its database on {pinned.name}, which is unreachable ({metrics[0].error}); "
+                "not moving it to another node because the data would be left behind",
+            )
+        node = pinned
+        out.handles["pinned"] = True
+    else:
+        try:
+            node, metrics = nodepool.select_node(reg, arch=cfg.node_arch, exclude=set(cfg.node_exclude))
+        except RuntimeError as e:
+            raise StepError("deploy", "user_action_required", f"node selection failed: {e}") from None
     r.steps.append(
         Step(
-            "select node",
+            "select node" + (" (pinned: stateful)" if pinned is not None else ""),
             f"ssh probe x{len(metrics)}",
             0,
             time.time() - t0,
@@ -1064,8 +1127,8 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     t0 = time.time()
     try:
         env = dict(cfg.env)
-        if wants_database(src_dir, cfg) == "postgres":
-            env.setdefault("DATABASE_URL", nodepool.ensure_postgres(node, name))
+        if "DATABASE_URL" not in env and wants_database(src_dir, cfg) == "postgres":  # the user's own DB wins
+            env["DATABASE_URL"] = nodepool.ensure_postgres(node, name)
             out.handles.update(database="postgres", db_container=f"{name}-db")
         host_port = nodepool.free_port_on(node)
         cid = nodepool.run_container(node, image, cname, host_port, cfg.container_port, env)
@@ -1138,14 +1201,195 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# function target: Cloud Run functions (gen2). Source-based — Google builds it with buildpacks, so the
+# Dockerfile is ignored and the source must be function-shaped (functions-framework + an HTTP entry point).
+# --------------------------------------------------------------------------- #
+_PY_DECORATED = re.compile(r"@functions_framework\.http\s*\n\s*def\s+(\w+)\s*\(")
+_PY_REQUEST_FN = re.compile(r"^def\s+(\w+)\s*\(\s*request\b", re.MULTILINE)
+_JS_HTTP = re.compile(r"functions\.http\(\s*['\"]([\w-]+)['\"]")
+_FN_NAME = re.compile(r"[^a-z0-9-]+")
+
+
+def detect_function(src_dir: Path) -> tuple[str, str] | None:
+    """Return (runtime, entry_point) when `src_dir` is shaped like a Cloud Run function, else None."""
+    main_py = src_dir / "main.py"
+    req = src_dir / "requirements.txt"
+    if main_py.exists():
+        text = main_py.read_text(errors="ignore")
+        if m := _PY_DECORATED.search(text):
+            return "python312", m.group(1)
+        has_ff = req.exists() and "functions-framework" in req.read_text(errors="ignore").lower()
+        if has_ff and (m := _PY_REQUEST_FN.search(text)):
+            return "python312", m.group(1)
+    pkg = src_dir / "package.json"
+    if pkg.exists():
+        try:
+            data = json.loads(pkg.read_text())
+        except ValueError:
+            data = {}
+        if "@google-cloud/functions-framework" in (data.get("dependencies") or {}):
+            index = src_dir / (data.get("main") or "index.js")
+            if index.exists() and (m := _JS_HTTP.search(index.read_text(errors="ignore"))):
+                return "nodejs20", m.group(1)
+    return None
+
+
+def preflight_function(src_dir: Path, cfg: Config, r: Runner) -> None:
+    problems: list[str] = []
+    if detect_function(src_dir) is None:
+        problems.append(
+            "source is not function-shaped: needs functions-framework and an HTTP entry point "
+            "(Python: @functions_framework.http def handler(request) in main.py; "
+            "Node: functions.http('name', ...) with @google-cloud/functions-framework). See sample-apps/function-hello"
+        )
+    if shutil.which("gcloud") is None:
+        problems.append("gcloud CLI not installed")
+    elif not cfg.project:
+        problems.append("GCP project not set (GCP_PROJECT_ID or gcloud config set project <ID>)")
+    else:
+        apis = r.run(
+            "apis",
+            [
+                "gcloud",
+                "services",
+                "list",
+                "--enabled",
+                "--project",
+                cfg.project,
+                "--format=value(config.name)",
+            ],
+            check=False,
+        )
+        # cloudresourcemanager: gcloud functions deploy reads the project through it when run as a service account
+        for api in (
+            "cloudfunctions.googleapis.com",
+            "cloudbuild.googleapis.com",
+            "run.googleapis.com",
+            "cloudresourcemanager.googleapis.com",
+        ):
+            if api not in apis.stdout.split():
+                problems.append(f"API not enabled: {api} (gcloud services enable {api})")
+    if problems:
+        raise StepError("preflight", "user_action_required", "\n".join(f"- {p}" for p in problems))
+
+
+def function_logs(name: str, cfg: Config, r: Runner) -> str:
+    """Gen2 functions run as a Cloud Run service with the same name; read its ERROR logs."""
+    flt = f'resource.type="cloud_run_revision" AND resource.labels.service_name="{name}" AND severity>=ERROR'
+    cp = r.run(
+        "gcloud logging read",
+        [
+            "gcloud",
+            "logging",
+            "read",
+            flt,
+            "--project",
+            str(cfg.project),
+            "--limit",
+            "40",
+            "--freshness",
+            "20m",
+            "--order",
+            "asc",
+            "--format=value(timestamp,textPayload)",
+        ],
+        check=False,
+    )
+    return cp.stdout[-TAIL:] or "(no ERROR-level runtime logs; see the build log URL in the error above)"
+
+
+def deploy_function(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
+    detected = detect_function(src_dir)
+    if detected is None:  # preflight normally catches this; kept for skip_preflight
+        raise StepError(
+            "preflight",
+            "user_action_required",
+            "source is not function-shaped (see sample-apps/function-hello)",
+        )
+    runtime, entry = detected
+    name = _FN_NAME.sub("-", (cfg.service or slug(src_dir.name)).lower()).strip("-")[:62] or "fn"
+    if not name[0].isalpha():
+        name = f"fn-{name}"[:62]
+    out.handles.update(
+        function=name, runtime=runtime, entry_point=entry, project=cfg.project, region=cfg.region
+    )
+    # The source upload must not carry our state or the (ignored) Dockerfile
+    (src_dir / ".gcloudignore").write_text(
+        ".deployer/\n.gcloudignore\nDockerfile\n__pycache__/\nnode_modules/\n.git/\n"
+    )
+
+    out.stage = "deploy"
+    cmd = [
+        "gcloud",
+        "functions",
+        "deploy",
+        name,
+        "--gen2",
+        "--runtime",
+        runtime,
+        "--region",
+        cfg.region,
+        "--project",
+        str(cfg.project),
+        "--source",
+        str(src_dir),
+        "--entry-point",
+        entry,
+        "--trigger-http",
+        "--quiet",
+    ]
+    if cfg.allow_unauthenticated:
+        cmd.append("--allow-unauthenticated")
+    if cfg.env:
+        cmd += ["--set-env-vars", "^|^" + "|".join(f"{k}={v}" for k, v in cfg.env.items())]
+    cp = r.run("gcloud functions deploy", cmd, timeout=cfg.deploy_timeout, check=False, stage="deploy")
+    if cp.returncode != 0:
+        raise StepError(
+            "deploy", "function_error", (cp.stderr or cp.stdout)[-TAIL:], app_logs=function_logs(name, cfg, r)
+        )
+
+    out.stage = "expose"
+    cp = r.run(
+        "function url",
+        [
+            "gcloud",
+            "functions",
+            "describe",
+            name,
+            "--gen2",
+            "--region",
+            cfg.region,
+            "--project",
+            str(cfg.project),
+            "--format=value(serviceConfig.uri)",
+        ],
+        stage="expose",
+    )
+    url = cp.stdout.strip()
+    if not url:
+        raise StepError("expose", "deploy_error", f"function {name} deployed but has no URL")
+
+    out.stage = "verify"
+    ok, why = wait_up(url, cfg.health_path, cfg.verify_timeout)
+    if not ok:
+        raise StepError(
+            "verify",
+            "function_error",
+            f"function {name} not healthy: {why}",
+            app_logs=function_logs(name, cfg, r),
+        )
+    out.url = url
+
+
+# --------------------------------------------------------------------------- #
 # Public API
 # --------------------------------------------------------------------------- #
 def run_pipeline(src_dir: str | os.PathLike, target: str, cfg: Config | None = None) -> Outcome:
     """Full-detail variant of deploy(): stages, handles, warnings. Does not raise."""
     cfg = cfg or Config.from_env()
-    if target not in ("local", "cloudrun", "node"):
-        raise ValueError("target must be 'local', 'cloudrun' or 'node'")
-    if target == "cloudrun" and not cfg.project:
+    if target not in ("local", "cloudrun", "node", "function"):
+        raise ValueError("target must be 'local', 'cloudrun', 'node' or 'function'")
+    if target in ("cloudrun", "function") and not cfg.project:
         cfg.project = gcloud_default_project()
 
     pdir = Path(src_dir).resolve()
@@ -1154,7 +1398,12 @@ def run_pipeline(src_dir: str | os.PathLike, target: str, cfg: Config | None = N
     try:
         if not cfg.skip_preflight:
             preflight(target, pdir, cfg, r)
-        {"local": deploy_local, "cloudrun": deploy_cloudrun, "node": deploy_node}[target](pdir, cfg, r, out)
+        {
+            "local": deploy_local,
+            "cloudrun": deploy_cloudrun,
+            "node": deploy_node,
+            "function": deploy_function,
+        }[target](pdir, cfg, r, out)
         out.ok = True
     except StepError as e:
         out.ok, out.stage, out.kind, out.error, out.app_logs, out.diagnosis = (
@@ -1207,7 +1456,7 @@ def _main(argv: list[str]) -> int:
         prog="python -m app.deployer", description="CloudMorph deployer (manual run)"
     )
     ap.add_argument("src_dir")
-    ap.add_argument("target", choices=["local", "cloudrun", "node"])
+    ap.add_argument("target", choices=["local", "cloudrun", "node", "function"])
     ap.add_argument("--dockerfile", help="Dockerfile to write into src_dir (default: reuse existing)")
     ap.add_argument("--service")
     ap.add_argument("--tag")
