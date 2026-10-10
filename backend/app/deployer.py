@@ -1004,6 +1004,19 @@ def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None
 # --------------------------------------------------------------------------- #
 # node target: least-loaded SSH/Docker host in the pool (GCP / Oracle / AWS / anything)
 # --------------------------------------------------------------------------- #
+def _pinned_node(reg: nodepool.Registry, app_name: str) -> nodepool.Node | None:
+    """The node a stateful app (database sidecar) already lives on, so redeploys stay with their data."""
+    from app import fleet
+
+    app = fleet.load_state().apps.get(app_name)
+    if app is None or not app.stateful or not app.replicas:
+        return None
+    try:
+        return reg.get(app.replicas[0].node)
+    except KeyError:
+        return None
+
+
 def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
     reg = nodepool.load_registry()
     if not reg.nodes:
@@ -1017,13 +1030,27 @@ def deploy_node(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
 
     out.stage = "deploy"
     t0 = time.time()
-    try:
-        node, metrics = nodepool.select_node(reg, arch=cfg.node_arch, exclude=set(cfg.node_exclude))
-    except RuntimeError as e:
-        raise StepError("deploy", "user_action_required", f"node selection failed: {e}") from None
+    pinned = _pinned_node(reg, name)
+    if pinned is not None:
+        # A stateful app's database lives on its node; moving it would silently leave the data behind.
+        metrics = [nodepool.probe(pinned)]
+        if not metrics[0].ok:
+            raise StepError(
+                "deploy",
+                "user_action_required",
+                f"{name} keeps its database on {pinned.name}, which is unreachable ({metrics[0].error}); "
+                "not moving it to another node because the data would be left behind",
+            )
+        node = pinned
+        out.handles["pinned"] = True
+    else:
+        try:
+            node, metrics = nodepool.select_node(reg, arch=cfg.node_arch, exclude=set(cfg.node_exclude))
+        except RuntimeError as e:
+            raise StepError("deploy", "user_action_required", f"node selection failed: {e}") from None
     r.steps.append(
         Step(
-            "select node",
+            "select node" + (" (pinned: stateful)" if pinned is not None else ""),
             f"ssh probe x{len(metrics)}",
             0,
             time.time() - t0,

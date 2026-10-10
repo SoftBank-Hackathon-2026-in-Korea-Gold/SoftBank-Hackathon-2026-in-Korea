@@ -109,3 +109,46 @@ def test_stateful_apps_never_scale_out(monkeypatch, tmp_path):
     for _ in range(3):
         row = fleet.tick()[0]
     assert "stateful" in (row["action"] or "") and len(row["replicas"]) == 1
+
+
+def test_stateful_app_redeploys_to_the_node_that_holds_its_database(monkeypatch, tmp_path):
+    """Regression: a push redeploy used to pick the least-loaded node and leave the DB sidecar (data) behind."""
+    from app import deployer, nodes
+    from app.nodes import Metrics, Node, Registry, Router
+
+    monkeypatch.setattr(fleet, "STATE_FILE", tmp_path / "fleet.json")
+    reg = Registry(
+        nodes=[Node(name="gcp-1", host="1"), Node(name="aws-1", host="2")], router=Router(name="r", host="3")
+    )
+    fleet.save_state(
+        fleet.State(
+            apps={
+                "gb-node": fleet.App(
+                    name="gb-node",
+                    image="i",
+                    container_port=8080,
+                    hostname="h",
+                    stateful=True,
+                    replicas=[fleet.Replica("gcp-1", "c", "1", 8000)],
+                )
+            }
+        )
+    )
+    assert deployer._pinned_node(reg, "gb-node").name == "gcp-1"
+    assert deployer._pinned_node(reg, "other") is None
+    # a stateless app is not pinned
+    fleet.save_state(
+        fleet.State(
+            apps={
+                "web-node": fleet.App(
+                    name="web-node",
+                    image="i",
+                    container_port=8080,
+                    hostname="h",
+                    replicas=[fleet.Replica("gcp-1", "c", "1", 8000)],
+                )
+            }
+        )
+    )
+    assert deployer._pinned_node(reg, "web-node") is None
+    del nodes, Metrics
