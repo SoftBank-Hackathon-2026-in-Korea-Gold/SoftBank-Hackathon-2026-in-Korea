@@ -13,8 +13,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
-from app.schemas import AnalysisResult, DeployRequest, DeployResult
+from app.schemas import AnalysisResult, DeployRequest, DeployResult, EnvInput, EnvRequirement
 
 
 @pytest.fixture
@@ -753,3 +754,138 @@ def test_failed_deploy_heals_and_preserves_sse_contract(m, tmp_path, monkeypatch
     assert decoded[4]["stage"] == "redeploy"
     assert decoded[5]["type"] == "done"
     assert decoded[5]["payload"]["success"] is True
+
+
+def _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "app.py").write_text("dummy")
+    required = [
+        EnvRequirement(name="GITHUB_TOKEN", scope="build", secret=True, evidence=["build.gradle:3"]),
+        EnvRequirement(name="GITHUB_USERNAME", scope="build", secret=False),
+        EnvRequirement(name="SECRET_KEY", scope="runtime", secret=True, generate=True),
+        EnvRequirement(name="API_KEY", scope="runtime", secret=True),
+    ]
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local", language="python", dockerfile="FROM scratch\n", required_env=required
+        ),
+    )
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    original_mkdtemp = m.tempfile.mkdtemp
+
+    def mkdtemp_in_test_dir(*args, **kwargs):
+        if len(args) >= 3:
+            args = (*args[:2], args[2] or tmp_path, *args[3:])
+        else:
+            kwargs["dir"] = kwargs.get("dir") or tmp_path
+        return original_mkdtemp(*args, **kwargs)
+
+    monkeypatch.setattr(m.tempfile, "mkdtemp", mkdtemp_in_test_dir)
+    routes = {route.path: route.endpoint for route in m.app.routes if hasattr(route, "endpoint")}
+    return source, routes
+
+
+async def _until(check):
+    async def poll():
+        while not check():
+            await asyncio.sleep(0.001)
+
+    await asyncio.wait_for(poll(), timeout=5)
+
+
+def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        if len(calls) == 1:
+            return DeployResult(
+                success=False,
+                target=target,
+                exit_code=1,
+                stderr="ModuleNotFoundError: No module named 'flask'",
+            )
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        job = m._jobs[deployment_id]
+        await _until(lambda: job.state == "waiting_input")
+        assert calls == []  # nothing is built before the user answers
+        answer = EnvInput(
+            values={"GITHUB_TOKEN": "ghp_s3cret", "GITHUB_USERNAME": "octo", "API_KEY": "", "LD_PRELOAD": "x"}
+        )
+        assert await routes["/deploy/{deployment_id}/env"](deployment_id, answer) == {
+            "accepted": ["GITHUB_TOKEN", "GITHUB_USERNAME"]
+        }
+        with pytest.raises(HTTPException) as again:
+            await routes["/deploy/{deployment_id}/env"](deployment_id, answer)
+        assert again.value.status_code == 409
+        await _until(lambda: job.completed)
+        status = await routes["/deploy/{deployment_id}"](deployment_id)
+        response = await routes["/deploy/{deployment_id}/events"](deployment_id)
+        return status, [event async for event in response.body_iterator]
+
+    status, events = asyncio.run(scenario())
+    assert status["status"] == "completed", status
+    assert len(calls) == 2 and calls[0] == calls[1]  # healer's redeploy gets the same values
+    assert calls[0]["build_secrets"] == {"GITHUB_TOKEN": "ghp_s3cret"}
+    assert calls[0]["build_args"] == {"GITHUB_USERNAME": "octo"}
+    generated = calls[0]["env"]["SECRET_KEY"]
+    assert set(calls[0]["env"]) == {"SECRET_KEY"} and len(generated) >= 32
+    asked = [json.loads(e["data"]) for e in events if e["event"] == "input_required"]
+    assert [i["name"] for i in asked[0]["payload"]["items"]] == [
+        "GITHUB_TOKEN",
+        "GITHUB_USERNAME",
+        "SECRET_KEY",
+        "API_KEY",
+    ]
+    stream = "".join(e["data"] for e in events)
+    assert "ghp_s3cret" not in stream and generated not in stream and "octo" not in stream
+    assert m._jobs[status["deployment_id"]].env_values is None
+
+
+def test_ask_env_gives_up_when_nobody_answers(m, tmp_path, monkeypatch):
+    def fake_deploy(*args, **kwargs):
+        raise AssertionError("must not deploy without an answer")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+    monkeypatch.setattr(m, "ENV_INPUT_TIMEOUT_SECONDS", 0.01)
+
+    async def scenario():
+        request = DeployRequest(source=str(source), targets=["local"], ask_env=True)
+        deployment_id = (await routes["/deploy"](request))["deployment_id"]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        return await routes["/deploy/{deployment_id}"](deployment_id)
+
+    status = asyncio.run(scenario())
+    assert status["status"] == "failed" and status["error"].startswith("TimeoutError")
+
+
+def test_without_ask_env_nothing_is_asked_or_injected(m, tmp_path, monkeypatch):
+    calls = []
+
+    def fake_deploy(directory, dockerfile, target, **options):
+        calls.append(options)
+        return DeployResult(success=True, target=target, exit_code=0, url="http://127.0.0.1:8080")
+
+    source, routes = _ask_env_setup(m, tmp_path, monkeypatch, fake_deploy)
+
+    async def scenario():
+        deployment_id = (await routes["/deploy"](DeployRequest(source=str(source), targets=["local"])))[
+            "deployment_id"
+        ]
+        await _until(lambda: m._jobs[deployment_id].completed)
+        with pytest.raises(HTTPException) as not_waiting:
+            await routes["/deploy/{deployment_id}/env"](deployment_id, EnvInput(values={"API_KEY": "x"}))
+        assert not_waiting.value.status_code == 409
+        return await routes["/deploy/{deployment_id}"](deployment_id)
+
+    assert asyncio.run(scenario())["status"] == "completed"
+    assert calls == [{}]

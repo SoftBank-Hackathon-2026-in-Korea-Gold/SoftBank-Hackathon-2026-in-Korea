@@ -106,6 +106,7 @@ def fake_inspector(answers=None, calls=None):
         return {
             "resources": an.ResourcesReport(items=[]),
             "env": an.EnvReport(items=[]),
+            "build_env": an.BuildEnvReport(items=[]),
             "risks": an.RisksReport(items=[]),
         }[name]
 
@@ -250,6 +251,89 @@ def test_notes_from_spec_inspectors(tmp_path):
     assert "넣어야 하는 환경변수: SECRET_KEY (무작위 값 가능)" in r.notes
     assert [n for n in r.notes if n.startswith("기타 위험")] == ["기타 위험: DB 없이 시작하면 죽음 — "]
     assert not any(n.startswith("수정 제안") for n in r.notes)
+
+
+def test_required_env_lists_build_inputs_and_runtime_values(flask_app):
+    (flask_app / "build.gradle").write_text(
+        'credentials {\n    username = System.getenv("GITHUB_USERNAME")\n'
+        '    password = System.getenv("GITHUB_TOKEN")\n}\n'
+    )
+    (flask_app / "settings.py").write_text(
+        'import os\nDB = os.environ["DATABASE_URL"]\nKEY = os.environ["SECRET_KEY"]\n'
+    )
+
+    def build(name, kind, evidence, reason="GitHub Packages 의존성 받기"):
+        return an.BuildEnvItem(name=name, kind=kind, reason=reason, evidence=[evidence])
+
+    answers = {
+        "resources": an.ResourcesReport(
+            items=[
+                an.ResourceItem(
+                    kind="postgres",
+                    env=[an.EnvRole(role="url", name="DATABASE_URL")],
+                    evidence=[ev("settings.py:2", 'DB = os.environ["DATABASE_URL"]')],
+                )
+            ]
+        ),
+        "env": an.EnvReport(
+            items=[
+                an.EnvItem(name="DATABASE_URL", kind="secret", required=True, generate=False, evidence=[]),
+                an.EnvItem(
+                    name="SECRET_KEY",
+                    kind="secret",
+                    required=True,
+                    generate=True,
+                    evidence=[ev("settings.py:3", 'KEY = os.environ["SECRET_KEY"]')],
+                ),
+            ]
+        ),
+        "build_env": an.BuildEnvReport(
+            items=[
+                build(
+                    "GITHUB_TOKEN", "secret", ev("build.gradle:3", 'password = System.getenv("GITHUB_TOKEN")')
+                ),
+                build(
+                    "GITHUB_USERNAME",
+                    "config",
+                    ev("build.gradle:2", 'username = System.getenv("GITHUB_USERNAME")'),
+                    "GitHub Packages 사용자",
+                ),
+                # 근거가 파일에 없거나 이름이 저장소에 없으면 묻지 않는다
+                build("SECRET_KEY", "secret", MADE_UP),
+                build(
+                    "NPM_TOKEN", "secret", ev("build.gradle:3", 'password = System.getenv("GITHUB_TOKEN")')
+                ),
+            ]
+        ),
+    }
+    r = run(flask_app, answers)
+    assert [(e.scope, e.name, e.secret, e.generate) for e in r.required_env] == [
+        ("build", "GITHUB_TOKEN", True, False),
+        ("build", "GITHUB_USERNAME", False, False),
+        ("runtime", "SECRET_KEY", True, True),  # DATABASE_URL은 외부 저장소 접속 정보라 deployer가 맡는다
+    ]
+    assert r.required_env[0].evidence == ["build.gradle:3"]
+    assert r.required_env[2].evidence == ["settings.py:3"]
+    assert (
+        "빌드할 때 넣어야 하는 값: GITHUB_TOKEN (GitHub Packages 의존성 받기), "
+        "GITHUB_USERNAME (GitHub Packages 사용자)" in r.notes
+    )
+
+
+def test_file_path_env_without_the_file_stops_analysis(flask_app):
+    (flask_app / "settings.py").write_text('import os\nKEY_PATH = os.environ["JWT_PRIVATE_KEY_PATH"]\n')
+
+    def env(evidence):
+        item = an.EnvItem(
+            name="JWT_PRIVATE_KEY_PATH", kind="file", required=True, generate=False, evidence=evidence
+        )
+        return {"env": an.EnvReport(items=[item])}
+
+    with pytest.raises(ValueError, match=r"파일을 요구.*JWT_PRIVATE_KEY_PATH \(settings.py:2\)"):
+        run(flask_app, env([ev("settings.py:2", 'KEY_PATH = os.environ["JWT_PRIVATE_KEY_PATH"]')]))
+    # 근거를 확인하지 못하면 멈추지 않고 값으로 묻는다
+    r = run(flask_app, env([MADE_UP]))
+    assert [(e.name, e.scope) for e in r.required_env] == [("JWT_PRIVATE_KEY_PATH", "runtime")]
 
 
 def test_fixed_port_app(flask_app):

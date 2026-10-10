@@ -30,6 +30,20 @@ ServiceModel = Literal["iaas", "caas", "paas", "faas"]
 # --------------------------------------------------------------------------- #
 # analyzer.py (이요환) -> deployer.py / main.py
 # --------------------------------------------------------------------------- #
+class EnvRequirement(BaseModel):
+    """A value only the user can supply: a build input (private registry token …) or a runtime env var."""
+
+    name: str
+    scope: Literal["build", "runtime"] = Field(
+        description="build: passed to docker build (secret -> BuildKit --secret, else --build-arg); "
+        "runtime: container env"
+    )
+    secret: bool = Field(description="Token/password. Never echoed in events or logs")
+    generate: bool = Field(default=False, description="Runtime secret that may be random: blank -> generated")
+    reason: str = Field(default="", description="What the value is for (build inputs only)")
+    evidence: list[str] = Field(default_factory=list, description="'path:line' where the code reads it")
+
+
 class AnalysisResult(BaseModel):
     """Static analysis output: where and how to deploy the user's app."""
 
@@ -45,6 +59,9 @@ class AnalysisResult(BaseModel):
     entrypoint: str | None = Field(default=None, description="e.g. 'uvicorn main:app'")
     dockerfile: str = Field(description="Generated initial Dockerfile content (full text)")
     notes: list[str] = Field(default_factory=list, description="Human-readable reasons for the decisions")
+    required_env: list[EnvRequirement] = Field(
+        default_factory=list, description="Values to ask the user for before deploying"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -117,7 +134,7 @@ class HealReport(BaseModel):
 # main.py (백락원) -> frontend/ (유예인) : SSE event envelope
 # --------------------------------------------------------------------------- #
 PipelineStage = Literal["analyze", "deploy", "heal", "redeploy"]
-EventType = Literal["stage", "log", "heal_diff", "done", "error"]
+EventType = Literal["stage", "log", "heal_diff", "input_required", "done", "error"]
 
 
 class PipelineEvent(BaseModel):
@@ -140,3 +157,14 @@ class DeployRequest(BaseModel):
         "Cloud Run service / node app instead of creating new ones. Default: derived from the deployment id.",
     )
     ref: str | None = Field(default=None, description="Git branch or tag to clone when `source` is a Git URL")
+    ask_env: bool = Field(
+        default=False,
+        description="Pause after analysis with an `input_required` event until POST /deploy/{id}/env answers "
+        "(the dashboard sets this; scripts and CD keep running without asking)",
+    )
+
+
+class EnvInput(BaseModel):
+    """POST /deploy/{deployment_id}/env body. Names not in the job's `required_env` are ignored."""
+
+    values: dict[str, str] = Field(default_factory=dict)
