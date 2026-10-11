@@ -714,3 +714,68 @@ def test_config_summary_omits_optional_warning_before_actual_missing_key():
     log = "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\nenvironment variable OPTIONAL_TOKEN is missing; continuing\n    os.environ['SECRET_KEY']\nKeyError: 'SECRET_KEY'\n"
     summary = needs_human_stop(log)
     assert "SECRET_KEY" in summary and "OPTIONAL_TOKEN" not in summary
+
+
+@pytest.mark.parametrize(
+    ("log", "expected_target", "expected_evidence"),
+    [
+        (
+            (
+                "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+                'django.db.utils.OperationalError: connection to server at "db.prod.internal" (10.0.0.1), port 5432 failed: '
+                'FATAL: password authentication failed for user "fastcampus"'
+            ),
+            "db.prod.internal:5432",
+            "password authentication failed",
+        ),
+        (
+            (
+                "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+                "pymysql.err.OperationalError: (2003, \"Can't connect to MySQL server on 'mysql.internal' ([Errno 111] Connection refused)\")"
+            ),
+            "mysql.internal:3306",
+            "Can't connect to MySQL server",
+        ),
+        (
+            (
+                "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+                "pymysql.err.OperationalError: (1045, \"Access denied for user 'fastcampus'@'localhost' (using password: YES)\")"
+            ),
+            None,
+            "Access denied for user",
+        ),
+        (
+            (
+                "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+                'psycopg2.OperationalError: connection to server on host "postgres.infra.internal", port 5432 failed: Operation timed out'
+            ),
+            "postgres.infra.internal:5432",
+            "Operation timed out",
+        ),
+        (
+            (
+                "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+                "django.db.utils.OperationalError: could not connect to server: Network is unreachable"
+            ),
+            None,
+            "could not connect to server",
+        ),
+        (
+            (
+                "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+                'django.db.utils.OperationalError: connection to server at "db.internal", port 5432 failed: '
+                'FATAL: database "sample" does not exist'
+            ),
+            "db.internal:5432",
+            'database "sample" does not exist',
+        ),
+    ],
+)
+def test_database_client_error_variants_trigger_service_stop(log, expected_target, expected_evidence):
+    from app.healer import SERVICE_STOP, needs_human_stop
+
+    summary = needs_human_stop(log)
+    assert summary is not None and summary.startswith(SERVICE_STOP)
+    assert expected_evidence in summary
+    if expected_target:
+        assert expected_target in summary

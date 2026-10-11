@@ -198,11 +198,18 @@ CRASH_STOP = "Not auto-healable: silent crash during startup"
 
 _CONNECTION_ERROR = re.compile(
     r"Connection refused|ECONNREFUSED|Name or service not known|Temporary failure in name resolution|"
-    r"could not translate host name|No route to host|Connection timed out|getaddrinfo ENOTFOUND",
+    r"could not translate host name|No route to host|Connection timed out|Operation timed out|"
+    r"Network is unreachable|ENETUNREACH|ETIMEDOUT|getaddrinfo ENOTFOUND|"
+    r"could not connect to server|Can't connect to MySQL server|"
+    r"password authentication failed|Access denied for user|"
+    r'database "[^"]+" does not exist|Unknown database',
     re.IGNORECASE,
 )
 _HOST_PORT = re.compile(r"(?<![\w.:-])((?:\d{1,3}\.){3}\d{1,3}|[A-Za-z][\w.-]*):(\d{2,5})\b")
-_PG_TARGET = re.compile(r'server at "([^"]+)"(?: \([^)]*\))?, port (\d+)')  # libpq / psycopg wording
+_PG_TARGET = re.compile(
+    r'server (?:at|on host) ["\']([^"\']+)["\'](?: \([^)]*\))?, port (\d+)', re.IGNORECASE
+)  # libpq / psycopg wording
+_MYSQL_TARGET = re.compile(r"Can't connect to MySQL server on ['\"]([^'\":]+)(?::(\d+))?['\"]", re.IGNORECASE)
 # KeyError: 'NAME' counts only when raised by an environ/getenv read: a plain dict KeyError is a code bug.
 _KEY_ERROR = re.compile(r"^KeyError: '([A-Z_][A-Z0-9_]*)'\s*$", re.MULTILINE)
 _ENV_ACCESS = re.compile(r"\bos\.environ\[|<frozen os>.*__getitem__")
@@ -320,7 +327,15 @@ def _service_stop(logs: str) -> str | None:
             if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host):
                 target = f"{host}:{m.group(2)}"
                 break
-    evidence = _CONNECTION_ERROR.search(lines[0]).group(0)
+        m_mysql = _MYSQL_TARGET.search(line)
+        if m_mysql:
+            host = m_mysql.group(1)
+            if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]*", host):
+                port = m_mysql.group(2) or "3306"
+                target = f"{host}:{port}"
+                break
+    evidence_match = _CONNECTION_ERROR.search(lines[-1]) or _CONNECTION_ERROR.search(lines[0])
+    evidence = evidence_match.group(0) if evidence_match else "unreachable"
     summary = (
         f"{SERVICE_STOP}: the app could not reach {target or 'an external service'} ({evidence}). "
         "A Dockerfile change cannot fix this; set the DB/network configuration (host, port, credentials) "

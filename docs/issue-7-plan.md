@@ -62,8 +62,10 @@ The three new stop scenarios and slow DB variant also passed with a repo-repair
 callback that raises if invoked: zero repair calls and zero redeploys. Existing
 application-code stops were tested with the repo agent disabled. No Cloud Run or
 live model validation was performed. Verification containers were removed.
+A reproducible local Docker verification runner is available at `scripts/verify-sample-apps.py`.
 
-Final backend checks: `uv run pytest -q` passed with 387 passed and 7 skipped;
-focused healer/fixture tests passed with 200 passed. Ruff check, formatting check,
-Python compilation, and `git diff --check` passed. Cloud Run startup log wrappers
-and adversarial optional/terminal error sequences are covered by local tests.
+Final backend checks: `uv run pytest -q` passed with 393 passed and 7 skipped;
+focused healer/fixture tests passed with 206 passed. Ruff check, formatting check,
+Python compilation, and `git diff --check` passed. Cloud Run startup log wrappers,
+adversarial optional/terminal error sequences, and database-client error variants
+(password auth, timeout, missing database, network unreachable) are covered by local tests.

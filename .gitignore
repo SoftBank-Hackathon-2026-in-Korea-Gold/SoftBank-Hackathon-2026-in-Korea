@@ -57,6 +57,7 @@ temp/
 .mypy_cache/
 
 # Local agent tooling state
+.omx/
 .omc/
 .serena/
 .remember/
