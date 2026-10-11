@@ -32,6 +32,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+from app import llmtrace
 from app.schemas import AnalysisResult, EnvRequirement
 
 DEFAULT_MODEL = "claude-haiku-5-5"
@@ -668,7 +669,9 @@ def run_all(inspect, root: Path) -> tuple[dict, list]:
     동시에 도는 LLM 호출 수는 llm_slots()가 막는다."""
     text = repo_text(root)
     with ThreadPoolExecutor(max_workers=len(INSPECTORS)) as pool:
-        futures = {n: pool.submit(inspect, n) for n in INSPECTORS}
+        futures = {
+            n: pool.submit(llmtrace.bind(inspect, span_name=f"analyzer.inspect:{n}"), n) for n in INSPECTORS
+        }
     reports, errors = {}, []
     for n, f in futures.items():
         try:
@@ -978,7 +981,11 @@ def load_model(repo: str | None = None):
         return None
     import anthropic
 
-    return RepoReader(anthropic.Anthropic(), os.environ.get("ANALYZER_MODEL") or DEFAULT_MODEL, repo)
+    return RepoReader(
+        llmtrace.wrap_anthropic(anthropic.Anthropic(), "analyzer.llm"),
+        os.environ.get("ANALYZER_MODEL") or DEFAULT_MODEL,
+        repo,
+    )
 
 
 # ---------- Dockerfile ----------

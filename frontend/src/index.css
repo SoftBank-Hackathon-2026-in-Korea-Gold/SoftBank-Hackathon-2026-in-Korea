@@ -164,3 +164,6 @@ code, pre, .font-mono { font-family: var(--mono); }
   .details-modal[open], .details-modal::backdrop { animation: none; }
   .dashboard-shell *, .dashboard-shell *::before, .dashboard-shell *::after { scroll-behavior: auto; }
 }
+/* Keep source changes readable even when the Tailwind CDN is unavailable. */
+.diff-added { background: rgba(16, 185, 129, .12); color: #6ee7b7; }
+.diff-removed { background: rgba(244, 63, 94, .12); color: #fda4af; }

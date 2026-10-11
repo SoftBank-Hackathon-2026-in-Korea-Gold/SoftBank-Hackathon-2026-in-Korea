@@ -49,7 +49,20 @@ from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
 
-from app import accounts, agents, analyzer, deployer, env_store, fixpr, healer, incident, users, webhooks
+from app import (
+    accounts,
+    agent_memory,
+    agents,
+    analyzer,
+    deployer,
+    env_store,
+    fixpr,
+    healer,
+    incident,
+    llmtrace,
+    users,
+    webhooks,
+)
 from app import fleet as fleetmod
 from app import nodes as nodepool
 from app.accounts import User
@@ -705,6 +718,7 @@ def run_pipeline(
     confirm: healer.ConfirmFn | None = None,
     overrides: dict | None = None,
     dockerfile_is_source: bool = False,
+    memory_scope: agent_memory.MemoryScope | None = None,
 ) -> bool:
     """Run one target synchronously; healer owns all retry attempts.
     deploy_fn defaults to deployer.deploy; the "agent" target passes one that runs on the user's machine.
@@ -713,10 +727,25 @@ def run_pipeline(
     `overrides` (deployer options such as env/build_secrets) apply to the healer's redeploys too."""
     if analysis is None:  # Preserve backward compatibility for direct calls.
         emit(PipelineEvent(type="stage", stage="analyze"))
-        analysis = analyzer.analyze(source)
+        with llmtrace.span("analyze"):
+            analysis = analyzer.analyze(source)
 
     if deploy_fn is None:
-        deploy_fn = functools.partial(deployer.deploy, **overrides) if overrides else deployer.deploy
+        options = dict(overrides or {})
+        # Fixed-port apps must be probed and published on the analyzer's port. Keep the
+        # same bound deploy function for every healer retry and leave caller options intact.
+        if analysis.port != 8080:
+            options.setdefault("container_port", analysis.port)
+        deploy_fn = functools.partial(deployer.deploy, **options) if options else deployer.deploy
+
+    untraced_deploy = deploy_fn
+
+    def deploy_fn(directory, dockerfile, place):
+        with llmtrace.span("deploy", target=place) as observation:
+            result = untraced_deploy(directory, dockerfile, place)
+            observation.update(metadata={"success": result.success})
+            return result
+
     emit(PipelineEvent(type="stage", stage="deploy", payload={"target": target}))
     result = deploy_fn(source, analysis.dockerfile, target)
     if result.success:
@@ -733,16 +762,19 @@ def run_pipeline(
             },
         )
     )
-    report = healer.heal(
-        source,
-        target,
-        result,
-        analysis.dockerfile,
-        deploy_fn,
-        emit=emit,
-        confirm_fn=confirm,
-        dockerfile_is_source=dockerfile_is_source,
-    )
+    with llmtrace.span("heal", target=target) as observation:
+        report = healer.heal(
+            source,
+            target,
+            result,
+            analysis.dockerfile,
+            deploy_fn,
+            emit=emit,
+            confirm_fn=confirm,
+            dockerfile_is_source=dockerfile_is_source,
+            memory_scope=memory_scope,
+        )
+        observation.update(metadata={"success": report.success, "attempts": report.attempts})
     payload = report.model_dump(mode="json")
     emit(PipelineEvent(type="done" if report.success else "error", payload=payload))
     return report.success
@@ -969,6 +1001,10 @@ def create_app() -> FastAPI:
         if os.getenv("CLOUDMORPH_GUARD", "1") != "0":
             guard.start()
 
+    @app.on_event("shutdown")
+    async def flush_tracing() -> None:
+        await asyncio.to_thread(llmtrace.shutdown, timeout=2.0)
+
     @app.get("/incidents")
     async def incidents(request: Request) -> dict:
         """What the guard sees (health per app and target) and what it did (incident timelines).
@@ -1133,7 +1169,8 @@ def create_app() -> FastAPI:
                 # Jev or clef-flash picks the service in under a second; the dashboard shows it before the analysis ends
                 if decision := analyzer.quick_decision(source_dir):
                     emit(PipelineEvent(type="log", stage="analyze", payload={"kind": "decision", **decision}))
-                analysis = analyzer.analyze(source_dir)
+                with llmtrace.span("analyze"):
+                    analysis = analyzer.analyze(source_dir)
                 emit(
                     PipelineEvent(
                         type="log",
@@ -1144,7 +1181,7 @@ def create_app() -> FastAPI:
                         },
                     )
                 )
-                for note in analysis.notes[:8]:
+                for note in analysis.notes:
                     emit(PipelineEvent(type="log", stage="analyze", payload={"line": f"analyzer: {note}"}))
                 project["analysis"] = {
                     "target": analysis.target,
@@ -1185,6 +1222,9 @@ def create_app() -> FastAPI:
                                     deploy_fn=_deploy_fn(target),
                                     confirm=confirm,
                                     dockerfile_is_source=own_dockerfile,
+                                    memory_scope=agent_memory.MemoryScope(
+                                        owner, app_name, _source_identity(source)
+                                    ),
                                 )
                                 and target != "agent"
                             ):  # the agent's container is on the user's PC
@@ -1319,7 +1359,12 @@ def create_app() -> FastAPI:
         async def worker() -> None:
             job.state = "running"
             try:
-                await asyncio.to_thread(execute)
+
+                def traced_execute():
+                    with llmtrace.deployment(deployment_id):
+                        execute()
+
+                await asyncio.to_thread(traced_execute)
                 # callbacks queued by execute are processed by the event loop
                 await asyncio.sleep(0)
                 if all(v.get("success") is True for v in job.targets.values()):

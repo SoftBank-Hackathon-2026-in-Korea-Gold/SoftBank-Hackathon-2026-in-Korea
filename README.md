@@ -6,7 +6,7 @@ SoftBank Hackathon 2026 in Korea · Term 2 · Team Gold
 
 ## 접속 (상시 호스팅)
 
-- 대시보드: https://cloudmorph.34-64-253-41.sslip.io (API 토큰 필요) · 운영 문서: [`docs/server-hosting.md`](docs/server-hosting.md)
+- 대시보드: https://cloudmorph.34-64-253-41.sslip.io (회원가입·로그인 또는 API 토큰) · 운영 문서: [`docs/server-hosting.md`](docs/server-hosting.md)
 - 서비스 전체 흐름(인터랙티브): [`docs/overview.html`](docs/overview.html) · 아키텍처: [`docs/architecture.png`](docs/architecture.png)
 - 배포 타깃: `local`(서버 Docker) · `cloudrun` · `node`(GCP·AWS VM 노드 풀) · `function`(Cloud Run functions)
 
@@ -57,7 +57,7 @@ uv run uvicorn app.main:app --reload
 ## Demo runbook (발표 노트북에서 띄우고 터널로 공개)
 
 ```bash
-cp .env.example .env            # GCP_PROJECT_ID, ANTHROPIC_API_KEY 채우기 (최초 1회, analyzer는 이 키가 없으면 분석하지 않음)
+cp .env.example .env            # GCP_PROJECT_ID와 분석 제공자 설정 (ANTHROPIC_API_KEY 또는 Jev/clef-flash; docs/analyzer.md)
 scripts/demo-up.sh              # 백엔드 :8000 + 대시보드 :5173 (대시보드가 /deploy, /health 를 백엔드로 프록시)
 scripts/demo-up.sh --public     # + Cloudflare quick tunnel 1개로 대시보드·API 공개, API 토큰 자동 생성
 scripts/demo-down.sh            # 전부 종료 (deployer가 띄운 로컬 컨테이너·터널 포함)
@@ -74,11 +74,16 @@ scripts/demo-down.sh            # 전부 종료 (deployer가 띄운 로컬 컨�
 - `schemas.py` 변경은 팀 합의 후에만
 - 키·서비스 계정 JSON은 절대 커밋하지 않기 (`.env`, GitHub Secrets)
 
-## Next steps
+## Next steps (2026. 10. 11. 점검)
 
-- [ ] analyzer 구현 및 healer 연결 (10/8) · deployer 구현 완료 (#PR: local Docker + Cloud Run 블루그린)
-- [ ] 고장 샘플 앱 stderr 실측 → `healer.ERROR_PATTERNS` 보강
-- [ ] 프론트 SSE 연동 + 수정 전/후 diff 카드
+- [x] analyzer 구현 및 healer 연결 · local Docker + Cloud Run 블루그린 · 분석 포트를 배포·재시도에 전달
+- [x] 고장 샘플 앱 11개 local Docker stderr 실측 및 회귀 검증 → `healer.ERROR_PATTERNS` 보강
+- [ ] Cloud Run deploy 단계 stderr 추가 실측 (인증된 `gcloud`·GCP 프로젝트 필요; 기존 `broken-import` fixture 1개)
+- [x] 프론트 SSE 연동 + 파일명·수정 전/후 diff 카드 · 최종 리포트로 누락 diff 복원
 - [x] 로컬 Public URL (Cloudflare Quick Tunnel) · [x] CI (pytest + ruff, `.github/workflows/ci.yml`)
 - [x] Notion ADR: Cloud Run 선택, Docker (ADR-002) · LangGraph 순환 루프, 규칙 우선·LLM 폴백 (ADR-003) — [설계 자료](https://app.notion.com/p/da58bee9ada482a79abb010aad08c0f0)
-- [ ] (stretch) Agent Memory, Langfuse 트레이싱, AWS 2nd target · 롤백은 Cloud Run 블루그린(candidate 태그 검증 후 승격)으로 대체
+- [x] (stretch) Agent Memory · opt-in Langfuse 트레이싱 · AWS 2nd target (node pool)
+- [x] Cloud Run 블루그린 실패·롤백 회귀 테스트 (기존 서비스 candidate 검증 후 지정 리비전 승격; 승격 후 실패 시 복귀)
+- [ ] 실제 Langfuse 프로젝트 수신 smoke test (키·endpoint 필요)
+
+반복 실행: `scripts/next-steps-workflow.sh --docker` · 설정·검증 범위: [`docs/next-steps-workflow.md`](docs/next-steps-workflow.md)

@@ -127,7 +127,7 @@ CloudMorph 시스템을 로컬 및 클라우드 환경에서 정상 구동하기
   - `cloudflared`를 통해 임시 Live Public URL을 발급하고 헬스체크를 수행한다.
 - **FR-2.2**: **클라우드 배포 (`cloudrun`)**:
   - Cloud Run 아키텍처(`linux/amd64`)에 맞춰 교차 빌드 후 Artifact Registry에 푸시한다.
-  - 블루그린 검증 전략(`--no-traffic --tag candidate`)으로 배포 후 태그 URL로 기동 검사를 완료한 뒤 100% 트래픽(`--to-latest`)으로 안전 승격한다.
+  - 기존 서비스는 블루그린 검증 전략(`--no-traffic --tag candidate`)으로 배포 후 태그 URL 검증을 완료한 리비전에만 100% 트래픽(`--to-revisions=<verified revision>=100`)을 전달한다. 승격 후 검증 실패 시 이전 리비전으로 복귀한다. 최초 배포는 이전 리비전이 없어 동일한 트래픽 보호를 제공하지 않는다.
 - **FR-2.3**: **오류 로그 보존 계약**:
   - 배포 또는 기동 실패 시 예외를 발생(raise)시키지 않고 `DeployResult(success=False, ...)`를 반환한다.
   - 단순 CLI 에러 외에 **컨테이너 런타임 로그(`docker logs` 또는 Cloud Run revision logs)**를 반드시 `stderr`에 포함하여 자가치유 모듈에 전달한다.

@@ -48,6 +48,30 @@ async function setup(page) {
 const emit = (page, type, payload = {}, stage) =>
   page.evaluate(({ type, payload, stage }) => window.testStreams.at(-1).emit(type, payload, stage), { type, payload, stage });
 
+test('healed source diff stays reviewable on the one-touch page', async ({ page }) => {
+  await setup(page);
+  await page.goto('/#/deploy');
+  await page.getByRole('button', { name: '배포하기', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => window.testStreams.length)).toBe(1);
+  await emit(page, 'stage', { target: 'local' }, 'deploy');
+  await emit(page, 'heal_diff', {
+    attempt: 1, category: 'missing_dependency', source: 'rule', rationale: 'flask 설치',
+    diff: '--- Dockerfile (before)\n+++ Dockerfile (after)\n@@ -1 +1 @@\n-RUN pip install gunicorn\n+RUN pip install gunicorn flask',
+  });
+  await expect(page.getByText('자가치유 패치', { exact: true })).toBeVisible();
+  await expect(page.getByText('#1 missing_dependency', { exact: true })).toBeVisible();
+  await expect(page.getByText('규칙', { exact: true })).toBeVisible();
+  await expect(page.getByText('Dockerfile', { exact: true })).toBeVisible();
+  await expect(page.getByText('− 수정 전 · + 수정 후', { exact: true })).toBeVisible();
+  await expect(page.locator('[data-diff-kind="removed"]')).toHaveText('-RUN pip install gunicorn');
+  await expect(page.locator('[data-diff-kind="added"]')).toHaveText('+RUN pip install gunicorn flask');
+  const background = await page.locator('[data-diff-kind="added"]').evaluate((el) => getComputedStyle(el).backgroundColor);
+  expect(background).not.toBe('rgba(0, 0, 0, 0)');
+  await emit(page, 'done', { target: 'local', url: 'https://healed.example' });
+  await expect(page.getByText('자가치유 패치', { exact: true })).toBeVisible();
+  await page.screenshot({ path: test.info().outputPath('healed-diff.png'), fullPage: true });
+});
+
 test('front door: one click, a 1-second pick, a question only for the risky choice, then done', async ({ page }) => {
   const sent = await setup(page);
   await page.goto('/#/deploy');

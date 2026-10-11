@@ -7,7 +7,7 @@ import RunProgress from './RunProgress';
 import { PLACES } from './copy';
 import { explainFailure } from './failure';
 import LogConsole from '../components/LogConsole';
-import { QuestionCard } from '../components/ResultPanels';
+import { PatchList, QuestionCard, SuggestionCard } from '../components/ResultPanels';
 import { fmtDur } from '../lib/style';
 
 const PRESETS = [
@@ -179,6 +179,8 @@ export default function DeployPage({ form, setForm, run, now, starting, cancelli
             <div className="space-y-5">
               {run.envRequest && <AskCard key={run.id} request={run.envRequest} onSubmit={onAnswer} />}
               <QuestionCard question={run.question} onAnswer={onAnswerQuestion} />
+              {run.patches.length > 0 && <PatchList patches={run.patches} />}
+              <SuggestionCard suggestion={run.suggestion} />
               <Result run={run} onOpenApps={onOpenApps} />
             </div>
           </div>

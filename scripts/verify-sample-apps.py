@@ -6,9 +6,9 @@ runs healer.heal(), verifies HTTP health for healed apps (200 on / and /health),
 and verifies that unhealable scenarios stop cleanly without redeployment or model fallback.
 
 Usage:
-    uv run python scripts/verify-sample-apps.py            # runs 6 issue #7 scenarios
-    uv run python scripts/verify-sample-apps.py --all      # runs all 11 broken sample apps
-    uv run python scripts/verify-sample-apps.py <name>     # runs a single sample app
+    uv run --project backend python scripts/verify-sample-apps.py            # repo root
+    uv run --project backend python scripts/verify-sample-apps.py --all      # all 11 apps
+    uv run --project backend python scripts/verify-sample-apps.py <name>     # one app
 """
 
 from __future__ import annotations
@@ -97,11 +97,13 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
         # One failing sample (assertion, HTTP error, Docker error) is recorded, not fatal, and its
         # containers are always cleaned up.
         try:
-            initial_res = deployer.deploy(tmp_dir, dockerfile, "local", tunnel=False, verify_timeout=timeout)
+            initial_res = deployer.deploy(
+                tmp_dir, dockerfile, "local", tunnel=False, verify_timeout=timeout
+            )
             # Issue #7 human-stop scenarios must never invoke the repo agent even if provided.
             # Pre-existing app-code stops (broken-import, broken-health) run with repo agent disabled (None).
             # A non-None llm_patch_fn also keeps heal() from enabling the repo agent when ANTHROPIC_API_KEY
-            # is exported, so no sample can make a model call.
+            # is exported. The separate source-suggestion path must also be disabled.
             repair_fn = _forbidden_agent if name in DEFAULT_ISSUE7_SAMPLES else None
             report = healer.heal(
                 tmp_dir,
@@ -111,6 +113,7 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
                 redeploy,
                 llm_patch_fn=_forbidden_agent,
                 repair_fn=repair_fn,
+                suggest_fn=lambda *_: None,
             )
             summary = report.summary
 
@@ -136,7 +139,10 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
                     detail = "Expected stop but heal reported success"
                 elif report.attempts != 0:
                     detail = f"Expected 0 redeploys but attempted {report.attempts}"
-                elif not (expected_stop_prefix and report.summary.startswith(expected_stop_prefix)):
+                elif not (
+                    expected_stop_prefix
+                    and report.summary.startswith(expected_stop_prefix)
+                ):
                     detail = f"Summary mismatch: {report.summary}"
                 else:
                     passed = True
@@ -157,7 +163,9 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--all", action="store_true", help="Run all 11 broken sample apps")
+    parser.add_argument(
+        "--all", action="store_true", help="Run all 11 broken sample apps"
+    )
     parser.add_argument("sample", nargs="?", help="Specific sample name to verify")
     args = parser.parse_args()
 

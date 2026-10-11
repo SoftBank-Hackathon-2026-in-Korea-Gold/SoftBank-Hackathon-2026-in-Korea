@@ -52,3 +52,5 @@ jobs:
         run: uv run ruff format --check app tests
       - name: Unit tests (no Docker)
         run: uv run pytest -q
+      - name: Optional Langfuse SDK integration (in-memory exporter)
+        run: uv run --frozen --extra tracing pytest -q tests/test_llmtrace.py

@@ -8,8 +8,9 @@ or `cloudrun` (Artifact Registry + Cloud Run). Contract: app/schemas.py::DeployR
 Pipeline (each stage is recorded; the first failing stage decides `stderr`):
 
     preflight -> build -> [push] -> deploy -> expose -> verify
-    cloudrun is blue/green: the new revision is deployed with --no-traffic and a `candidate` tag URL,
-    verified there, and only then promoted (--to-latest). A broken revision never serves the public URL.
+    cloudrun redeploys are blue/green: a --no-traffic `candidate` revision is verified before
+    promotion (--to-revisions=<verified>=100). First deployments have no prior revision to protect
+    and receive traffic before verification; a failed first probe is reported as a failure.
 
 `stderr` layout (what healer classifies):
 
@@ -318,12 +319,18 @@ def http_status(url: str, timeout: float = 5.0) -> tuple[int | None, str]:
 def wait_up(
     base_url: str, health_path: str, timeout: int, *, is_dead=None, interval: float = 2.0
 ) -> tuple[bool, str]:
-    """App is 'up' when health_path (or "/" as fallback) answers with a status < 500."""
+    """Probe health first; a missing health route must fall back to the root route.
+
+    Root 4xx still demonstrates liveness for API-only apps with no index page. A missing
+    health endpoint alone says nothing about whether the application's routes work.
+    """
     deadline = time.time() + timeout
     last = "not attempted"
     while time.time() < deadline:
         for path in (health_path, "/") if health_path != "/" else ("/",):
             status, last = http_status(base_url + path)
+            if path != "/" and status in (404, 405):
+                continue
             if status is not None and status < 500:
                 return True, last
             if status is not None and status >= 500:
@@ -1777,7 +1784,7 @@ def _cloud_size_flags(
 
 
 def deploy_cloudrun(src_dir: Path, cfg: Config, r: Runner, out: Outcome) -> None:
-    """Blue/green: new revision gets 0% traffic and a tag URL; traffic moves only after it passes verify."""
+    """Verify a candidate before replacing existing traffic; a first deployment serves immediately."""
     name = slug(src_dir.name)
     service = cfg.service or name
     tag = cfg.tag or time.strftime("v%Y%m%d-%H%M%S")

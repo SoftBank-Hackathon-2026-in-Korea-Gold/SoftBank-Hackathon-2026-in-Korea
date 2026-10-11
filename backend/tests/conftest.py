@@ -15,6 +15,10 @@ def _no_decision_models(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _isolated_project_registry(tmp_path, monkeypatch):
+    # Host .env credentials must never turn unit tests into telemetry exports or
+    # writes to the persistent repair memory. Feature tests opt in explicitly.
+    monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "false")
+    monkeypatch.setenv("CLOUDMORPH_HEAL_MEMORY", "0")
     # env var survives importlib.reload(app.main) in tests that reload the module
     monkeypatch.setenv("CLOUDMORPH_PROJECTS_FILE", str(tmp_path / "projects.json"))
     from app import main

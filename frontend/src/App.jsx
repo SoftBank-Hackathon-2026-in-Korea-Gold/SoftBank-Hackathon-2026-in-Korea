@@ -4,7 +4,7 @@ import AuthScreen from './components/AuthScreen';
 import { applyEvent, emptyRun } from './lib/run';
 import DeployForm from './components/DeployForm';
 import EnvRequestCard from './components/EnvRequestCard';
-import { AnalysisCard, Endpoints, PatchList, QuestionCard } from './components/ResultPanels';
+import { AnalysisCard, Endpoints, PatchList, QuestionCard, SuggestionCard } from './components/ResultPanels';
 import AppsBoard from './components/AppsBoard';
 import { DashboardHeader, RunHUD, ActivityDock } from './components/DashboardChrome';
 import DetailsModal from './components/DetailsModal';
@@ -525,9 +525,10 @@ export default function App() {
         <div className="modal-section" id="modal-section-details" role="region" aria-labelledby="modal-menu-details" hidden={panel !== 'details'}>
           {run.envRequest && <EnvRequestCard key={`env-${run.id}`} request={run.envRequest} onSubmit={(values) => submitEnv(run.id, values)} />}
           <QuestionCard key={`question-${run.id}`} question={run.question} onAnswer={(qid, choice) => answerQuestion(run.id, qid, choice)} />
+          {run.patches.length > 0 && <PatchList patches={run.patches} />}
+          <SuggestionCard suggestion={run.suggestion} />
           <AnalysisCard run={run} />
           <Endpoints run={run} project={currentProject} onStop={onStop} stopping={stopping.has(currentProject?.name) ? currentProject?.name : null} stopDisabled={starting || !!redeploying || runRunning} />
-          <PatchList patches={run.patches} />
         </div>
         <div className="modal-section settings-section" id="modal-section-settings" role="region" aria-labelledby="modal-menu-settings" hidden={panel !== 'settings'}>
           <h3>API 토큰</h3>

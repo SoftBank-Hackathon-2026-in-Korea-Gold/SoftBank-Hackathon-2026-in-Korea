@@ -110,8 +110,13 @@ test('healing question, full stage celebration, modal-first Escape and return to
   await setup(page);
   await start(page);
   await emit(page, 'stage', { target: 'local' }, 'deploy');
-  await emit(page, 'log', { kind: 'question', question_id: 'q1', ask: true, rationale: 'review fix', diff: '+fixed', timeout_s: 300 });
+  const diff = '--- app.py (before)\n+++ app.py (after)\n@@ -1 +1 @@\n-old\n+fixed';
+  await emit(page, 'log', { kind: 'question', question_id: 'q1', ask: true, rationale: 'review fix', diff, timeout_s: 300 });
   const dialog = page.getByRole('dialog');
+  await expect(dialog.getByText('app.py', { exact: true })).toBeVisible();
+  await expect(dialog.getByText('− 수정 전 · + 수정 후', { exact: true })).toBeVisible();
+  await expect(dialog.locator('[data-diff-kind="removed"]')).toHaveText('-old');
+  await expect(dialog.locator('[data-diff-kind="added"]')).toHaveText('+fixed');
   await expect(dialog.getByRole('button', { name: '고친 채로 계속' })).toBeVisible();
   await dialog.getByRole('button', { name: '고친 채로 계속' }).click();
   await emit(page, 'log', { kind: 'answer', choice: 'continue', reason: 'user' });

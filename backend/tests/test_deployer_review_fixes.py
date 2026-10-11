@@ -60,14 +60,23 @@ def test_existing_service_returns_serving_revision(monkeypatch):
 # --------------------------------------------------------------------------- #
 # 2. revision must be known; promote the verified revision
 # --------------------------------------------------------------------------- #
-def _stub_cloudrun(monkeypatch, *, latest: str | None):
+def _stub_cloudrun(
+    monkeypatch, *, latest: str | None, previous="svc-00001-old", candidate_ok=True, public_ok=True
+):
     commands: list[list[str]] = []
     monkeypatch.setattr(deployer, "build_image", lambda *a, **k: None)
     monkeypatch.setattr(deployer, "push_image", lambda *a, **k: None)
-    monkeypatch.setattr(deployer, "serving_revision", lambda *a, **k: "svc-00001-old")
+    monkeypatch.setattr(deployer, "serving_revision", lambda *a, **k: previous)
     monkeypatch.setattr(deployer, "latest_revision", lambda *a, **k: latest)
     monkeypatch.setattr(deployer, "tagged_url", lambda *a, **k: "https://candidate---svc.run.app")
-    monkeypatch.setattr(deployer, "wait_up", lambda *a, **k: (True, "HTTP 200"))
+    monkeypatch.setattr(deployer, "database_for", lambda *a, **k: None)
+    monkeypatch.setattr(deployer, "cloudrun_logs", lambda *a, **k: "runtime logs")
+
+    def wait_up(url, *a, **k):
+        ok = candidate_ok if "candidate---" in url else public_ok
+        return ok, "HTTP 200" if ok else "HTTP 503"
+
+    monkeypatch.setattr(deployer, "wait_up", wait_up)
 
     def fake_run(self, name, cmd, **_):
         commands.append(cmd)
@@ -93,6 +102,59 @@ def test_promotes_exactly_the_verified_revision(monkeypatch, tmp_path):
     promote = next(c for c in commands if "update-traffic" in c)
     assert "--to-revisions=svc-00002-new=100" in promote and "--to-latest" not in promote
     assert out.url == "https://svc.run.app"
+    command = next(c for c in commands if "deploy" in c)
+    assert "--no-traffic" in command
+    assert command[command.index("--tag") + 1] == "candidate"
+
+
+def test_failed_candidate_leaves_existing_traffic_untouched(monkeypatch, tmp_path):
+    commands = _stub_cloudrun(monkeypatch, latest="svc-00002-new", candidate_ok=False)
+    with pytest.raises(StepError) as exc:
+        deployer.deploy_cloudrun(tmp_path, _cloud_cfg(), Runner(), Outcome(target="cloudrun"))
+    assert "--no-traffic" in next(c for c in commands if "deploy" in c)
+    assert not any("update-traffic" in c for c in commands)
+    assert "traffic untouched (still on svc-00001-old)" in exc.value.error
+
+
+def test_failed_public_probe_rolls_back_after_promotion(monkeypatch, tmp_path):
+    commands = _stub_cloudrun(monkeypatch, latest="svc-00002-new", public_ok=False)
+    out = Outcome(target="cloudrun")
+    with pytest.raises(StepError) as exc:
+        deployer.deploy_cloudrun(tmp_path, _cloud_cfg(), Runner(), out)
+    traffic = [c for c in commands if "update-traffic" in c]
+    assert len(traffic) == 2
+    assert "--to-revisions=svc-00002-new=100" in traffic[0]
+    assert "--to-revisions=svc-00001-old=100" in traffic[1]
+    assert out.handles["rolled_back_to"] == "svc-00001-old"
+    assert "rolled back to svc-00001-old: True" in exc.value.error
+    assert out.url is None
+
+
+def test_first_deploy_cannot_protect_a_previous_revision(monkeypatch, tmp_path):
+    commands = _stub_cloudrun(monkeypatch, latest="svc-00001-new", previous=None, candidate_ok=False)
+    with pytest.raises(StepError):
+        deployer.deploy_cloudrun(tmp_path, _cloud_cfg(), Runner(), Outcome(target="cloudrun"))
+    command = next(c for c in commands if "deploy" in c)
+    assert "--no-traffic" not in command and "--tag" in command
+    assert not any("update-traffic" in c for c in commands)
+
+
+@pytest.mark.parametrize(
+    "health_status,root_status,expected",
+    [(404, 200, True), (405, 200, True), (404, 404, True), (404, 500, False), (500, 200, False)],
+)
+def test_health_fallback_does_not_hide_root_errors(monkeypatch, health_status, root_status, expected):
+    calls = []
+
+    def probe(url):
+        calls.append(url)
+        status = health_status if url.endswith("/health") else root_status
+        return status, f"HTTP {status}"
+
+    monkeypatch.setattr(deployer, "http_status", probe)
+    ok, _ = deployer.wait_up("http://app", "/health", 10, is_dead=lambda: True)
+    assert ok is expected
+    assert calls == (["http://app/health"] if health_status == 500 else ["http://app/health", "http://app/"])
 
 
 # --------------------------------------------------------------------------- #

@@ -15,6 +15,9 @@ langchain-openai>=0.2
 # Environment Variables
 python-dotenv>=1.0
 
+# Optional metadata-only tracing: install separately, or uv sync --project backend --extra tracing.
+# langfuse>=4.17,<5
+
 # Development & Testing (Optional, installed via pip install -r requirements-dev.txt or uv sync)
 # pytest>=8
 # ruff>=0.6

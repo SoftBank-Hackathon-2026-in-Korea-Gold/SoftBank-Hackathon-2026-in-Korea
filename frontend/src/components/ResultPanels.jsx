@@ -3,6 +3,7 @@ import { Zap, Cloud, Cpu, ExternalLink, GitPullRequest, Globe, Network, Server, 
 import { TARGET_META, canStop } from '../lib/run';
 import { Badge, Card, CopyButton, Dot, StopButton } from './ui';
 import { TONE } from '../lib/style';
+import { diffRows } from '../lib/diff';
 
 const ICONS = { local: Server, cloudrun: Cloud, node: Network, function: Zap };
 
@@ -37,13 +38,16 @@ export function AnalysisCard({ run }) {
 
 function DiffBlock({ diff }) {
   return (
-    <pre className="max-h-56 max-w-full overflow-auto rounded-xl border border-[rgba(150,160,215,0.16)] bg-[#0b0d17]/85 p-3 font-mono text-[11px] leading-[1.2rem] text-slate-300 shadow-inner">
-      {(diff || '').split('\n').filter((l) => !l.startsWith('---') && !l.startsWith('+++')).map((ln, j) => (
-        <div key={j} className={ln.startsWith('+') ? 'bg-emerald-500/12 text-emerald-300 px-1 rounded-sm' : ln.startsWith('-') ? 'bg-rose-500/12 text-rose-300 px-1 rounded-sm' : ln.startsWith('@@') ? 'text-sky-300 font-semibold' : 'text-slate-400'}>
-          {ln || ' '}
-        </div>
-      ))}
-    </pre>
+    <div className="space-y-1.5">
+      <p className="text-[11px] text-slate-400">− 수정 전 · + 수정 후</p>
+      <pre className="max-h-56 max-w-full overflow-auto rounded-xl border border-[rgba(150,160,215,0.16)] bg-[#0b0d17]/85 p-3 font-mono text-[11px] leading-[1.2rem] text-slate-300 shadow-inner">
+        {diffRows(diff || '').map(({ kind, text }, j) => (
+          <div key={j} data-diff-kind={kind} className={kind === 'added' ? 'diff-added px-1 rounded-sm' : kind === 'removed' ? 'diff-removed px-1 rounded-sm' : kind === 'file' ? 'mt-2 mb-1 text-slate-100 font-semibold' : kind === 'hunk' ? 'text-sky-300 font-semibold' : 'text-slate-400'}>
+            {text || ' '}
+          </div>
+        ))}
+      </pre>
+    </div>
   );
 }
 
@@ -131,6 +135,16 @@ export function PatchList({ patches }) {
           ))}
         </div>
       )}
+    </Card>
+  );
+}
+
+export function SuggestionCard({ suggestion }) {
+  if (!suggestion) return null;
+  return (
+    <Card title="소스 수정 제안 (적용 안 함)" icon={Wrench}>
+      <p className="mb-2 text-xs text-slate-400">{suggestion.path} · 제안을 검토한 뒤 저장소에 반영해 주세요.</p>
+      <DiffBlock diff={suggestion.diff} />
     </Card>
   );
 }

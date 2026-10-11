@@ -986,6 +986,113 @@ async def _until(check):
     await asyncio.wait_for(poll(), timeout=5)
 
 
+@pytest.mark.parametrize("target", ["local", "cloudrun", "node"])
+def test_fixed_analysis_port_survives_healer_redeploy(m, tmp_path, monkeypatch, target):
+    source = tmp_path / "app"
+    source.mkdir()
+    analysis = AnalysisResult(
+        target=target,
+        language="python",
+        port=5000,
+        dockerfile="FROM python:3.12-slim\nENV PORT=5000\nEXPOSE 5000\nCMD gunicorn -b 0.0.0.0:5000 app:app\n",
+    )
+    options = {"env": {"MODE": "test"}}
+    calls = []
+
+    def fake_deploy(directory, dockerfile, place, **kwargs):
+        calls.append((place, kwargs))
+        return DeployResult(
+            success=len(calls) > 1,
+            target=place,
+            exit_code=0 if len(calls) > 1 else 1,
+            stderr="ModuleNotFoundError: No module named 'flask'" if len(calls) == 1 else "",
+            url="http://app.invalid" if len(calls) > 1 else None,
+        )
+
+    monkeypatch.setattr(m.deployer, "deploy", fake_deploy)
+    assert m.run_pipeline(str(source), target, lambda _: None, analysis=analysis, overrides=options)
+    assert len(calls) == 2
+    assert all(place == target and opts == {**options, "container_port": 5000} for place, opts in calls)
+    assert options == {"env": {"MODE": "test"}}
+
+
+def test_named_jobs_keep_private_trace_parents_through_healer_retry(m, tmp_path, monkeypatch):
+    from tests.test_llmtrace import FakeClient
+
+    trace = FakeClient()
+    monkeypatch.setenv("LANGFUSE_TRACING_ENABLED", "true")
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "pk-lf-test")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "sk-lf-test")
+    monkeypatch.setattr(m.llmtrace, "_stopped", False)
+    monkeypatch.setattr(m.llmtrace, "_initialized", False)
+    monkeypatch.setattr(m.llmtrace, "_client", None)
+    monkeypatch.setattr(m.llmtrace, "_make_client", lambda: trace)
+    source = tmp_path / "private-repository"
+    source.mkdir()
+    (source / "app.py").write_text("private source content")
+    notes = [f"note {i}" for i in range(12)]
+    monkeypatch.setattr(
+        m.analyzer,
+        "analyze",
+        lambda _: AnalysisResult(
+            target="local",
+            language="python",
+            notes=notes,
+            dockerfile="FROM python:3.12-slim\nCMD python app.py\n",
+        ),
+    )
+    calls = []
+
+    def deploy(directory, dockerfile, target, **kwargs):
+        calls.append(dockerfile)
+        failed = len(calls) % 2 == 1
+        return DeployResult(
+            target=target,
+            success=not failed,
+            exit_code=int(failed),
+            stderr="ModuleNotFoundError: No module named 'flask'" if failed else "",
+            url=None if failed else "http://app.invalid",
+        )
+
+    monkeypatch.setattr(m.deployer, "deploy", deploy)
+    monkeypatch.setattr(m.deployer, "last_handles", lambda _: {})
+    routes = {r.path: r.endpoint for r in m.app.routes if hasattr(r, "endpoint")}
+
+    async def scenario():
+        ids = []
+        for _ in range(2):
+            response = await routes["/deploy"](
+                DeployRequest(source=str(source), name="private-app", targets=["local"]), ADMIN
+            )
+            deployment_id = response["deployment_id"]
+            await _until(lambda job_id=deployment_id: m._jobs[job_id].completed)
+            assert m._jobs[deployment_id].state == "completed"
+            assert all(
+                any(
+                    event.payload.get("line") == f"analyzer: {note}"
+                    for event in m._jobs[deployment_id].events
+                )
+                for note in notes
+            )
+            ids.append(deployment_id)
+        return ids
+
+    ids = asyncio.run(scenario())
+    roots = [r for r in trace.records if r.kwargs["name"] == "cloudmorph.deploy"]
+    assert [r.kwargs["trace_context"]["trace_id"] for r in roots] == [m.llmtrace.trace_id_for(i) for i in ids]
+    assert roots[0].kwargs["trace_context"] != roots[1].kwargs["trace_context"]
+    for root in roots:
+        children = [r for r in trace.records if r.parent is root]
+        assert [r.kwargs["name"] for r in children] == ["analyze", "deploy", "heal"]
+        retries = [r for r in trace.records if r.parent is children[-1]]
+        assert len(retries) == 1 and retries[0].kwargs["name"] == "deploy"
+    exported = json.dumps([{"kwargs": r.kwargs, "updates": r.updates} for r in trace.records])
+    assert all(
+        private not in exported
+        for private in (str(source), "private-app", "private source content", "ModuleNotFoundError")
+    )
+
+
 def test_ask_env_waits_for_values_and_heal_redeploys_with_them(m, tmp_path, monkeypatch):
     calls = []
 

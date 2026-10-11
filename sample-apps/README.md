@@ -32,5 +32,5 @@ uv run python -m app.deployer ../sample-apps/broken local --no-tunnel
 uv run python -m app.deployer cleanup ../sample-apps/healthy          # 컨테이너·터널 정리
 
 # 6종 자가치유/조기중단 검증 (Docker E2E 재현 러너)
-uv run --project backend python ../scripts/verify-sample-apps.py
+uv run python ../scripts/verify-sample-apps.py
 ```

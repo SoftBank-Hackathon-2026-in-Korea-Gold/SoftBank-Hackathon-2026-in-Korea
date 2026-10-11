@@ -36,6 +36,7 @@ from typing import NamedTuple
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
+from app import agent_memory, llmtrace
 from app.schemas import (
     MAX_RETRIES,
     DeployResult,
@@ -64,8 +65,8 @@ DEFAULT_PORT = 8080  # Cloud Run injects PORT=8080 by default
 
 # --------------------------------------------------------------------------- #
 # 1. Classification (regex). Order matters: first match wins.
-# TODO(박재현): extend with real stderr samples from 전동훈's broken sample app
-#               and Cloud Run deploy logs.
+# Local samples are measured in tests/fixtures; Cloud Run deploy-stage wording
+# below is also covered by synthetic regressions pending live measurements.
 # --------------------------------------------------------------------------- #
 ERROR_PATTERNS: list[tuple[ErrorCategory, re.Pattern[str]]] = [
     (
@@ -82,7 +83,7 @@ ERROR_PATTERNS: list[tuple[ErrorCategory, re.Pattern[str]]] = [
         re.compile(
             # Shared objects only from the raised error or the loader: optional "Could not load dynamic
             # library ... cannot open shared object file" warnings (e.g. CUDA) must not mask the real cause.
-            r"ModuleNotFoundError: No module named|Cannot find module|"
+            r"ModuleNotFoundError: No module named|Cannot find (?:module|package)|"
             r"^(?:ImportError|OSError)\b.*cannot open shared object file|error while loading shared libraries",
             re.IGNORECASE | re.MULTILINE,
         ),
@@ -93,7 +94,7 @@ ERROR_PATTERNS: list[tuple[ErrorCategory, re.Pattern[str]]] = [
         ErrorCategory.PORT_BINDING,
         re.compile(
             r"EADDRINUSE|address already in use|port is already allocated|"
-            r"failed to start and listen on the port",
+            r"failed to start and (?:then )?listen on (?:the )?port",
             re.IGNORECASE,
         ),
     ),
@@ -106,7 +107,7 @@ ERROR_PATTERNS: list[tuple[ErrorCategory, re.Pattern[str]]] = [
     ),
     (
         ErrorCategory.BUILD_FAILURE,
-        re.compile(r"failed to solve|returned a non-zero code|ERROR \[", re.IGNORECASE),
+        re.compile(r"(?i:failed to solve|returned a non-zero code)|ERROR \["),
     ),
 ]
 
@@ -122,6 +123,17 @@ PIP_NAME_MAP = {
 
 
 def classify_error(error_log: str) -> ErrorCategory:
+    # A Cloud Run port wrapper describes every startup failure. Classify the
+    # actual app output first, including timestamp-prefixed revision logs.
+    runtime = _section(error_log, "runtime logs") or _section(error_log, "cloudrun revision logs")
+    if runtime:
+        for category, pattern in ERROR_PATTERNS:
+            if pattern.search(runtime):
+                return category
+        if re.search(
+            r"^(?:[A-Za-z_][\w.]*(?:Error|Exception)|Error|Exception)(?::|\s+\[)", runtime, re.MULTILINE
+        ):
+            return ErrorCategory.UNKNOWN
     for category, pattern in ERROR_PATTERNS:
         if pattern.search(error_log):
             return category
@@ -153,7 +165,7 @@ def deployer_header(error_log: str) -> tuple[str, str] | None:
 
 def _unhealable(error_log: str) -> tuple[str, str] | None:
     header = deployer_header(error_log)
-    return header if header and header[1] in UNHEALABLE_KINDS else None
+    return header if header and (header[1] in UNHEALABLE_KINDS or header[0] == "expose") else None
 
 
 class AppCodeError(NamedTuple):
@@ -181,6 +193,7 @@ def app_code_failure(error_log: str) -> AppCodeError | None:
     header = deployer_header(error_log)
     if not header or header[0] not in {"verify", "deploy"}:
         return None
+    error_log = re.sub(r"^\d{4}-\d\d-\d\dT[^\s]+\s+", "", error_log, flags=re.MULTILINE)
     exceptions = list(_EXCEPTION_LINE.finditer(error_log))
     if not exceptions:
         return None
@@ -206,6 +219,8 @@ def _stops_on_app_code(error_log: str) -> AppCodeError | None:
 SERVICE_STOP = "Not auto-healable: external service unreachable at startup"
 CONFIG_STOP = "Not auto-healable: missing runtime configuration"
 CRASH_STOP = "Not auto-healable: silent crash during startup"
+STARTUP_STOP = "Not auto-healable: startup failure without an actionable port fix"
+LOCAL_IMPORT_STOP = "Not auto-healable: local application module missing"
 
 _CONNECTION_ERROR = re.compile(
     r"Connection refused|ECONNREFUSED|Name or service not known|Temporary failure in name resolution|"
@@ -242,7 +257,8 @@ def _section(error_log: str, name: str) -> str:
     m = re.search(
         rf"^--- {re.escape(name)} ---$\n?(.*?)(?=^--- [^\n]+ ---$|\Z)", error_log, re.MULTILINE | re.DOTALL
     )
-    return m.group(1) if m else ""
+    body = m.group(1) if m else ""
+    return re.sub(r"^\d{4}-\d\d-\d\dT[^\s]+\s+", "", body, flags=re.MULTILINE)
 
 
 def _diagnosis(error_log: str) -> str:
@@ -395,11 +411,29 @@ def needs_human_stop(error_log: str, src_dir: str | None = None, dockerfile: str
     if "probably bound to another port or to 127.0.0.1" in _diagnosis(error_log):
         return None
     logs = _section(error_log, "runtime logs") or _section(error_log, "cloudrun revision logs")
-    return (
+    stopped = (
         _config_stop(logs, src_dir, dockerfile, error_log)
         or _service_stop(logs)
         or _crash_stop(logs, error_log)
     )
+    if stopped:
+        return stopped
+    # A wrapper with no traceback cannot establish whether the app bound to the
+    # wrong port, crashed silently, or needs a longer startup probe. Merely
+    # adding ENV PORT is not evidence that the start command will change.
+    if dockerfile and classify_error(error_log) == ErrorCategory.PORT_BINDING:
+        port = _expected_port(error_log)
+        command_changed = any(
+            _rebind_start_command(line, port) != line
+            for line in dockerfile.splitlines()
+            if re.match(r"\s*(?:CMD|ENTRYPOINT)\b", line, re.IGNORECASE)
+        )
+        if not command_changed and not re.search(r"EADDRINUSE|address already in use", logs, re.IGNORECASE):
+            return (
+                f"{STARTUP_STOP}. Inspect the startup/revision logs and verify the app listens on "
+                f"0.0.0.0:$PORT ({port}); increase the startup probe timeout if warmup is slow."
+            )
+    return None
 
 
 def _llm_context(error_log: str, tail: int = 40) -> str:
@@ -442,9 +476,11 @@ def _patch_missing_dependency(dockerfile: str, error_log: str) -> tuple[str, str
             dockerfile, line
         ), f"Python module '{module}' missing -> pip install {package}"
 
-    node = re.search(r"Cannot find module '([^'./][^']*)'", error_log)
+    node = re.search(r"Cannot find (?:module|package) '([^'./][^']*)'", error_log)
     if node:
         package = node.group(1)
+        if not re.fullmatch(r"(?:@[a-z0-9_.-]+/)?[a-z0-9_.-]+", package):
+            return None
         line = f"RUN npm install {package}"
         if line in dockerfile:
             return None
@@ -452,6 +488,25 @@ def _patch_missing_dependency(dockerfile: str, error_log: str) -> tuple[str, str
             dockerfile, line
         ), f"Node module '{package}' missing -> npm install {package}"
     return _patch_shared_library(dockerfile, error_log)
+
+
+def _local_import_stop(src_dir: str, dockerfile: str, error_log: str) -> str | None:
+    match = re.search(r"No module named '([\w.]+)'", error_log)
+    if not match:
+        return None
+    module = match.group(1).split(".")[0]
+    root = Path(src_dir)
+    local = any(
+        (directory / f"{module}.py").is_file() or (directory / module / "__init__.py").is_file()
+        for directory in (root, root / "src")
+    )
+    entrypoint = re.search(rf"[\"'\s]{re.escape(module)}(?:\.[\w.]+)?:\w+", dockerfile)
+    if local or entrypoint:
+        return (
+            f"{LOCAL_IMPORT_STOP}: {module} belongs to this app. Check COPY, WORKDIR, PYTHONPATH, "
+            "and the entrypoint; installing an unrelated package from PyPI is unsafe."
+        )
+    return None
 
 
 # Only stable Debian package mappings exercised by the deterministic rule.
@@ -508,18 +563,18 @@ def _patch_shared_library(dockerfile: str, error_log: str) -> tuple[str, str] | 
 _ARG_SEP = r'(?:[ =]|",\s*")'
 
 
-def _rebind_start_command(line: str) -> str:
+def _rebind_start_command(line: str, port: int = DEFAULT_PORT) -> str:
     """Rewrite host/port inside a CMD/ENTRYPOINT line to 0.0.0.0:DEFAULT_PORT."""
     original = line
     line = re.sub(
         rf"((?<![\w-])(?:-b|--bind){_ARG_SEP})(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d+",
-        rf"\g<1>0.0.0.0:{DEFAULT_PORT}",
+        rf"\g<1>0.0.0.0:{port}",
         line,
     )
     # gunicorn with the IP omitted (`-b :5000`, `--bind=:5000`); anchored to the flag so another
     # service's host:port in an `sh -c` chain is left alone.
-    line = re.sub(rf"((?<![\w-])(?:-b|--bind){_ARG_SEP}):\d+", rf"\g<1>0.0.0.0:{DEFAULT_PORT}", line)
-    line = re.sub(rf"(--port{_ARG_SEP})\d+", rf"\g<1>{DEFAULT_PORT}", line)
+    line = re.sub(rf"((?<![\w-])(?:-b|--bind){_ARG_SEP}):\d+", rf"\g<1>0.0.0.0:{port}", line)
+    line = re.sub(rf"(--port{_ARG_SEP})\d+", rf"\g<1>{port}", line)
     line = re.sub(rf"(--host{_ARG_SEP})(?:127\.0\.0\.1|localhost)", r"\g<1>0.0.0.0", line)
     if line != original:
         return line
@@ -529,34 +584,41 @@ def _rebind_start_command(line: str) -> str:
     if not endpoints:
         return line
     last = endpoints[-1]
-    return f"{line[: last.start()]}0.0.0.0:{DEFAULT_PORT}{line[last.end() :]}"
+    return f"{line[: last.start()]}0.0.0.0:{port}{line[last.end() :]}"
+
+
+def _expected_port(error_log: str) -> int:
+    match = re.search(r"\bPORT=(\d{1,5})\b", _diagnosis(error_log))
+    port = int(match.group(1)) if match else DEFAULT_PORT
+    return port if 1 <= port <= 65535 else DEFAULT_PORT
 
 
 def _patch_port_binding(dockerfile: str, error_log: str) -> tuple[str, str] | None:
-    exposed = re.sub(
-        r"^(\s*EXPOSE\s+)\d+", rf"\g<1>{DEFAULT_PORT}", dockerfile, flags=re.MULTILINE | re.IGNORECASE
-    )
+    port = _expected_port(error_log)
+    exposed = re.sub(r"^(\s*EXPOSE\s+)\d+", rf"\g<1>{port}", dockerfile, flags=re.MULTILINE | re.IGNORECASE)
     patched = re.sub(
         r"^\s*(?:CMD|ENTRYPOINT)\b.*$",
-        lambda m: _rebind_start_command(m.group(0)),
+        lambda m: _rebind_start_command(m.group(0), port),
         exposed,
         flags=re.MULTILINE | re.IGNORECASE,
     )
     rebound = patched != exposed
     has_env = re.search(r"^\s*ENV\s+PORT\b", patched, re.MULTILINE | re.IGNORECASE)
     if not has_env:
-        patched = _insert_before_cmd(patched, f"ENV PORT={DEFAULT_PORT}")
+        patched = _insert_before_cmd(patched, f"ENV PORT={port}")
+    else:
+        patched = re.sub(r"^(\s*ENV\s+PORT[ =])\d+\b", rf"\g<1>{port}", patched, flags=re.MULTILINE)
     if patched == dockerfile:
         return None
     # Say what actually changed: the user sees this next to the diff.
     changes = [
-        f"start command rebound to 0.0.0.0:{DEFAULT_PORT}"
+        f"start command rebound to 0.0.0.0:{port}"
         if rebound
         else "start command unchanged (no host/port bind found in CMD/ENTRYPOINT)",
-        *([f"EXPOSE {DEFAULT_PORT}"] if exposed != dockerfile else []),
-        *([f"ENV PORT={DEFAULT_PORT} added"] if not has_env else []),
+        *([f"EXPOSE {port}"] if exposed != dockerfile else []),
+        *([f"ENV PORT={port} added"] if not has_env else []),
     ]
-    return patched, f"Port contract (listen on 0.0.0.0:$PORT, default {DEFAULT_PORT}): " + "; ".join(changes)
+    return patched, f"Port contract (listen on 0.0.0.0:$PORT, expected {port}): " + "; ".join(changes)
 
 
 # Runtime write denied for a non-root USER. Category stays `unknown` (no contract change); handled here.
@@ -796,7 +858,9 @@ def _model_for(provider: str) -> str | None:
 def _call_anthropic(system: str, user: str, model: str, timeout: float = LLM_TIMEOUT_S) -> str | None:
     import anthropic  # lazy: keep import cost off the rule path
 
-    client = anthropic.Anthropic(timeout=timeout, max_retries=0)
+    client = llmtrace.wrap_anthropic(
+        anthropic.Anthropic(timeout=timeout, max_retries=0), "healer.dockerfile_patch"
+    )
     r = client.messages.create(
         model=model, max_tokens=8000, system=system, messages=[{"role": "user", "content": user}]
     )
@@ -822,8 +886,10 @@ def _call_openai_compatible(
         kwargs["api_key"] = os.environ.get("OPENAI_API_KEY") or "EMPTY"  # local servers ignore the key
     else:
         kwargs["api_key"] = os.environ.get("OPENAI_API_KEY")
-    content = ChatOpenAI(**kwargs).invoke([("system", system), ("user", user)]).content
-    return str(content).strip()
+    with llmtrace.generation("healer.dockerfile_patch", provider=provider, model=model) as observation:
+        reply = ChatOpenAI(**kwargs).invoke([("system", system), ("user", user)])
+        observation.record_langchain(reply)
+        return str(reply.content).strip()
 
 
 def _ask_llm(system: str, user: str, fence_langs: str) -> str | None:
@@ -952,7 +1018,11 @@ def default_repo_repair(
     root = Path(src_dir).resolve()
     edit_file, originals = repo_edit_tool(root)
     reader = RepoReader(
-        anthropic.Anthropic(timeout=REPAIR_TIMEOUT_S, max_retries=0), _model_for("anthropic"), str(root)
+        llmtrace.wrap_anthropic(
+            anthropic.Anthropic(timeout=REPAIR_TIMEOUT_S, max_retries=0), "healer.repo_agent"
+        ),
+        _model_for("anthropic"),
+        str(root),
     )
     reader.tools.append(edit_file)
     reader.specs.append(
@@ -1005,14 +1075,27 @@ def build_graph(
     repair_fn: RepairFn | None = None,
     confirm_fn: ConfirmFn | None = None,
     dockerfile_is_source: bool = False,
+    memory_scope: agent_memory.MemoryScope | None = None,
+    memory_store: agent_memory.MemoryStore | None = None,
 ):
     llm_patch = llm_patch_fn or default_llm_patch
+    store = (memory_store or agent_memory.configured_store()) if memory_scope else None
+    origin: dict[str, str] = {}
+    source_changed = False
+    memory_hit = False
+    reused: dict[str, str] = {}
 
     def _emit(event: PipelineEvent) -> None:
         if emit:
             emit(event)
 
     def classify(state: HealState) -> HealState:
+        if store and not origin:
+            snapshot = agent_memory.source_fingerprint(state["src_dir"])
+            if snapshot:
+                origin.update(
+                    before=state["current_dockerfile"], error=state.get("error_log", ""), snapshot=snapshot
+                )
         error_log = state.get("error_log", "")
         category = classify_error(error_log)
         update: HealState = {"error_category": category}
@@ -1030,12 +1113,14 @@ def build_graph(
         if (
             _unhealable(error_log)
             or (not oom and needs_human_stop(error_log, state["src_dir"], state["current_dockerfile"]))
+            or _local_import_stop(state["src_dir"], state["current_dockerfile"], error_log)
             or app_stop
         ):
             update["status"] = "gave_up"  # no Dockerfile patch can fix it: skip LLM + redeploy
         return update
 
     def patch(state: HealState) -> HealState:
+        nonlocal source_changed, memory_hit
         before = state["current_dockerfile"]
         error_log = state.get("error_log", "")
         category = state["error_category"]
@@ -1046,6 +1131,32 @@ def build_graph(
         source = "rule"
         source_diff = ""
         fix = None
+        # Rules are cheap and authoritative; a remembered validated edit replaces
+        # only the expensive LLM fallback, after the same safety stops as usual.
+        if result is None and store and origin:
+            remembered = store.recall(memory_scope, state["target"], before, error_log, origin["snapshot"])
+            reused_key = (before, error_log)
+            if not remembered and (before != origin.get("before") or error_log != origin.get("error")):
+                remembered = store.recall(
+                    memory_scope, state["target"], origin["before"], origin["error"], origin["snapshot"]
+                )
+                reused_key = (origin["before"], origin["error"])
+            if remembered and remembered != before:
+                reused.update(before=reused_key[0], error=reused_key[1])
+                result = (remembered, "Reused a previously validated healing fix")
+                source, memory_hit = "llm", True
+                _emit(
+                    PipelineEvent(
+                        type="log",
+                        stage="heal",
+                        payload={
+                            "kind": "heal_memory",
+                            "target": state["target"],
+                            "action": "hit",
+                            "line": "Reused a validated fix from this project's healing memory.",
+                        },
+                    )
+                )
         if result is None and repair_fn:
             fix = repair_fn(state["src_dir"], before, error_log, category)
             if fix and (fix.dockerfile != before or fix.source_diff):
@@ -1059,6 +1170,7 @@ def build_graph(
             return {"status": "gave_up"}  # no patch applied -> attempt not counted
 
         after, rationale = result
+        source_changed = source_changed or bool(source_diff)
         history = state.get("history", [])
         seen = {before.strip(), *(r.before.strip() for r in history), *(r.after.strip() for r in history)}
         if not source_diff and after.strip() in seen:
@@ -1091,10 +1203,41 @@ def build_graph(
         }
 
     def redeploy(state: HealState) -> HealState:
+        nonlocal memory_hit
         _emit(PipelineEvent(type="stage", stage="redeploy", payload={"attempt": state["retry_count"]}))
         result = deploy_fn(state["src_dir"], state["current_dockerfile"], state["target"])
         if result.success:
+            if (
+                store
+                and origin
+                and not source_changed
+                and agent_memory.source_fingerprint(state["src_dir"]) == origin["snapshot"]
+            ):
+                saved = store.remember(
+                    memory_scope,
+                    state["target"],
+                    origin["before"],
+                    state["current_dockerfile"],
+                    origin["error"],
+                    origin["snapshot"],
+                )
+                if saved and not memory_hit:
+                    _emit(
+                        PipelineEvent(
+                            type="log",
+                            stage="heal",
+                            payload={
+                                "kind": "heal_memory",
+                                "target": state["target"],
+                                "action": "saved",
+                                "line": "Validated safe Dockerfile edits saved to this project's healing memory.",
+                            },
+                        )
+                    )
             return {"status": "healed", "last_result": result}
+        if memory_hit and store and origin:
+            store.forget(memory_scope, state["target"], reused["before"], reused["error"], origin["snapshot"])
+            memory_hit = False
         status = "gave_up" if state["retry_count"] >= MAX_RETRIES else "healing"
         return {"status": status, "last_result": result, "error_log": result.stderr}
 
@@ -1193,6 +1336,8 @@ def heal(
     repair_fn: RepairFn | None = None,
     confirm_fn: ConfirmFn | None = None,
     dockerfile_is_source: bool = False,
+    memory_scope: agent_memory.MemoryScope | None = None,
+    memory_store: agent_memory.MemoryStore | None = None,
 ) -> HealReport:
     """Entry point for main.py: call after the first deploy failed.
 
@@ -1213,7 +1358,14 @@ def heal(
         return stop
 
     app = build_graph(
-        deploy_fn, llm_patch_fn, emit, repair_fn, confirm if confirm_fn else None, dockerfile_is_source
+        deploy_fn,
+        llm_patch_fn,
+        emit,
+        repair_fn,
+        confirm if confirm_fn else None,
+        dockerfile_is_source,
+        memory_scope,
+        memory_store,
     )
     initial: HealState = {
         "src_dir": src_dir,
@@ -1233,6 +1385,9 @@ def heal(
     blocked = None if success else _unhealable(error_log)
     human = (
         None if (success or blocked) else needs_human_stop(error_log, src_dir, final["current_dockerfile"])
+    )
+    human = human or (
+        None if success else _local_import_stop(src_dir, final["current_dockerfile"], error_log)
     )
     app_error = None if (success or blocked or human or repair_fn) else _stops_on_app_code(error_log)
     if success:

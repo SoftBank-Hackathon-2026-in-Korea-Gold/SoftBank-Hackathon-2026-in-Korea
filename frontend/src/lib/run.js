@@ -26,6 +26,7 @@ export function emptyRun(id = null, meta = {}) {
     targetState: Object.fromEntries(targets.map((t) => [t, freshTarget()])),
     logs: [],
     patches: [],
+    suggestion: null,
     envRequest: null, // { items, timeoutSec, chooseTarget? } while the backend waits for POST /deploy/{id}/env
     decision: null, // clef-flash's 1-second pick: { service, target, label, explain, probabilities, ms, prep_ms, engine, why }
     seen: new Set(),
@@ -45,6 +46,14 @@ function ensure(run, t) {
 
 function push(run, entry) {
   run.logs.push({ id: ++seq, at: entry.ts ? new Date(entry.ts * 1000) : new Date(), ...entry })
+}
+
+function restorePatches(run, target, records) {
+  for (const record of records || []) {
+    if (!record.diff) continue;
+    const duplicate = run.patches.some((p) => p.target === target && p.attempt === record.attempt && p.diff === record.diff);
+    if (!duplicate) run.patches.push({ ...record, target });
+  }
 }
 
 function parseSummary(line) {
@@ -73,6 +82,9 @@ export function applyEvent(prev, type, p, raw) {
       if (p.kind === 'decision') {
         run.decision = p
         push(run, { ts, kind: 'analyze', stage: 'analyze', text: `${(p.ms / 1000).toFixed(2)}초 만에 판단했어요 · ${p.label} (${p.engine})` })
+      } else if (p.kind === 'source_suggestion') {
+        run.suggestion = { path: p.path, diff: p.diff }
+        push(run, { ts, kind: 'heal', stage: 'heal', target: run.currentTarget, text: `소스 수정 제안 (적용 안 함) · ${p.path}`, detail: p.diff })
       } else if (p.kind === 'question') {
         run.question = { ...p, choice: null, reason: null }
         const ask = p.ask ? '반영하기 전에 물어볼게요' : '아무도 보고 있지 않아 PR로만 제안해요'
@@ -137,7 +149,7 @@ export function applyEvent(prev, type, p, raw) {
       break
     }
     case 'heal_diff': {
-      const t = run.currentTarget
+      const t = p.target || run.currentTarget
       run.patches.push({ ...p, target: t })
       push(run, {
         ts,
@@ -151,6 +163,7 @@ export function applyEvent(prev, type, p, raw) {
     }
     case 'done': {
       const t = p.target || run.currentTarget
+      restorePatches(run, t, p.records)
       ensure(run, t)
       const url = p.url || p.final_url
       run.targetState[t] = { ...run.targetState[t], phase: 'done', url, healed: Array.isArray(p.records) && p.records.length > 0 }
@@ -159,6 +172,7 @@ export function applyEvent(prev, type, p, raw) {
     }
     case 'error': {
       const t = p.target
+      restorePatches(run, t || run.currentTarget, p.records)
       const msg = p.message || p.summary || '실패'
       if (p.cancelled) {
         for (const k of run.targets) {

@@ -174,6 +174,8 @@ export function subscribe(id, onEvent, onFail) {
   const es = new EventSource(`/deploy/${id}/events${q}`)
   for (const type of ['stage', 'log', 'heal_diff', 'input_required', 'done', 'error']) {
     es.addEventListener(type, (ev) => {
+      // Native connection errors share the name "error" but carry no SSE payload.
+      if (!ev.data) return
       try {
         const raw = JSON.parse(ev.data)
         onEvent(type, raw.payload || {}, raw)
@@ -182,7 +184,7 @@ export function subscribe(id, onEvent, onFail) {
       }
     })
   }
-  es.onerror = () => onFail && onFail()
+  es.onerror = (ev) => !ev.data && onFail && onFail()
   return () => es.close()
 }
 
