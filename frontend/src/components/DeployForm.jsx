@@ -52,7 +52,7 @@ export default function DeployForm({ form, setForm, onDeploy, busy, fleetAvailab
 
         <div>
           <label className="mb-1.5 block text-xs font-semibold text-slate-300">배포 타깃</label>
-          <div className="grid gap-2">
+          <div className="grid grid-cols-1 gap-2">
             {Object.entries(TARGET_META).map(([t, m]) => {
               const Icon = ICONS[t];
               const on = form.targets[t];
