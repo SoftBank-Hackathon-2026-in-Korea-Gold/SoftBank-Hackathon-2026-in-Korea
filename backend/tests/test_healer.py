@@ -723,7 +723,7 @@ def test_config_summary_omits_optional_warning_before_actual_missing_key():
             (
                 "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
                 'django.db.utils.OperationalError: connection to server at "db.prod.internal" (10.0.0.1), port 5432 failed: '
-                'FATAL: password authentication failed for user "fastcampus"'
+                'FATAL: password authentication failed for user "app_user"'
             ),
             "db.prod.internal:5432",
             "password authentication failed",
@@ -739,7 +739,7 @@ def test_config_summary_omits_optional_warning_before_actual_missing_key():
         (
             (
                 "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
-                "pymysql.err.OperationalError: (1045, \"Access denied for user 'fastcampus'@'localhost' (using password: YES)\")"
+                "pymysql.err.OperationalError: (1045, \"Access denied for user 'app_user'@'localhost' (using password: YES)\")"
             ),
             None,
             "Access denied for user",
@@ -779,3 +779,121 @@ def test_database_client_error_variants_trigger_service_stop(log, expected_targe
     assert expected_evidence in summary
     if expected_target:
         assert expected_target in summary
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        (
+            'CMD ["python", "manage.py", "runserver", "127.0.0.1:8000"]',
+            'CMD ["python", "manage.py", "runserver", "0.0.0.0:8080"]',
+        ),
+        ("CMD php -S localhost:8000 -t public", "CMD php -S 0.0.0.0:8080 -t public"),
+        (
+            "CMD waitress-serve --listen=127.0.0.1:5000 app:app",
+            "CMD waitress-serve --listen=0.0.0.0:8080 app:app",
+        ),
+        (
+            'CMD ["sh", "-c", "wait-for localhost:5432 && python manage.py runserver 127.0.0.1:8000"]',
+            'CMD ["sh", "-c", "wait-for localhost:5432 && python manage.py runserver 0.0.0.0:8080"]',
+        ),
+    ],
+)
+def test_rebind_rewrites_localhost_endpoint_without_bind_flag(line, expected):
+    from app.healer import _rebind_start_command
+
+    assert _rebind_start_command(line) == expected
+
+
+LOCAL_LISTENING_ON_LOOPBACK = (
+    "[deployer] stage=verify kind=runtime_error target=local\n"
+    "container started but failed to start and listen on the port defined by PORT=8080 "
+    "(timeout after 15s (last probe: URLError)); the app is probably bound to another port or to 127.0.0.1\n"
+    "--- runtime logs ---\n"
+    "[INFO] Starting gunicorn 23.0.0\n"
+    "[INFO] Listening at: http://127.0.0.1:5000 (1)\n"
+)
+
+
+@pytest.mark.parametrize(
+    "warning",
+    [
+        "Warning: environment variable SENTRY_DSN not set, error reporting disabled",
+        "WARNING:root:cache: Error 111 connecting to redis:6379. Connection refused. caching disabled",
+    ],
+)
+def test_local_loopback_bind_with_harmless_warning_is_repaired_not_stopped(warning):
+    log = LOCAL_LISTENING_ON_LOOPBACK + warning + "\n"
+    responses = iter([DeployResult(success=True, target="local", exit_code=0, url="http://127.0.0.1:49152")])
+
+    def fake_deploy(src_dir, dockerfile, target):
+        return next(responses)
+
+    def forbidden(*_):
+        raise AssertionError("the port rule must fix this without the agent or LLM")
+
+    report = heal(
+        "/tmp/app",
+        "local",
+        DeployResult(success=False, target="local", exit_code=1, stderr=log),
+        BROKEN_DOCKERFILE,
+        fake_deploy,
+        forbidden,
+        repair_fn=forbidden,
+    )
+    assert report.success and report.attempts == 1
+    assert report.records[0].category == ErrorCategory.PORT_BINDING
+    assert "0.0.0.0:8080" in report.final_dockerfile
+
+
+def test_cloudrun_port_wrapper_with_database_auth_failure_still_stops():
+    from app.healer import SERVICE_STOP, needs_human_stop
+
+    log = (
+        "[deployer] stage=deploy kind=runtime_error target=cloudrun\n"
+        "The user-provided container failed to start and listen on the port defined by the PORT=8080 environment variable.\n"
+        "--- cloudrun revision logs ---\n"
+        'psycopg2.OperationalError: connection to server at "db.internal" (10.0.0.5), port 5432 failed: '
+        'FATAL: password authentication failed for user "app_user"\n'
+    )
+    assert needs_human_stop(log).startswith(SERVICE_STOP)
+
+
+@pytest.mark.parametrize(
+    "logs",
+    [
+        "exec /app/entrypoint.sh: no such file or directory",
+        "/usr/bin/env: 'python\\r': No such file or directory",
+    ],
+)
+def test_visible_exec_error_is_not_reported_as_quiet_crash(logs):
+    from app.healer import needs_human_stop
+
+    log = (
+        "[deployer] stage=verify kind=runtime_error target=local\ncontainer exited during startup\n"
+        "--- error ---\ncontainer status=exited exit_code=255\n--- runtime logs ---\n" + logs + "\n"
+    )
+    assert needs_human_stop(log) is None
+
+
+def test_optional_shared_library_warning_does_not_mask_port_binding():
+    log = (
+        "W tensorflow/stream_executor/platform/default/dso_loader.cc:64] Could not load dynamic library "
+        "'libcudart.so.11.0'; dlerror: libcudart.so.11.0: cannot open shared object file: No such file or directory\n"
+        + PORT_ERROR
+    )
+    assert classify_error(log) == ErrorCategory.PORT_BINDING
+    assert (
+        classify_error("ImportError: libxslt.so.1: cannot open shared object file: No such file or directory")
+        == ErrorCategory.MISSING_DEPENDENCY
+    )
+
+
+def test_service_summary_redacts_schemeless_credentials():
+    from app.healer import needs_human_stop
+
+    summary = needs_human_stop(
+        "[deployer] stage=verify kind=runtime_error target=local\n--- runtime logs ---\n"
+        "connection to admin:1234@db.internal:5432 failed: Connection refused\n"
+    )
+    assert "admin" not in summary and "1234" not in summary and "db.internal:5432" in summary

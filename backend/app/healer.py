@@ -71,9 +71,11 @@ ERROR_PATTERNS: list[tuple[ErrorCategory, re.Pattern[str]]] = [
     (
         ErrorCategory.MISSING_DEPENDENCY,
         re.compile(
+            # Shared objects only from the raised error or the loader: optional "Could not load dynamic
+            # library ... cannot open shared object file" warnings (e.g. CUDA) must not mask the real cause.
             r"ModuleNotFoundError: No module named|Cannot find module|"
-            r"cannot open shared object file|error while loading shared libraries",
-            re.IGNORECASE,
+            r"^(?:ImportError|OSError)\b.*cannot open shared object file|error while loading shared libraries",
+            re.IGNORECASE | re.MULTILINE,
         ),
     ),
     (
@@ -220,7 +222,9 @@ _ENV_MESSAGE = re.compile(
 )
 _ENV_REQUIRED_READ = re.compile(r"""environ\[\s*['"]([A-Z_][A-Z0-9_]*)['"]\s*\]""")
 _EXIT_CODE = re.compile(r"exit_code=(\d+)")
-_ERROR_WORDS = re.compile(r"error|exception|traceback|fatal|panic|denied|not found|fail", re.IGNORECASE)
+_ERROR_WORDS = re.compile(
+    r"error|exception|traceback|fatal|panic|denied|not found|fail|no such file|not executable", re.IGNORECASE
+)
 _SIGNALS = {4: "SIGILL", 6: "SIGABRT", 7: "SIGBUS", 9: "SIGKILL", 11: "SIGSEGV"}
 
 
@@ -321,6 +325,7 @@ def _service_stop(logs: str) -> str | None:
     target = None
     for line in reversed(lines):
         line = re.sub(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s/]*@", "", line)
+        line = re.sub(r"[^\s:@'\"]+:[^\s@'\"]*@", "", line)  # scheme-less user:pass@host
         m = _HOST_PORT.search(line) or _PG_TARGET.search(line)
         if m:
             host = m.group(1)
@@ -374,6 +379,11 @@ def needs_human_stop(error_log: str, src_dir: str | None = None, dockerfile: str
     """Summary of an app-level failure only a human can fix (missing env, unreachable DB, silent crash)."""
     header = deployer_header(error_log)
     if not header or header[0] not in {"verify", "deploy"}:
+        return None
+    # The local deployer writes this only when the app logged that it is listening and did not crash,
+    # so env/connection warnings in its logs are not the cause; leave it to the port rule. Not keyed on
+    # the category: Cloud Run reports every startup crash as "failed to start and listen on the port".
+    if "probably bound to another port or to 127.0.0.1" in _diagnosis(error_log):
         return None
     logs = _section(error_log, "runtime logs") or _section(error_log, "cloudrun revision logs")
     return (
@@ -491,6 +501,7 @@ _ARG_SEP = r'(?:[ =]|",\s*")'
 
 def _rebind_start_command(line: str) -> str:
     """Rewrite host/port inside a CMD/ENTRYPOINT line to 0.0.0.0:DEFAULT_PORT."""
+    original = line
     line = re.sub(
         rf"((?<![\w-])(?:-b|--bind){_ARG_SEP})(?:127\.0\.0\.1|localhost|0\.0\.0\.0):\d+",
         rf"\g<1>0.0.0.0:{DEFAULT_PORT}",
@@ -500,7 +511,16 @@ def _rebind_start_command(line: str) -> str:
     # service's host:port in an `sh -c` chain is left alone.
     line = re.sub(rf"((?<![\w-])(?:-b|--bind){_ARG_SEP}):\d+", rf"\g<1>0.0.0.0:{DEFAULT_PORT}", line)
     line = re.sub(rf"(--port{_ARG_SEP})\d+", rf"\g<1>{DEFAULT_PORT}", line)
-    return re.sub(rf"(--host{_ARG_SEP})(?:127\.0\.0\.1|localhost)", r"\g<1>0.0.0.0", line)
+    line = re.sub(rf"(--host{_ARG_SEP})(?:127\.0\.0\.1|localhost)", r"\g<1>0.0.0.0", line)
+    if line != original:
+        return line
+    # No flag to anchor on (`runserver 127.0.0.1:8000`, `php -S localhost:8000`, `--listen=...`): rewrite
+    # only the last localhost endpoint, the server at the end of a chain, so `wait-for localhost:5432` stays.
+    endpoints = list(re.finditer(r"(?<![\w.-])(?:127\.0\.0\.1|localhost):\d+\b", line))
+    if not endpoints:
+        return line
+    last = endpoints[-1]
+    return f"{line[: last.start()]}0.0.0.0:{DEFAULT_PORT}{line[last.end() :]}"
 
 
 def _patch_port_binding(dockerfile: str, error_log: str) -> tuple[str, str] | None:

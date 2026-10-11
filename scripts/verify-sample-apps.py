@@ -83,35 +83,37 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
         # Copy to isolated directory
         shutil.copytree(src_path, tmp_dir, dirs_exist_ok=True)
         dockerfile = (Path(tmp_dir) / "Dockerfile").read_text()
-
         timeout = 10 if name == "broken-db-startup" else 15
-        initial_res = deployer.deploy(
-            tmp_dir, dockerfile, "local", tunnel=False, verify_timeout=timeout
-        )
-
         redeploy_count = 0
+        summary = ""
 
         def redeploy(s, d, t):
             nonlocal redeploy_count
             redeploy_count += 1
             return deployer.deploy(s, d, t, tunnel=False, verify_timeout=timeout)
 
-        # Issue #7 human-stop scenarios must never invoke the repo agent even if provided.
-        # Pre-existing app-code stops (broken-import, broken-health) run with repo agent disabled (None).
-        repair_fn = _forbidden_agent if name in DEFAULT_ISSUE7_SAMPLES else None
-        report = healer.heal(
-            tmp_dir,
-            "local",
-            initial_res,
-            dockerfile,
-            redeploy,
-            repair_fn=repair_fn,
-        )
-
         passed = False
         detail = ""
-
+        # One failing sample (assertion, HTTP error, Docker error) is recorded, not fatal, and its
+        # containers are always cleaned up.
         try:
+            initial_res = deployer.deploy(tmp_dir, dockerfile, "local", tunnel=False, verify_timeout=timeout)
+            # Issue #7 human-stop scenarios must never invoke the repo agent even if provided.
+            # Pre-existing app-code stops (broken-import, broken-health) run with repo agent disabled (None).
+            # A non-None llm_patch_fn also keeps heal() from enabling the repo agent when ANTHROPIC_API_KEY
+            # is exported, so no sample can make a model call.
+            repair_fn = _forbidden_agent if name in DEFAULT_ISSUE7_SAMPLES else None
+            report = healer.heal(
+                tmp_dir,
+                "local",
+                initial_res,
+                dockerfile,
+                redeploy,
+                llm_patch_fn=_forbidden_agent,
+                repair_fn=repair_fn,
+            )
+            summary = report.summary
+
             if expected_outcome == "healed":
                 if not report.success:
                     detail = f"Failed to heal: {report.summary}"
@@ -134,20 +136,20 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
                     detail = "Expected stop but heal reported success"
                 elif report.attempts != 0:
                     detail = f"Expected 0 redeploys but attempted {report.attempts}"
-                elif not (
-                    expected_stop_prefix
-                    and report.summary.startswith(expected_stop_prefix)
-                ):
+                elif not (expected_stop_prefix and report.summary.startswith(expected_stop_prefix)):
                     detail = f"Summary mismatch: {report.summary}"
                 else:
                     passed = True
                     detail = "stopped cleanly (0 redeploys)"
+        except Exception as exc:  # noqa: BLE001 - record any failure for this sample and move on
+            summary = summary or f"{type(exc).__name__}: {exc}"
+            detail = f"{type(exc).__name__}: {exc}"
         finally:
             deployer.cleanup(tmp_dir)
 
         return (
             passed,
-            expected_outcome if passed else f"failed ({report.summary[:30]})",
+            expected_outcome if passed else f"failed ({summary[:30]})",
             redeploy_count,
             detail,
         )
@@ -155,9 +157,7 @@ def verify_sample(name: str) -> tuple[bool, str, int, str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--all", action="store_true", help="Run all 11 broken sample apps"
-    )
+    parser.add_argument("--all", action="store_true", help="Run all 11 broken sample apps")
     parser.add_argument("sample", nargs="?", help="Specific sample name to verify")
     args = parser.parse_args()
 
